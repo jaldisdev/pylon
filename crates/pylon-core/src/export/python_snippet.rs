@@ -67,8 +67,48 @@ pub fn python_snippet_for_step(step: &MigrationStep, schema: &SchemaDescriptor) 
                 .find(|f| &f.module == module && &f.name == name)?;
             Some(python_snippet_for_function(f))
         }
-        OpKey::Module(_) => None,
+        // A declared named tuple's type is named for it (`Point` →
+        // `Point_t`, see `schema::tuple_type`), so the declaration is
+        // recoverable. A structural tuple has no declaration of its own —
+        // it exists because some property is typed `pylon.Tuple[...]`, and
+        // that property's type is the thing to show, which this step isn't
+        // about. A rebuild spans a whole set of types, so no single one of
+        // them is the snippet either.
+        OpKey::TupleType(pg_schema, name) => {
+            let module = if pg_schema == "public" { "default" } else { pg_schema };
+            let declared = name.strip_suffix("_t")?;
+            let nt = schema
+                .named_tuples
+                .iter()
+                .find(|nt| nt.module == module && nt.name == declared)?;
+            Some(python_snippet_for_named_tuple(nt))
+        }
+        OpKey::TupleTypeRebuild | OpKey::Module(_) => None,
     }
+}
+
+fn python_snippet_for_named_tuple(nt: &crate::schema::NamedTupleDescriptor) -> String {
+    use crate::schema::TupleMemberKind;
+
+    let mut lines = vec!["@pylon.named_tuple".to_string(), format!("class {}:", nt.name)];
+    if nt.members.is_empty() {
+        lines.push("    pass".to_string());
+        return lines.join("\n");
+    }
+    for (i, m) in nt.members.iter().enumerate() {
+        let hint = match &m.kind {
+            TupleMemberKind::Scalar { pg_type } => python_type_hint(pg_type, None),
+            TupleMemberKind::Enum { name, .. } | TupleMemberKind::NamedTuple { name, .. } => name.clone(),
+            // A nested structural tuple's own members are a shape, not a
+            // name — `pylon.Tuple[...]` is as far as this goes.
+            TupleMemberKind::Tuple { .. } => "pylon.Tuple[...]".to_string(),
+        };
+        // A positional member has no name to declare; show the index it is
+        // read by, which is what its attribute is called.
+        let name = m.name.clone().unwrap_or_else(|| format!("_{i}"));
+        lines.push(format!("    {name}: {hint}"));
+    }
+    lines.join("\n")
 }
 
 /// Shared by object types (`@pylon.type`) and interface types

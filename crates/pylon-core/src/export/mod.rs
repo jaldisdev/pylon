@@ -32,17 +32,18 @@ pub mod python_snippet;
 ///   1. CREATE SCHEMA for each module
 ///   2. CREATE TYPE … AS ENUM for enum types
 ///   3. CREATE DOMAIN for custom scalars
-///   4. CREATE TABLE for concrete object types (property + link stub columns)
-///   5. ALTER TABLE ADD CONSTRAINT FOREIGN KEY for single links
-///   6. CREATE TABLE for multi-link junction tables
-///   7. CREATE UNIQUE INDEX for exclusive properties/constraints
-///   8. ALTER TABLE ADD CONSTRAINT CHECK for check constraints
-///   9. CREATE INDEX for non-unique indexes
-///  10. CREATE FUNCTION + CREATE TRIGGER for trigger descriptors
-///  11. CREATE VIEW for interface types (abstract + materialized)
-///  12. User-defined functions
-///  13. ALTER TABLE ADD COLUMN for vector embedding columns
-///  14. CREATE INDEX USING hnsw for vector indexes
+///   4. CREATE TYPE … AS (…) for the tuples that have to persist
+///   5. CREATE TABLE for concrete object types (property + link stub columns)
+///   6. ALTER TABLE ADD CONSTRAINT FOREIGN KEY for single links
+///   7. CREATE TABLE for multi-link junction tables
+///   8. CREATE UNIQUE INDEX for exclusive properties/constraints
+///   9. ALTER TABLE ADD CONSTRAINT CHECK for check constraints
+///  10. CREATE INDEX for non-unique indexes
+///  11. CREATE FUNCTION + CREATE TRIGGER for trigger descriptors
+///  12. CREATE VIEW for interface types (abstract + materialized)
+///  13. User-defined functions
+///  14. ALTER TABLE ADD COLUMN for vector embedding columns
+///  15. CREATE INDEX USING hnsw for vector indexes
 pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     let mut out = String::new();
 
@@ -61,6 +62,7 @@ pub fn export_schema(schema: &SchemaDescriptor) -> Result<String, PyQLError> {
     emit_schemas(schema, &mut out);
     emit_enums(schema, &mut out);
     emit_scalars(schema, &mut out);
+    emit_tuple_types(schema, &mut out)?;
     emit_scalar_functions(schema, &mut out)?;
     emit_tables(schema, &mut out);
     emit_fk_constraints(schema, &type_map, &mut out);
@@ -185,6 +187,9 @@ fn emit_schemas(schema: &SchemaDescriptor, out: &mut String) {
     for e in &schema.enums {
         modules.insert(&e.module);
     }
+    for nt in &schema.named_tuples {
+        modules.insert(&nt.module);
+    }
     for f in &schema.functions {
         modules.insert(&f.module);
     }
@@ -249,7 +254,44 @@ fn emit_scalars(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 4: concrete tables ───────────────────────────────────────────────────
+// ── Phase 4: tuple composite types ────────────────────────────────────────────
+
+/// A tuple that has to persist — a property's column, an element of an
+/// `array<tuple<…>>` — gets a composite type of its own, so each member keeps
+/// its own PostgreSQL type instead of collapsing into jsonb's single number
+/// type. See `schema::tuple_type` for where these live and what names them.
+///
+/// Guarded the way an enum is: `CREATE TYPE` has no `IF NOT EXISTS`, and this
+/// DDL is meant to be re-runnable against a database that already has some of
+/// it. The `COMMENT` is unconditional — it carries the tuple's own signature,
+/// which is the only thing that makes a generated `t_<hash>` legible in psql.
+fn emit_tuple_types(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
+    let types = crate::schema::tuple_type::collect(schema)?;
+    for t in &types {
+        let attributes: Vec<String> = t
+            .attributes
+            .iter()
+            .map(|a| format!("{} {}", qi(&a.name), a.pg_type))
+            .collect();
+        let qname = crate::schema::tuple_type::type_ref(&t.module, &t.name);
+        out.push_str(&format!(
+            "DO $$ BEGIN CREATE TYPE {} AS ({}); EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n",
+            qname,
+            attributes.join(", "),
+        ));
+        out.push_str(&format!(
+            "COMMENT ON TYPE {} IS '{}';\n",
+            qname,
+            t.signature.replace('\'', "''"),
+        ));
+    }
+    if !types.is_empty() {
+        out.push('\n');
+    }
+    Ok(())
+}
+
+// ── Phase 5: concrete tables ───────────────────────────────────────────────────
 
 fn emit_tables(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types {
@@ -285,11 +327,11 @@ fn emit_one_table(t: &TypeDescriptor, schema: Option<&SchemaDescriptor>, out: &m
         let default = column_default(p, schema)
             .map(|d| format!(" DEFAULT {}", d))
             .unwrap_or_default();
-        let col_type = p.column_type.as_deref().unwrap_or_else(|| resolved_pg_type(&p.pg_type));
+        let col_type = crate::schema::column_ddl_type(p, &t.module);
         lines.push(format!("    {} {}{}{}", qi(&p.name), col_type, not_null, default));
     }
 
-    // Link columns — uuid stubs; FK constraints added in phase 5. A
+    // Link columns — uuid stubs; FK constraints added in phase 6. A
     // junction-backed link has no column here at all — it's stored the
     // same way a multi-link is, via a junction table (`emit_junction_tables`).
     for l in &t.links {
@@ -515,7 +557,7 @@ fn target_jt_fk_suffix(policies: &[OnDeletePolicy]) -> String {
     }
 }
 
-// ── Phase 5: FK constraints for single links ───────────────────────────────────
+// ── Phase 6: FK constraints for single links ───────────────────────────────────
 
 fn emit_fk_constraints(schema: &SchemaDescriptor, type_map: &HashMap<String, (&str, &str)>, out: &mut String) {
     let polymorphic = polymorphic_types(schema);
@@ -713,7 +755,7 @@ fn target_table_qnames(
     Some(vec![qn(tgt_module, tgt_table)])
 }
 
-// ── Phase 5.5: source-side deletion triggers for single links ──────────────────
+// ── Phase 6.5: source-side deletion triggers for single links ──────────────────
 
 /// Structured description of one deletion-policy trigger (either a
 /// single-link Source-side `DeleteTarget`/`DeleteTargetIfOrphan`, a
@@ -814,7 +856,7 @@ fn emit_link_source_triggers(schema: &SchemaDescriptor, type_map: &HashMap<Strin
     }
 }
 
-// ── Phase 6: junction tables for multi-links ───────────────────────────────────
+// ── Phase 7: junction tables for multi-links ───────────────────────────────────
 
 fn emit_junction_tables(schema: &SchemaDescriptor, out: &mut String) {
     for t in &schema.types {
@@ -915,7 +957,7 @@ fn emit_one_junction_table(
     out.push_str("\n\n");
 }
 
-// ── Phase 6.5: multilink deletion policy triggers ──────────────────────────────
+// ── Phase 7.5: multilink deletion policy triggers ──────────────────────────────
 
 fn multilink_deletion_trigger_infos(
     schema: &SchemaDescriptor,
@@ -1049,7 +1091,7 @@ fn push_junction_deletion_triggers(
     }
 }
 
-// ── Phase 6.6: target-side enforcement for polymorphic links ───────────────────
+// ── Phase 7.6: target-side enforcement for polymorphic links ───────────────────
 
 /// Emits, for one link whose target is an interface, the trigger that stands
 /// in for the foreign key such a link cannot have.
@@ -1353,7 +1395,7 @@ fn constraint_column(t: &TypeDescriptor, pointer: &str) -> String {
     }
 }
 
-// ── Phase 7: unique indexes ────────────────────────────────────────────────────
+// ── Phase 8: unique indexes ────────────────────────────────────────────────────
 
 fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
     let mut emitted = false;
@@ -1421,7 +1463,7 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 8: check constraints ─────────────────────────────────────────────────
+// ── Phase 9: check constraints ─────────────────────────────────────────────────
 
 /// `(module, table, constraint name, DDL)` for every CHECK the schema implies.
 ///
@@ -1523,7 +1565,7 @@ fn emit_check_constraints(schema: &SchemaDescriptor, out: &mut String) -> Result
     Ok(())
 }
 
-// ── Phase 9: non-unique indexes ────────────────────────────────────────────────
+// ── Phase 10: non-unique indexes ───────────────────────────────────────────────
 
 /// The `(...)` an index is keyed on and its `WHERE`, both as SQL.
 ///
@@ -1613,7 +1655,7 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 10: trigger functions + triggers ─────────────────────────────────────
+// ── Phase 11: trigger functions + triggers ─────────────────────────────────────
 
 fn emit_triggers(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
     for info in user_trigger_infos(schema)? {
@@ -2087,7 +2129,7 @@ pub fn object_function_ddl_with_names(
         .collect()
 }
 
-// ── Phase 11: interface views ──────────────────────────────────────────────────
+// ── Phase 12: interface views ──────────────────────────────────────────────────
 
 fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &mut String) {
     let cols: Vec<String> = t
@@ -2126,7 +2168,7 @@ fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 11.5: interface exclusive constraint triggers ────────────────────────
+// ── Phase 12.5: interface exclusive constraint triggers ────────────────────────
 
 /// Structured description of one cross-table exclusive constraint trigger group.
 /// Used by the diff engine to detect added/removed triggers without re-parsing DDL.
@@ -2451,7 +2493,7 @@ fn emit_interface_exclusive_triggers(schema: &SchemaDescriptor, out: &mut String
     }
 }
 
-// ── Phase 12: user-defined functions ─────────────────────────────────────────
+// ── Phase 13: user-defined functions ─────────────────────────────────────────
 
 fn emit_scalar_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
     for fd in schema.functions.iter().filter(|fd| !fd.return_is_object) {
@@ -2589,7 +2631,13 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
         cols.push("__type__ text".to_string());
     }
     for p in &td.properties {
-        cols.push(format!("{} {}", qi(&p.name), resolved_pg_type(&p.pg_type)));
+        // A tuple property's column is a composite type, so the declared
+        // return column has to be that same type — not the `jsonb` the
+        // marker resolves to. Every other property keeps its plain base
+        // type here, domains included (see `PropertyDescriptor.pg_type`).
+        let col_type = crate::schema::tuple_type::property_column_type(p, &td.module)
+            .unwrap_or_else(|| resolved_pg_type(&p.pg_type).to_string());
+        cols.push(format!("{} {}", qi(&p.name), col_type));
     }
     for l in &td.links {
         if l.is_junction_backed() {
@@ -2600,7 +2648,7 @@ fn emit_fn_return_table(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> S
     cols.join(", ")
 }
 
-// ── Phase 13: vector embedding columns ────────────────────────────────────────
+// ── Phase 14: vector embedding columns ────────────────────────────────────────
 
 fn emit_vector_columns(schema: &SchemaDescriptor, out: &mut String) {
     for td in &schema.types {
@@ -2625,7 +2673,7 @@ fn emit_vector_columns(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 14: vector HNSW indexes ─────────────────────────────────────────────
+// ── Phase 15: vector HNSW indexes ─────────────────────────────────────────────
 
 fn emit_vector_indexes(schema: &SchemaDescriptor, out: &mut String) {
     for td in &schema.types {
@@ -2648,7 +2696,7 @@ fn emit_vector_indexes(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 15: search tsvector generated columns (Postgres backend) ─────────────
+// ── Phase 16: search tsvector generated columns (Postgres backend) ─────────────
 
 fn emit_search_columns(schema: &SchemaDescriptor, out: &mut String) {
     use crate::schema::SearchBackend;
@@ -2694,7 +2742,7 @@ fn emit_search_columns(schema: &SchemaDescriptor, out: &mut String) {
     }
 }
 
-// ── Phase 16: search GIN indexes (Postgres backend) ───────────────────────────
+// ── Phase 17: search GIN indexes (Postgres backend) ───────────────────────────
 
 fn emit_search_indexes(schema: &SchemaDescriptor, out: &mut String) {
     use crate::schema::SearchBackend;
@@ -4596,6 +4644,248 @@ mod tests {
         };
         let ddl = export_schema(&schema).unwrap();
         assert!(!ddl.contains("IF TG_OP = 'UPDATE'"), "got:\n{ddl}");
+    }
+}
+
+#[cfg(test)]
+mod tuple_type_tests {
+    use super::*;
+    use crate::schema::{
+        NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor, TupleMemberDescriptor, TupleMemberKind,
+        TypeDescriptor, tuple_type,
+    };
+
+    fn scalar_member(name: Option<&str>, pg_type: &str) -> TupleMemberDescriptor {
+        TupleMemberDescriptor {
+            name: name.map(str::to_string),
+            kind: TupleMemberKind::Scalar {
+                pg_type: pg_type.to_string(),
+            },
+        }
+    }
+
+    fn property(name: &str, pg_type: &str, tuple_members: Option<Vec<TupleMemberDescriptor>>) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members,
+            column_type: None,
+        }
+    }
+
+    fn type_with(module: &str, name: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
+        TypeDescriptor {
+            name: name.into(),
+            module: module.into(),
+            table: name.into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties,
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }
+    }
+
+    #[test]
+    fn a_declared_named_tuple_gets_a_composite_type_and_a_column_of_that_type() {
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+            members: vec![scalar_member(Some("x"), "int8"), scalar_member(Some("y"), "numeric")],
+        });
+        schema.types.push(type_with(
+            "default",
+            "Pin",
+            vec![property("at", "__nt__:default::Point", None)],
+        ));
+
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("CREATE TYPE \"public\".\"Point_t\" AS (\"x\" int8, \"y\" numeric)"),
+            "got:\n{ddl}"
+        );
+        assert!(
+            ddl.contains("\"at\" \"public\".\"Point_t\""),
+            "the column must have the composite type, not jsonb, got:\n{ddl}"
+        );
+        assert!(
+            !ddl.contains("\"at\" jsonb"),
+            "a tuple column stored as jsonb loses every member's type, got:\n{ddl}"
+        );
+    }
+
+    #[test]
+    fn the_type_is_created_before_the_table_that_uses_it() {
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+            members: vec![scalar_member(Some("x"), "int8")],
+        });
+        schema.types.push(type_with(
+            "default",
+            "Pin",
+            vec![property("at", "__nt__:default::Point", None)],
+        ));
+
+        let ddl = export_schema(&schema).unwrap();
+        let type_pos = ddl.find("CREATE TYPE \"public\".\"Point_t\"").unwrap();
+        let table_pos = ddl.find("CREATE TABLE \"public\".\"Pin\"").unwrap();
+        assert!(type_pos < table_pos, "got:\n{ddl}");
+    }
+
+    #[test]
+    fn the_signature_travels_with_the_type_as_a_comment() {
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Money".into(),
+            module: "default".into(),
+            members: vec![scalar_member(Some("amount"), "numeric"), scalar_member(Some("ccy"), "text")],
+        });
+
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("COMMENT ON TYPE \"public\".\"Money_t\" IS 'tuple<amount: numeric, ccy: text>';"),
+            "got:\n{ddl}"
+        );
+    }
+
+    #[test]
+    fn an_array_of_tuples_keeps_the_array_on_the_column() {
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Header".into(),
+            module: "integration".into(),
+            members: vec![scalar_member(Some("name"), "text"), scalar_member(Some("value"), "text")],
+        });
+        schema.types.push(type_with(
+            "integration",
+            "Webhook",
+            vec![property("headers", "__nt__:integration::Header[]", None)],
+        ));
+
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("\"headers\" \"integration\".\"Header_t\"[]"),
+            "got:\n{ddl}"
+        );
+    }
+
+    #[test]
+    fn a_structural_tuple_property_gets_a_type_named_for_its_content() {
+        let members = vec![scalar_member(Some("name"), "text"), scalar_member(Some("value"), "numeric")];
+        let mut schema = SchemaDescriptor::default();
+        schema.types.push(type_with(
+            "default",
+            "Webhook",
+            vec![property("headers", "jsonb", Some(members.clone()))],
+        ));
+
+        let ddl = export_schema(&schema).unwrap();
+        let name = tuple_type::structural_name(&members);
+        assert!(
+            ddl.contains(&format!(
+                "CREATE TYPE \"public\".\"{name}\" AS (\"name\" text, \"value\" numeric)"
+            )),
+            "got:\n{ddl}"
+        );
+        assert!(ddl.contains(&format!("\"headers\" \"public\".\"{name}\"")), "got:\n{ddl}");
+    }
+
+    #[test]
+    fn a_positional_tuples_attributes_are_named_for_their_indexes() {
+        let members = vec![scalar_member(None, "numeric"), scalar_member(None, "text")];
+        let mut schema = SchemaDescriptor::default();
+        schema.types.push(type_with(
+            "default",
+            "Reading",
+            vec![property("pair", "jsonb", Some(members.clone()))],
+        ));
+
+        let ddl = export_schema(&schema).unwrap();
+        let name = tuple_type::structural_name(&members);
+        assert!(
+            ddl.contains(&format!("CREATE TYPE \"public\".\"{name}\" AS (\"0\" numeric, \"1\" text)")),
+            "a composite attribute must have a name, so a positional member is named for its index, got:\n{ddl}"
+        );
+        assert!(
+            ddl.contains(&format!("COMMENT ON TYPE \"public\".\"{name}\" IS 'tuple<numeric, text>';")),
+            "got:\n{ddl}"
+        );
+    }
+
+    #[test]
+    fn a_module_that_only_declares_a_named_tuple_still_gets_its_schema() {
+        // Without its own `CREATE SCHEMA`, the module's first `CREATE TYPE`
+        // fails outright with "schema does not exist" — the same trap every
+        // other kind of declaration is already guarded against.
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "geo".into(),
+            members: vec![scalar_member(Some("x"), "int8")],
+        });
+
+        let ddl = export_schema(&schema).unwrap();
+        let schema_pos = ddl.find("CREATE SCHEMA IF NOT EXISTS \"geo\"").expect(&ddl);
+        let type_pos = ddl.find("CREATE TYPE \"geo\".\"Point_t\"").unwrap();
+        assert!(schema_pos < type_pos, "got:\n{ddl}");
+    }
+
+    #[test]
+    fn an_object_function_returning_a_type_with_a_tuple_property_declares_the_composite() {
+        use crate::schema::FunctionDescriptor;
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+            members: vec![scalar_member(Some("x"), "int8")],
+        });
+        schema.types.push(type_with(
+            "default",
+            "Pin",
+            vec![property("at", "__nt__:default::Point", None)],
+        ));
+        schema.functions.push(FunctionDescriptor {
+            name: "pins".into(),
+            module: "default".into(),
+            params: vec![],
+            return_pg_type: "default::Pin".into(),
+            return_is_object: true,
+            return_is_set: true,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select Pin".into(),
+        });
+
+        let ddl = export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("\"at\" \"public\".\"Point_t\""),
+            "the declared return column must be the column's own type, got:\n{ddl}"
+        );
     }
 }
 

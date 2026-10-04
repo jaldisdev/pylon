@@ -2190,8 +2190,8 @@ impl MigrationStep {
             .collect()
     }
 
-    /// One of "module", "scalar", "table", "function", "view", "foreign_key"
-    /// — the kind of
+    /// One of "module", "scalar", "tuple_type", "table", "function",
+    /// "view", "foreign_key" — the kind of
     /// object this step's identity refers to. Lets a caller correlate steps
     /// (e.g. an interface's "view" step with its implementors' "table"
     /// steps) without parsing `prompt`/`object_desc` display text.
@@ -2204,6 +2204,10 @@ impl MigrationStep {
             core::diff::OpKey::Function(_, _) => "function",
             core::diff::OpKey::View(_, _) => "view",
             core::diff::OpKey::ForeignKey(_, _) => "foreign_key",
+            // A replacement spans every composite type being replaced at
+            // once, so it has no single object of its own; it is still a
+            // change to tuple types, which is what a caller correlates on.
+            core::diff::OpKey::TupleType(_, _) | core::diff::OpKey::TupleTypeRebuild => "tuple_type",
         }
     }
 
@@ -2227,6 +2231,11 @@ impl MigrationStep {
                 .iter()
                 .find(|t| &t.module == m && &t.table == table)
                 .map(|t| format!("{}::{}", t.module, t.name)),
+            // The Postgres type name, which for a declared named tuple is
+            // that tuple's own name plus `_t` (see `schema::tuple_type`).
+            core::diff::OpKey::TupleType(m, n) => Some(format!("{m}::{n}")),
+            // No one object to name — see `kind`.
+            core::diff::OpKey::TupleTypeRebuild => None,
         }
     }
 

@@ -17,6 +17,8 @@
 // limitations under the License.
 //
 
+pub mod tuple_type;
+
 // ── Deletion policies ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -121,6 +123,26 @@ pub fn resolved_pg_type(pg_type: &str) -> &str {
         Some(marker) if marker.ends_with("[]") => "jsonb[]",
         Some(_) => "jsonb",
         None => pg_type,
+    }
+}
+
+/// The PostgreSQL type a property's column is *declared* with — the one
+/// place that decides it, shared by the DDL emitter and the migration diff
+/// so a column and the diff's idea of that column can't drift apart.
+///
+/// Three kinds of property have a column type that isn't just `pg_type`: a
+/// tuple, which gets a composite type of its own (see `tuple_type`); a
+/// registered custom scalar, which gets its DOMAIN (`column_type`); and a
+/// nominal tuple marker, which `resolved_pg_type` resolves. `owner_module`
+/// is the module of the type declaring the property — where a structural
+/// tuple's composite type lives.
+pub fn column_ddl_type(p: &PropertyDescriptor, owner_module: &str) -> String {
+    if let Some(composite) = tuple_type::property_column_type(p, owner_module) {
+        return composite;
+    }
+    match &p.column_type {
+        Some(domain) => domain.clone(),
+        None => resolved_pg_type(&p.pg_type).to_string(),
     }
 }
 

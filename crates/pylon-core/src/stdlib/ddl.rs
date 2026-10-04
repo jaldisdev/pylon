@@ -240,6 +240,62 @@ pub const SIGNAL_OUTBOX_DDL: &str = concat!(
     "    FOR EACH ROW EXECUTE FUNCTION _pylon.notify_signal_queue();\n",
 );
 
+/// DDL for the helpers that read a tuple out of the jsonb it used to be
+/// stored as.
+///
+/// A tuple's column is a composite type (see `schema::tuple_type`), so a
+/// database written before that holds `jsonb` where a composite now belongs
+/// and its migration has to convert every row. `ALTER COLUMN … TYPE … USING`
+/// refuses a subquery outright ("cannot use subquery in transform
+/// expression") and `jsonb_populate_record` refuses a json *array*, which is
+/// exactly how a positional tuple was stored — so neither an array-typed
+/// column nor a positional tuple can be converted inline. A function call is
+/// allowed there, and inside a function both restrictions lift.
+///
+/// Polymorphic on `base`, which is only ever passed as `NULL::the_type`:
+/// `anyelement` is how a SQL-language function gets told which composite to
+/// populate, since `jsonb_populate_record` needs a concrete one.
+///
+/// Both take their source as plain `jsonb`, and every caller hands them
+/// `to_jsonb(column)` — which is the identity on a `jsonb` column and turns
+/// a composite one into the object its attributes already name, so the same
+/// two calls convert a column whatever it holds today: the jsonb a tuple
+/// used to be, or a composite of a shape that has since changed.
+pub const TUPLE_CONVERSION_DDL: &str = concat!(
+    // A positional tuple travelled as a json array, whose members are the
+    // composite's `"0"`, `"1"`, … attributes — named for their index exactly
+    // so this mapping is mechanical. A named tuple's object passes through.
+    "CREATE OR REPLACE FUNCTION _pylon.tuple_json_object(src jsonb)\n",
+    "\tRETURNS jsonb\n",
+    "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
+    "AS $$\n",
+    "    SELECT CASE jsonb_typeof(src)\n",
+    "        WHEN 'array' THEN (\n",
+    "            SELECT COALESCE(jsonb_object_agg((ord - 1)::text, val), '{}'::jsonb)\n",
+    "            FROM jsonb_array_elements(src) WITH ORDINALITY AS e(val, ord)\n",
+    "        )\n",
+    "        ELSE src\n",
+    "    END\n",
+    "$$;\n\n",
+    "CREATE OR REPLACE FUNCTION _pylon.populate_tuple(base anyelement, src jsonb)\n",
+    "\tRETURNS anyelement\n",
+    "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
+    "AS $$\n",
+    // `base` is the NULL of the target type, so an absent value stays absent
+    // rather than becoming a row of all-NULL members — which a composite
+    // treats as `IS NULL` but not as `IS NOT DISTINCT FROM NULL`.
+    "    SELECT CASE WHEN src IS NULL OR jsonb_typeof(src) = 'null' THEN base\n",
+    "                ELSE jsonb_populate_record(base, _pylon.tuple_json_object(src)) END\n",
+    "$$;\n\n",
+    "CREATE OR REPLACE FUNCTION _pylon.populate_tuples(base anyelement, src jsonb)\n",
+    "\tRETURNS anyarray\n",
+    "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
+    "AS $$\n",
+    "    SELECT array_agg(_pylon.populate_tuple(base, e) ORDER BY ord)\n",
+    "    FROM jsonb_array_elements(src) WITH ORDINALITY AS u(e, ord)\n",
+    "$$;\n",
+);
+
 /// DDL for the cache-invalidation notify function.
 ///
 /// One statement-level trigger per user table (attached in the diff/export
@@ -365,6 +421,8 @@ pub fn export_stdlib() -> String {
     out.push_str(MIGRATION_TRACKING_DDL);
     out.push('\n');
     out.push_str(CACHE_INVALIDATE_DDL);
+    out.push('\n');
+    out.push_str(TUPLE_CONVERSION_DDL);
     out.push('\n');
 
     // Internal runtime helpers (not user-callable from PyQL).

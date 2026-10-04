@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor, resolved_pg_type};
+use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
 
 // ── Live database state ────────────────────────────────────────────────────────
 
@@ -44,6 +44,11 @@ pub struct DbState {
     pub enums: Vec<DbEnum>,
     #[serde(default)]
     pub domains: Vec<DbDomain>,
+    /// Composite types — the types tuples compile to (see
+    /// `schema::tuple_type`). Only the ones a module's schema holds; a
+    /// table's own row type is not one of these.
+    #[serde(default)]
+    pub composites: Vec<DbComposite>,
     #[serde(default)]
     pub sequences: Vec<DbSequence>,
     #[serde(default)]
@@ -162,6 +167,28 @@ pub struct DbEnum {
     pub members: Vec<String>,
 }
 
+/// A composite type as the database has it. `attributes` is in attribute
+/// order, which is part of the type's identity: a tuple's members are read
+/// by position, so two types with the same attributes in a different order
+/// are not the same type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbComposite {
+    /// The Pylon *module*, not the Postgres schema — `default` where the
+    /// database says `public`, matching `DbEnum`/`DbDomain`.
+    pub schema: String,
+    pub name: String,
+    #[serde(default)]
+    pub attributes: Vec<DbCompositeAttr>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCompositeAttr {
+    pub name: String,
+    /// PostgreSQL's own `format_type` spelling, e.g. `numeric`,
+    /// `"geo"."Point_t"[]`.
+    pub pg_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbDomain {
     pub schema: String,
@@ -226,6 +253,9 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
     for s in &schema.scalars {
         schema_set.insert(s.module.clone());
     }
+    for nt in &schema.named_tuples {
+        schema_set.insert(nt.module.clone());
+    }
 
     let schemas: Vec<String> = schema_set.into_iter().collect();
 
@@ -237,6 +267,25 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             schema: e.module.clone(),
             name: e.name.clone(),
             members: e.members.clone(),
+        })
+        .collect();
+
+    // Composite types (the types tuples compile to). A cycle among named
+    // tuples has no composite type at all, and is reported where the DDL is
+    // emitted rather than silently turning into a diff that drops things.
+    let composites: Vec<DbComposite> = target_tuple_types(schema)
+        .into_iter()
+        .map(|t| DbComposite {
+            schema: t.module,
+            name: t.name,
+            attributes: t
+                .attributes
+                .into_iter()
+                .map(|a| DbCompositeAttr {
+                    name: a.name,
+                    pg_type: a.pg_type,
+                })
+                .collect(),
         })
         .collect();
 
@@ -283,7 +332,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         for p in &td.properties {
             columns.push(DbColumn {
                 name: p.name.clone(),
-                pg_type: col_type_str(p).to_string(),
+                pg_type: col_type_str(p, &td.module),
                 nullable: p.nullable,
                 is_generated: false,
                 column_default: resolve_default(p, schema),
@@ -582,11 +631,21 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         tables,
         enums,
         domains,
+        composites,
         sequences,
         views,
         functions,
         extensions,
     }
+}
+
+/// The composite types a target schema needs, or none at all when they
+/// cannot be worked out (a named tuple that contains itself). The diff's job
+/// is to describe a reachable database, and a schema that has no valid DDL
+/// has no database to describe — `export::emit_tuple_types` reports the
+/// cycle itself, with the name of the tuple it runs through.
+fn target_tuple_types(schema: &SchemaDescriptor) -> Vec<crate::schema::tuple_type::TupleType> {
+    crate::schema::tuple_type::collect(schema).unwrap_or_default()
 }
 
 /// Postgres extensions `target` needs in order for its own DDL to apply
@@ -665,7 +724,7 @@ fn build_junction_db_table(
             if p.name == "id" {
                 continue;
             }
-            let pg_type = col_type_str(p).to_string();
+            let pg_type = col_type_str(p, &through_td.module);
             jt_columns.push(DbColumn {
                 name: p.name.clone(),
                 pg_type,
@@ -939,6 +998,18 @@ pub enum OpKey {
     /// Covers enums, custom scalar domains, and sequence scalars — all
     /// three share one object identity (a scalar can only be one of them).
     Scalar(String, String),
+    /// One tuple's composite type, by `(pg schema, type name)` — created or
+    /// dropped on its own.
+    TupleType(String, String),
+    /// Every composite type being *replaced*, as one step.
+    ///
+    /// Unlike a create or a drop, replacing one is not an independent piece
+    /// of work: each replacement type has to exist before any column moves
+    /// to it, and every column has to have moved before any of the types
+    /// they held can be dropped. Keyed without a name because the set is the
+    /// unit — a type nested in another cannot have its own step ordered
+    /// against the step of the type holding it.
+    TupleTypeRebuild,
     /// Covers a concrete type's own table plus everything folded into it:
     /// column/FK diffs, junction tables for its multi-/through-links,
     /// vector/search index columns, and constraint/deletion/signal/cache
@@ -1042,6 +1113,16 @@ fn is_generated_check_name(name: &str) -> bool {
 /// as its own separate noun to someone reviewing a schema change.
 fn verbosename_scalar(module: &str, name: &str) -> String {
     format!("scalar type '{module}::{name}'")
+}
+
+/// A declared named tuple is named; a structural one has only its shape, so
+/// that is what identifies it to a reader (`tuple type 'tuple<name: text>'`)
+/// — the same string its generated type name carries as a comment.
+fn verbosename_tuple_type(t: &crate::schema::tuple_type::TupleType) -> String {
+    match &t.nominal {
+        Some(qname) => format!("tuple type '{qname}'"),
+        None => format!("tuple type '{}'", t.signature),
+    }
 }
 
 fn verbosename_type(module: &str, name: &str) -> String {
@@ -1345,7 +1426,7 @@ pub fn detect_col_renames(
         let target_cols: Vec<(String, String)> = td
             .properties
             .iter()
-            .map(|p| (p.name.clone(), col_type_str(p).to_string()))
+            .map(|p| (p.name.clone(), col_type_str(p, &td.module)))
             .chain(
                 td.links
                     .iter()
@@ -1457,7 +1538,7 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
                             module: td.module.clone(),
                             table: td.table.clone(),
                             column: p.name.clone(),
-                            pg_type: col_type_str(p).to_string(),
+                            pg_type: col_type_str(p, &td.module),
                             type_name: td.name.clone(),
                             is_new_column: true,
                             default_sql: None,
@@ -1470,7 +1551,7 @@ pub fn detect_fill_required(target: &SchemaDescriptor, current: &DbState) -> Vec
                         module: td.module.clone(),
                         table: td.table.clone(),
                         column: p.name.clone(),
-                        pg_type: col_type_str(p).to_string(),
+                        pg_type: col_type_str(p, &td.module),
                         type_name: td.name.clone(),
                         is_new_column: false,
                         default_sql: p.default_sql.clone(),
@@ -1728,6 +1809,154 @@ fn pg_schema(module: &str) -> String {
     }
 }
 
+/// The suffix a replacement type carries while the type it replaces still
+/// exists. Two underscores, so it cannot collide with the `_t` a declared
+/// named tuple's own name ends in.
+const NEW_TYPE_SUFFIX: &str = "__new";
+
+fn new_type_ref(t: &crate::schema::tuple_type::TupleType) -> String {
+    crate::schema::tuple_type::type_ref(&t.module, &format!("{}{}", t.name, NEW_TYPE_SUFFIX))
+}
+
+/// `CREATE TYPE <name> AS (…)` for one tuple, under whatever name it is being
+/// created as — its own, or its replacement's while a rebuild is in flight.
+///
+/// An attribute holding a type that is itself being rebuilt points at *that*
+/// type's replacement: the type it names today is about to be dropped.
+fn create_composite_sql(
+    t: &crate::schema::tuple_type::TupleType,
+    as_name: &str,
+    rebuild: &HashSet<String>,
+    all: &[(String, &crate::schema::tuple_type::TupleType)],
+) -> String {
+    let attributes: Vec<String> = t
+        .attributes
+        .iter()
+        .map(|a| {
+            let base = attribute_base_type(a);
+            let pg_type = match rebuild.contains(base) {
+                true => {
+                    let replacement = all
+                        .iter()
+                        .find(|(tref, _)| tref == base)
+                        .map(|(_, held)| new_type_ref(held))
+                        .unwrap_or_else(|| base.to_string());
+                    match a.pg_type.ends_with("[]") {
+                        true => format!("{replacement}[]"),
+                        false => replacement,
+                    }
+                }
+                false => a.pg_type.clone(),
+            };
+            format!("{} {}", qi(&a.name), pg_type)
+        })
+        .collect();
+    format!(
+        "DO $$ BEGIN CREATE TYPE {} AS ({}); EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        as_name,
+        attributes.join(", ")
+    )
+}
+
+/// `CREATE TYPE` for a composite type as the database already describes it —
+/// the squash path, where both sides are introspected rather than declared.
+fn create_db_composite_sql(c: &DbComposite, as_name: &str) -> String {
+    let attributes: Vec<String> = c
+        .attributes
+        .iter()
+        .map(|a| format!("{} {}", qi(&a.name), a.pg_type))
+        .collect();
+    format!(
+        "DO $$ BEGIN CREATE TYPE {} AS ({}); EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        as_name,
+        attributes.join(", ")
+    )
+}
+
+fn new_db_type_ref(c: &DbComposite) -> String {
+    qn(&c.schema, &format!("{}{}", c.name, NEW_TYPE_SUFFIX))
+}
+
+fn db_composite_changed(after: &DbComposite, before: &DbComposite) -> bool {
+    if after.attributes.len() != before.attributes.len() {
+        return true;
+    }
+    after
+        .attributes
+        .iter()
+        .zip(&before.attributes)
+        .any(|(a, b)| a.name != b.name || pg_type_changed(&a.pg_type, &b.pg_type))
+}
+
+/// Every column holding `c`, as `(schema, table, column, is_array)`. A
+/// column's introspected type carries the schema qualifier only sometimes
+/// (`format_type` drops it when the type is on `search_path`), so these
+/// match on the type's own name — see `bare_type_name`.
+fn db_columns_of_composite(state: &DbState, c: &DbComposite) -> Vec<(String, String, String, bool)> {
+    let mut out = Vec::new();
+    for t in &state.tables {
+        for col in &t.columns {
+            let is_array = col.pg_type.ends_with("[]");
+            let base = col.pg_type.strip_suffix("[]").unwrap_or(&col.pg_type);
+            if bare_type_name(base) == c.name {
+                out.push((t.schema.clone(), t.name.clone(), col.name.clone(), is_array));
+            }
+        }
+    }
+    out
+}
+
+/// An attribute's type with any array-ness stripped — what identifies the
+/// type it refers to.
+fn attribute_base_type(a: &crate::schema::tuple_type::TupleAttribute) -> &str {
+    a.pg_type.strip_suffix("[]").unwrap_or(&a.pg_type)
+}
+
+/// Whether the database's composite type says something different from the
+/// schema's. Attribute *order* counts: a tuple's members are read by
+/// position.
+fn composite_changed(t: &crate::schema::tuple_type::TupleType, existing: &DbComposite) -> bool {
+    if t.attributes.len() != existing.attributes.len() {
+        return true;
+    }
+    t.attributes
+        .iter()
+        .zip(&existing.attributes)
+        .any(|(want, have)| want.name != have.name || pg_type_changed(&want.pg_type, &have.pg_type))
+}
+
+/// Every column whose type is a tuple's composite type, as
+/// `(module, table, column, column type)`.
+fn tuple_columns(target: &SchemaDescriptor) -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    for td in &target.types {
+        if td.abstract_ {
+            continue;
+        }
+        for p in &td.properties {
+            if let Some(col_type) = crate::schema::tuple_type::property_column_type(p, &td.module) {
+                out.push((td.module.clone(), td.table.clone(), p.name.clone(), col_type));
+            }
+        }
+    }
+    out
+}
+
+/// How a column becomes the composite type its tuple property now asks for.
+///
+/// No cast reaches it: jsonb has no cast to a composite, and a composite of
+/// one shape has none to another. `_pylon.populate_tuple`/`populate_tuples`
+/// do, reading the value as the object its member names already describe —
+/// `to_jsonb` makes that object whatever the column holds today, so the same
+/// expression converts a jsonb column written before tuples had types and a
+/// composite column whose shape has since changed.
+fn tuple_conversion_expr(col: &str, target_type: &str) -> String {
+    match target_type.strip_suffix("[]") {
+        Some(element) => format!("_pylon.populate_tuples(NULL::{element}, to_jsonb({}))", qi(col)),
+        None => format!("_pylon.populate_tuple(NULL::{target_type}, to_jsonb({}))", qi(col)),
+    }
+}
+
 /// Whether `pg_type` names one of the schema's own enums (or an array of one).
 /// PostgreSQL will not cast between two enum types directly, so such a column
 /// has to be converted through `text`.
@@ -1805,8 +2034,8 @@ fn topo_sort_types(types: &[TypeDescriptor], polymorphic: &HashSet<String>) -> V
 /// A property's actual DDL column type: its own registered-scalar DOMAIN
 /// name when it has one (`column_type`), else its plain `pg_type` (with the
 /// `__nt__:` nominal-tuple marker resolved to `jsonb`).
-fn col_type_str(p: &crate::schema::PropertyDescriptor) -> &str {
-    p.column_type.as_deref().unwrap_or_else(|| resolved_pg_type(&p.pg_type))
+fn col_type_str(p: &crate::schema::PropertyDescriptor, owner_module: &str) -> String {
+    crate::schema::column_ddl_type(p, owner_module)
 }
 
 /// Maps a Pylon-internal base `pg_type` spelling to PostgreSQL's own
@@ -1883,6 +2112,11 @@ fn diff_inner(
         .iter()
         .map(|d| (d.schema.as_str(), d.name.as_str()))
         .collect();
+    let cur_composites: HashMap<(&str, &str), &DbComposite> = current
+        .composites
+        .iter()
+        .map(|c| ((c.schema.as_str(), c.name.as_str()), c))
+        .collect();
     let cur_sequences: HashSet<(&str, &str)> = current
         .sequences
         .iter()
@@ -1925,6 +2159,9 @@ fn diff_inner(
     }
     for s in &target.scalars {
         target_schemas.insert(s.module.clone());
+    }
+    for nt in &target.named_tuples {
+        target_schemas.insert(nt.module.clone());
     }
     for f in &target.functions {
         target_schemas.insert(f.module.clone());
@@ -2106,6 +2343,118 @@ fn diff_inner(
                 local,
             );
         }
+    }
+
+    // ── Phase 3.6: composite types for tuples (before tables, which declare
+    // columns of them) ───────────────────────────────────────────────────────
+    let target_tuples = target_tuple_types(target);
+    let tuple_refs: Vec<(String, &crate::schema::tuple_type::TupleType)> = target_tuples
+        .iter()
+        .map(|t| (crate::schema::tuple_type::type_ref(&t.module, &t.name), t))
+        .collect();
+
+    // A type the database doesn't have yet is simply created. One it has with
+    // different attributes has to be *rebuilt*: PostgreSQL can append and
+    // drop attributes but cannot insert one in the middle, and a tuple's
+    // members are read by position, so attribute order is part of the type.
+    let mut rebuild: HashSet<String> = HashSet::new();
+    for (tref, t) in &tuple_refs {
+        match cur_composites.get(&(t.module.as_str(), t.name.as_str())) {
+            None => steps.push(
+                OpKey::TupleType(t.module.clone(), t.name.clone()),
+                Verb::Create,
+                verbosename_tuple_type(t),
+                DiffOp {
+                    sql: create_composite_sql(t, tref, &rebuild, &tuple_refs),
+                    non_transactional: false,
+                },
+            ),
+            Some(existing) if composite_changed(t, existing) => {
+                rebuild.insert(tref.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    // A type holding a rebuilt one is rebuilt too: its attribute points at
+    // the type that is about to be dropped, so it cannot outlive it.
+    loop {
+        let grown: Vec<String> = tuple_refs
+            .iter()
+            .filter(|(tref, t)| {
+                !rebuild.contains(tref)
+                    && cur_composites.contains_key(&(t.module.as_str(), t.name.as_str()))
+                    && t.attributes.iter().any(|a| rebuild.contains(attribute_base_type(a)))
+            })
+            .map(|(tref, _)| tref.clone())
+            .collect();
+        if grown.is_empty() {
+            break;
+        }
+        rebuild.extend(grown);
+    }
+
+    if !rebuild.is_empty() {
+        // One step for the whole set, because the sequence is one piece of
+        // work: every replacement type has to exist before any column moves
+        // to it, and every column has to have moved before any old type can
+        // be dropped. Split per type, a nested type's drop would be ordered
+        // before the type holding it had been rebuilt at all.
+        let rebuilt: Vec<(&String, &crate::schema::tuple_type::TupleType)> = tuple_refs
+            .iter()
+            .filter(|(tref, _)| rebuild.contains(tref))
+            .map(|(tref, t)| (tref, *t))
+            .collect();
+        let mut ops: Vec<DiffOp> = Vec::new();
+        // 1. the replacements, in dependency order, each referring to the
+        //    replacements of anything it holds.
+        for (_, t) in &rebuilt {
+            push_tx(&mut ops, create_composite_sql(t, &new_type_ref(t), &rebuild, &tuple_refs));
+        }
+        // 2. every column that holds one of them.
+        for (module, table, column, col_type) in tuple_columns(target) {
+            let base = col_type.strip_suffix("[]").unwrap_or(&col_type);
+            if !rebuild.contains(base) {
+                continue;
+            }
+            let Some((_, t)) = tuple_refs.iter().find(|(tref, _)| tref == base) else {
+                continue;
+            };
+            let new_base = new_type_ref(t);
+            let new_type = if col_type.ends_with("[]") {
+                format!("{new_base}[]")
+            } else {
+                new_base
+            };
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {};",
+                    qn(&module, &table),
+                    qi(&column),
+                    new_type,
+                    tuple_conversion_expr(&column, &new_type),
+                ),
+            );
+        }
+        // 3. the old types, innermost last — a type holding another cannot be
+        //    dropped after it.
+        for (tref, _) in rebuilt.iter().rev() {
+            push_tx(&mut ops, format!("DROP TYPE {};", tref));
+        }
+        // 4. the replacements take the names. A column refers to its type by
+        //    OID, so renaming moves nothing.
+        for (_, t) in &rebuilt {
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER TYPE {} RENAME TO {};",
+                    new_type_ref(t),
+                    qi(&t.name)
+                ),
+            );
+        }
+        let described: Vec<String> = rebuilt.iter().map(|(_, t)| verbosename_tuple_type(t)).collect();
+        steps.extend(OpKey::TupleTypeRebuild, Verb::Alter, described.join(", "), ops);
     }
 
     // ── Phase 3.5: scalar functions (before tables — table DEFAULTs may call them) ──
@@ -3117,6 +3466,33 @@ fn diff_inner(
         }
     }
 
+    // ── Phase 13.5: drop removed composite types ─────────────────────────────
+    // After the tables, so a dropped column takes its dependency with it. No
+    // CASCADE: a composite type still held by a column is a diff that got
+    // something wrong, and failing says so rather than taking the column
+    // along with it.
+    let target_composite_set: HashSet<(String, String)> = target_tuples
+        .iter()
+        .map(|t| (t.module.clone(), t.name.clone()))
+        .collect();
+    for cur_composite in &current.composites {
+        if !target_composite_set.contains(&(cur_composite.schema.clone(), cur_composite.name.clone())) {
+            steps.push(
+                OpKey::TupleType(cur_composite.schema.clone(), cur_composite.name.clone()),
+                Verb::Drop,
+                format!("tuple type '{}::{}'", cur_composite.schema, cur_composite.name),
+                DiffOp {
+                    sql: format!(
+                        "DROP TYPE IF EXISTS {}.{};",
+                        pg_schema(&cur_composite.schema),
+                        qi(&cur_composite.name)
+                    ),
+                    non_transactional: false,
+                },
+            );
+        }
+    }
+
     // ── Phase 14: drop removed domains ───────────────────────────────────────
     let target_domain_set: HashSet<(String, String)> = target
         .scalars
@@ -3240,7 +3616,7 @@ fn emit_create_table(td: &TypeDescriptor, schema: &SchemaDescriptor, ops: &mut V
         lines.push(format!(
             "    {} {}{}{}",
             qi(&p.name),
-            col_type_str(p),
+            col_type_str(p, &td.module),
             not_null,
             default
         ));
@@ -3317,7 +3693,7 @@ fn emit_column_diff(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}{}{};",
                 qn(&td.module, &td.table),
                 qi(&p.name),
-                col_type_str(p),
+                col_type_str(p, &td.module),
                 not_null,
                 default
             ),
@@ -3350,7 +3726,10 @@ fn emit_column_diff(
     // ── Type changes on existing columns ──────────────────────────────────────
     // e.g. a property gaining a registered custom scalar's own DOMAIN (see
     // PropertyDescriptor.column_type), or any other base-type change.
-    let type_changes: Vec<(&str, &str, bool)> = td
+    // `(column, target type, has a default to drop first, is a tuple)` — the
+    // last because a tuple's column needs a conversion no cast can express,
+    // and only the property itself knows it is one.
+    let type_changes: Vec<(&str, String, bool, bool)> = td
         .properties
         .iter()
         .filter_map(|p| {
@@ -3358,11 +3737,12 @@ fn emit_column_diff(
             if cur.is_generated {
                 return None;
             }
-            let target_type = col_type_str(p);
-            pg_type_changed(target_type, &cur.pg_type).then_some((
+            let target_type = col_type_str(p, &td.module);
+            pg_type_changed(&target_type, &cur.pg_type).then_some((
                 p.name.as_str(),
                 target_type,
                 cur.column_default.is_some(),
+                crate::schema::tuple_type::property_column_type(p, &td.module).is_some(),
             ))
         })
         .collect();
@@ -3378,7 +3758,7 @@ fn emit_column_diff(
         for (m, n, _) in &affected_views {
             push_tx(ops, format!("DROP VIEW IF EXISTS {};", qn(m, n)));
         }
-        for (col, target_type, has_default) in &type_changes {
+        for (col, target_type, has_default, to_tuple) in &type_changes {
             // Postgres checks the *existing* DEFAULT against the new type
             // before any `SET DEFAULT` further down can replace it, and
             // refuses ("default for column ... cannot be cast automatically").
@@ -3406,7 +3786,9 @@ fn emit_column_diff(
             // two enums (a renamed one, most often) has to go through `text`.
             // Only for an enum target: a numeric conversion routed through
             // text would change what it accepts.
-            let default_expr = if enum_target(schema, target_type) {
+            let default_expr = if *to_tuple {
+                tuple_conversion_expr(col, target_type)
+            } else if enum_target(schema, target_type) {
                 let text_type = if target_type.ends_with("[]") { "text[]" } else { "text" };
                 format!("{}::{text_type}::{target_type}", qi(col))
             } else {
@@ -3713,7 +4095,7 @@ fn emit_junction_table(
                 continue;
             }
             let not_null = if p.nullable { "" } else { " NOT NULL" };
-            col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), col_type_str(p), not_null));
+            col_lines.push_str(&format!(",\n    {} {}{}", qi(&p.name), col_type_str(p, &through_td.module), not_null));
         }
     }
 
@@ -3803,6 +4185,70 @@ fn diff_states_inner(before: &DbState, after: &DbState) -> Vec<DiffOp> {
                     }
                 }
             }
+        }
+    }
+
+    // New / replaced composite types. Unlike a domain, a composite type
+    // *can* be reconstructed exactly from what was introspected — the
+    // attribute list is the whole of it — so these are faithful rather than
+    // best-effort.
+    let before_composites: HashMap<(&str, &str), &DbComposite> = before
+        .composites
+        .iter()
+        .map(|c| ((c.schema.as_str(), c.name.as_str()), c))
+        .collect();
+    let mut replaced: Vec<&DbComposite> = Vec::new();
+    for c in &after.composites {
+        match before_composites.get(&(c.schema.as_str(), c.name.as_str())) {
+            None => push_tx(&mut ops, create_db_composite_sql(c, &qn(&c.schema, &c.name))),
+            Some(existing) if db_composite_changed(c, existing) => replaced.push(c),
+            Some(_) => {}
+        }
+    }
+    if !replaced.is_empty() {
+        // Same sequence Phase 3.6 emits, and for the same reason: every
+        // replacement before every column, every column before every drop.
+        for c in &replaced {
+            push_tx(
+                &mut ops,
+                create_db_composite_sql(c, &new_db_type_ref(c)),
+            );
+        }
+        for c in &replaced {
+            for (schema, table, column, is_array) in db_columns_of_composite(after, c) {
+                let new_type = match is_array {
+                    true => format!("{}[]", new_db_type_ref(c)),
+                    false => new_db_type_ref(c),
+                };
+                push_tx(
+                    &mut ops,
+                    format!(
+                        "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {};",
+                        qn(&schema, &table),
+                        qi(&column),
+                        new_type,
+                        tuple_conversion_expr(&column, &new_type),
+                    ),
+                );
+            }
+        }
+        for c in replaced.iter().rev() {
+            push_tx(&mut ops, format!("DROP TYPE {};", qn(&c.schema, &c.name)));
+        }
+        for c in &replaced {
+            push_tx(
+                &mut ops,
+                format!("ALTER TYPE {} RENAME TO {};", new_db_type_ref(c), qi(&c.name)),
+            );
+        }
+    }
+    for c in &before.composites {
+        let still_there = after
+            .composites
+            .iter()
+            .any(|a| a.schema == c.schema && a.name == c.name);
+        if !still_there {
+            push_tx(&mut ops, format!("DROP TYPE IF EXISTS {};", qn(&c.schema, &c.name)));
         }
     }
 
@@ -6116,5 +6562,450 @@ mod tests {
             candidates.is_empty(),
             "a banned rename candidate must not be re-proposed"
         );
+    }
+}
+
+#[cfg(test)]
+mod tuple_type_tests {
+    use super::*;
+    use crate::schema::{
+        NamedTupleDescriptor, PropertyDescriptor, SchemaDescriptor, TupleMemberDescriptor, TupleMemberKind,
+        TypeDescriptor, tuple_type,
+    };
+
+    fn scalar_member(name: &str, pg_type: &str) -> TupleMemberDescriptor {
+        TupleMemberDescriptor {
+            name: Some(name.to_string()),
+            kind: TupleMemberKind::Scalar {
+                pg_type: pg_type.to_string(),
+            },
+        }
+    }
+
+    fn prop(name: &str, pg_type: &str, tuple_members: Option<Vec<TupleMemberDescriptor>>) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members,
+            column_type: None,
+        }
+    }
+
+    fn type_with(module: &str, name: &str, properties: Vec<PropertyDescriptor>) -> TypeDescriptor {
+        TypeDescriptor {
+            name: name.into(),
+            module: module.into(),
+            table: name.into(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties,
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }
+    }
+
+    /// A schema with one named tuple and one type holding it, as a property
+    /// of the given `pg_type` (`__nt__:default::Point`, or that with `[]`).
+    fn point_schema(members: Vec<TupleMemberDescriptor>, prop_pg_type: &str) -> SchemaDescriptor {
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "default".into(),
+            members,
+        });
+        schema
+            .types
+            .push(type_with("default", "Pin", vec![prop("at", prop_pg_type, None)]));
+        schema
+    }
+
+    #[test]
+    fn a_new_tuple_type_is_created_before_the_table_holding_it() {
+        let schema = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point");
+        let joined = diff_schema(&schema, &DbState::default()).unwrap().join("\n");
+
+        let type_pos = joined.find("CREATE TYPE \"public\".\"Point_t\"").expect(&joined);
+        let table_pos = joined.find("\"public\".\"Pin\" (").expect(&joined);
+        assert!(type_pos < table_pos, "got:\n{joined}");
+        assert!(
+            joined.contains("\"at\" \"public\".\"Point_t\""),
+            "the column must be declared with the composite type, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_jsonb_column_is_converted_rather_than_cast() {
+        // The upgrade path for a database written before tuples had types.
+        // No cast reaches a composite from jsonb, so a blind `::type` here
+        // would fail at apply time.
+        let schema = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point");
+        let mut current = schema_to_db_state(&schema);
+        for table in &mut current.tables {
+            for col in &mut table.columns {
+                if col.name == "at" {
+                    col.pg_type = "jsonb".into();
+                }
+            }
+        }
+        // The type itself already exists; only the column is behind.
+        let joined = diff_schema(&schema, &current).unwrap().join("\n");
+
+        assert!(
+            joined.contains(
+                "ALTER TABLE \"public\".\"Pin\" ALTER COLUMN \"at\" TYPE \"public\".\"Point_t\" \
+                 USING _pylon.populate_tuple(NULL::\"public\".\"Point_t\", to_jsonb(\"at\"))"
+            ),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_jsonb_array_column_is_converted_element_wise() {
+        let schema = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point[]");
+        let mut current = schema_to_db_state(&schema);
+        for table in &mut current.tables {
+            for col in &mut table.columns {
+                if col.name == "at" {
+                    col.pg_type = "jsonb[]".into();
+                }
+            }
+        }
+        let joined = diff_schema(&schema, &current).unwrap().join("\n");
+
+        assert!(
+            joined.contains(
+                "TYPE \"public\".\"Point_t\"[] USING \
+                 _pylon.populate_tuples(NULL::\"public\".\"Point_t\", to_jsonb(\"at\"))"
+            ),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_tuple_type_the_schema_no_longer_declares_is_dropped() {
+        let before = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point");
+        let mut after = SchemaDescriptor::default();
+        after
+            .types
+            .push(type_with("default", "Pin", vec![prop("at", "text", None)]));
+
+        let joined = diff_schema(&after, &schema_to_db_state(&before)).unwrap().join("\n");
+        assert!(
+            joined.contains("DROP TYPE IF EXISTS \"public\".\"Point_t\";"),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_tuple_type_produces_no_ddl() {
+        let schema = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point");
+        let current = schema_to_db_state(&schema);
+        let ops = diff_schema(&schema, &current).unwrap();
+        assert!(
+            !ops.iter().any(|o| o.contains("Point_t")),
+            "got:\n{}",
+            ops.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_member_added_to_a_named_tuple_replaces_the_type_in_order() {
+        // PostgreSQL can append an attribute, but not insert one — and a
+        // tuple's members are read by position, so the type is replaced
+        // rather than altered. The order is the whole point: the
+        // replacement before the column, the column before the drop.
+        let before = point_schema(vec![scalar_member("x", "int8")], "__nt__:default::Point");
+        let after = point_schema(
+            vec![scalar_member("x", "int8"), scalar_member("y", "numeric")],
+            "__nt__:default::Point",
+        );
+
+        let joined = diff_schema(&after, &schema_to_db_state(&before)).unwrap().join("\n");
+        let create = joined
+            .find("CREATE TYPE \"public\".\"Point_t__new\" AS (\"x\" int8, \"y\" numeric)")
+            .expect(&joined);
+        let retype = joined
+            .find("ALTER COLUMN \"at\" TYPE \"public\".\"Point_t__new\"")
+            .expect(&joined);
+        let drop = joined.find("DROP TYPE \"public\".\"Point_t\";").expect(&joined);
+        let rename = joined
+            .find("ALTER TYPE \"public\".\"Point_t__new\" RENAME TO \"Point_t\"")
+            .expect(&joined);
+        assert!(create < retype && retype < drop && drop < rename, "got:\n{joined}");
+    }
+
+    #[test]
+    fn a_tuple_held_by_another_tuple_is_replaced_along_with_it() {
+        // `Pin` holds a `Point`, so replacing `Point` strands `Pin`'s
+        // attribute on a type that is about to be dropped.
+        fn schema_with(point_members: Vec<TupleMemberDescriptor>) -> SchemaDescriptor {
+            let mut schema = SchemaDescriptor::default();
+            schema.named_tuples.push(NamedTupleDescriptor {
+                name: "Point".into(),
+                module: "default".into(),
+                members: point_members,
+            });
+            schema.named_tuples.push(NamedTupleDescriptor {
+                name: "Pin".into(),
+                module: "default".into(),
+                members: vec![TupleMemberDescriptor {
+                    name: Some("at".into()),
+                    kind: TupleMemberKind::NamedTuple {
+                        module: "default".into(),
+                        name: "Point".into(),
+                    },
+                }],
+            });
+            schema
+                .types
+                .push(type_with("default", "Marker", vec![prop("pin", "__nt__:default::Pin", None)]));
+            schema
+        }
+        let before = schema_with(vec![scalar_member("x", "int8")]);
+        let after = schema_with(vec![scalar_member("x", "int8"), scalar_member("y", "int8")]);
+
+        let joined = diff_schema(&after, &schema_to_db_state(&before)).unwrap().join("\n");
+        assert!(
+            joined.contains("CREATE TYPE \"public\".\"Pin_t__new\" AS (\"at\" \"public\".\"Point_t__new\")"),
+            "the holder's replacement must point at the held type's replacement, got:\n{joined}"
+        );
+        // The column holds `Pin`, and that is the one that moves.
+        assert!(
+            joined.contains("ALTER COLUMN \"pin\" TYPE \"public\".\"Pin_t__new\""),
+            "got:\n{joined}"
+        );
+        let drop_pin = joined.find("DROP TYPE \"public\".\"Pin_t\";").expect(&joined);
+        let drop_point = joined.find("DROP TYPE \"public\".\"Point_t\";").expect(&joined);
+        assert!(
+            drop_pin < drop_point,
+            "the holder has to go before the type it holds, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_structural_shape_change_is_a_new_type_and_not_a_replacement() {
+        // A structural tuple is named for its content, so a changed shape is
+        // a different type — created, moved to, and the old one dropped, with
+        // no replacement dance at all.
+        let before_members = vec![scalar_member("name", "text")];
+        let after_members = vec![scalar_member("name", "text"), scalar_member("value", "numeric")];
+        let mut before = SchemaDescriptor::default();
+        before.types.push(type_with(
+            "default",
+            "Webhook",
+            vec![prop("headers", "jsonb", Some(before_members.clone()))],
+        ));
+        let mut after = SchemaDescriptor::default();
+        after.types.push(type_with(
+            "default",
+            "Webhook",
+            vec![prop("headers", "jsonb", Some(after_members.clone()))],
+        ));
+
+        let joined = diff_schema(&after, &schema_to_db_state(&before)).unwrap().join("\n");
+        let old_name = tuple_type::structural_name(&before_members);
+        let new_name = tuple_type::structural_name(&after_members);
+        assert!(
+            joined.contains(&format!("CREATE TYPE \"public\".\"{new_name}\"")),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains(&format!("DROP TYPE IF EXISTS \"public\".\"{old_name}\";")),
+            "got:\n{joined}"
+        );
+        assert!(!joined.contains("__new"), "no replacement needed, got:\n{joined}");
+    }
+
+    #[test]
+    fn a_module_that_only_declares_a_named_tuple_gets_its_schema_created() {
+        let mut schema = SchemaDescriptor::default();
+        schema.named_tuples.push(NamedTupleDescriptor {
+            name: "Point".into(),
+            module: "geo".into(),
+            members: vec![scalar_member("x", "int8")],
+        });
+        let joined = diff_schema(&schema, &DbState::default()).unwrap().join("\n");
+        let schema_pos = joined.find("CREATE SCHEMA IF NOT EXISTS \"geo\"").expect(&joined);
+        let type_pos = joined.find("CREATE TYPE \"geo\".\"Point_t\"").expect(&joined);
+        assert!(schema_pos < type_pos, "got:\n{joined}");
+    }
+}
+
+#[cfg(test)]
+mod tuple_type_live_tests {
+    //! The upgrade a database written before tuples had types goes through,
+    //! executed rather than merely asserted: no cast reaches a composite
+    //! type from jsonb, so a conversion that only *looks* right in a string
+    //! comparison would fail at apply time.
+    use super::*;
+    use crate::schema::{NamedTupleDescriptor, PropertyDescriptor, TupleMemberDescriptor, TupleMemberKind};
+    use pylon_pgcon::PgPool;
+
+    fn test_dsn() -> String {
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        format!("{prefix}_{nanos}")
+    }
+
+    fn scalar_member(name: &str, pg_type: &str) -> TupleMemberDescriptor {
+        TupleMemberDescriptor {
+            name: Some(name.to_string()),
+            kind: TupleMemberKind::Scalar {
+                pg_type: pg_type.to_string(),
+            },
+        }
+    }
+
+    fn prop(name: &str, pg_type: &str) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn the_generated_conversion_keeps_every_member_exact() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        // `_pylon.populate_tuple`/`populate_tuples` live in the internal
+        // schema, which `migration apply` ensures before running anything.
+        crate::migrate::ensure_internal_schema(&pool).await.unwrap();
+
+        let table = unique_name("tuple_upgrade");
+        let point = unique_name("Point");
+        pool.batch_execute(&format!(
+            "CREATE TABLE \"{table}\" (\"at\" jsonb, \"legs\" jsonb[]);
+             INSERT INTO \"{table}\" VALUES (
+                 '{{\"x\": 1, \"y\": 2.5000}}'::jsonb,
+                 ARRAY['{{\"x\": 3, \"y\": 4.0000}}'::jsonb]
+             );
+             INSERT INTO \"{table}\" VALUES (NULL, NULL);"
+        ))
+        .await
+        .unwrap();
+
+        // What the schema now says those columns are.
+        let mut target = SchemaDescriptor::default();
+        target.named_tuples.push(NamedTupleDescriptor {
+            name: point.clone(),
+            module: "default".into(),
+            members: vec![scalar_member("x", "int8"), scalar_member("y", "numeric")],
+        });
+        target.types.push(TypeDescriptor {
+            name: table.clone(),
+            module: "default".into(),
+            table: table.clone(),
+            abstract_: false,
+            materialized: false,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![
+                prop("at", &format!("__nt__:default::{point}")),
+                prop("legs", &format!("__nt__:default::{point}[]")),
+            ],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        });
+
+        // The database as it was: the same tables, but the columns still
+        // jsonb and the composite type not there at all.
+        let mut current = schema_to_db_state(&target);
+        current.composites.clear();
+        for t in &mut current.tables {
+            for col in &mut t.columns {
+                col.pg_type = match col.name.as_str() {
+                    "at" => "jsonb".into(),
+                    "legs" => "jsonb[]".into(),
+                    other => other.into(),
+                };
+            }
+        }
+
+        let ops = diff_schema(&target, &current).unwrap();
+        for sql in &ops {
+            pool.batch_execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("the diff emitted DDL that does not run: {e}\n{sql}"));
+        }
+
+        let rows = pool
+            .query_typed(
+                &format!(
+                    "SELECT ((\"at\").\"y\"::text, (\"legs\")[1].\"y\"::text) AS result
+                     FROM \"{table}\" WHERE \"at\" IS NOT NULL"
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        let [row] = rows.as_slice() else {
+            panic!("expected exactly the one row that had a value, got {rows:?}")
+        };
+        let pylon_value::DecodedValue::Composite(fields) = row else {
+            panic!("expected a row, got {row:?}")
+        };
+        assert_eq!(
+            fields,
+            &vec![
+                pylon_value::DecodedValue::Str("2.5000".into()),
+                pylon_value::DecodedValue::Str("4.0000".into()),
+            ],
+            "every digit a decimal member was written with has to survive the conversion"
+        );
+
+        pool.batch_execute(&format!(
+            "DROP TABLE \"{table}\"; DROP TYPE \"{point}_t\";"
+        ))
+        .await
+        .unwrap();
     }
 }

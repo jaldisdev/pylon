@@ -32,7 +32,8 @@
 //! "decode every column" path for this one caller.
 
 use crate::diff::{
-    DbColumn, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence, DbState, DbTable, DbView,
+    DbColumn, DbComposite, DbCompositeAttr, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence,
+    DbState, DbTable, DbView,
 };
 use pylon_pgcon::PgPool;
 use pylon_value::DecodedValue;
@@ -126,6 +127,29 @@ const DOMAINS_SQL: &str = r#"
       AND n.nspname NOT LIKE 'pg_%'
       AND n.nspname <> ALL($1::text[])
     ORDER BY n.nspname, t.typname
+"#;
+
+/// Standalone composite types — what a tuple compiles to (see
+/// `schema::tuple_type`). `relkind = 'c'` is what separates them from the
+/// row type every table and view also has: those share `typtype = 'c'` but
+/// are owned by a relation, and dropping one is not a thing a migration can
+/// do on its own.
+///
+/// Attributes come back one per row, in attribute order — which is part of a
+/// composite's identity here, since a tuple's members are read by position.
+/// `LEFT JOIN`, so a type with no attributes at all is still reported.
+const COMPOSITES_SQL: &str = r#"
+    SELECT (n.nspname, t.typname, a.attname, format_type(a.atttypid, a.atttypmod)) AS result
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    JOIN pg_class c ON c.oid = t.typrelid
+    LEFT JOIN pg_attribute a
+        ON a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+    WHERE t.typtype = 'c'
+      AND c.relkind = 'c'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+    ORDER BY n.nspname, t.typname, a.attnum
 "#;
 
 const DOMAIN_CHECKS_SQL: &str = r#"
@@ -309,6 +333,44 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
             schema: pg_to_module(&schema),
             name,
             checks: vec![],
+        });
+    }
+
+    // Composite types (one row per attribute, consecutive rows sharing a
+    // type — same shape as the enum loop above).
+    let mut current_composite: Option<(String, String)> = None;
+    let mut attributes: Vec<DbCompositeAttr> = Vec::new();
+    for row in query(pool, COMPOSITES_SQL, std::slice::from_ref(&object_excludes)).await? {
+        let Some([schema, name, attname, attr_type]) = fields::<4>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else {
+            continue;
+        };
+        let key = (schema, name);
+        if current_composite.as_ref() != Some(&key) {
+            if let Some((cs, cn)) = current_composite.take() {
+                state.composites.push(DbComposite {
+                    schema: pg_to_module(&cs),
+                    name: cn,
+                    attributes: std::mem::take(&mut attributes),
+                });
+            }
+            current_composite = Some(key);
+        }
+        // A composite with no attributes at all reports one row with none.
+        if let (Some(attname), Some(attr_type)) = (as_str(attname), as_str(attr_type)) {
+            attributes.push(DbCompositeAttr {
+                name: attname,
+                pg_type: attr_type,
+            });
+        }
+    }
+    if let Some((cs, cn)) = current_composite {
+        state.composites.push(DbComposite {
+            schema: pg_to_module(&cs),
+            name: cn,
+            attributes,
         });
     }
 
@@ -558,6 +620,56 @@ mod tests {
             .expect("index found");
         assert!(!idx.is_unique);
         assert_eq!(idx.method, "btree");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn finds_a_composite_type_with_its_attributes_in_order() {
+        // Attribute order is part of a tuple's identity — its members are
+        // read by position — so it has to survive introspection.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let type_name = unique_name("introspect_tuple");
+        pool.batch_execute(&format!(
+            "CREATE TYPE {type_name} AS (\"amount\" numeric, \"note\" text);"
+        ))
+        .await
+        .unwrap();
+
+        let state = introspect_db_state(&pool).await.unwrap();
+        let found = state
+            .composites
+            .iter()
+            .find(|c| c.name == type_name)
+            .unwrap_or_else(|| panic!("composite {type_name} not found"));
+        assert_eq!(found.schema, "default", "the public schema is the default module");
+        let attrs: Vec<(&str, &str)> = found
+            .attributes
+            .iter()
+            .map(|a| (a.name.as_str(), a.pg_type.as_str()))
+            .collect();
+        assert_eq!(attrs, vec![("amount", "numeric"), ("note", "text")]);
+
+        pool.batch_execute(&format!("DROP TYPE {type_name};")).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_tables_own_row_type_is_not_reported_as_a_composite() {
+        // Every table has a composite type of the same name (`typtype = 'c'`
+        // too), and a migration has no business creating or dropping one.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let table = unique_name("introspect_rowtype");
+        pool.batch_execute(&format!("CREATE TABLE {table} (id int8);"))
+            .await
+            .unwrap();
+
+        let state = introspect_db_state(&pool).await.unwrap();
+        assert!(
+            !state.composites.iter().any(|c| c.name == table),
+            "a table's row type must not look like a declared tuple type"
+        );
+
+        pool.batch_execute(&format!("DROP TABLE {table};")).await.unwrap();
     }
 
     #[tokio::test]
