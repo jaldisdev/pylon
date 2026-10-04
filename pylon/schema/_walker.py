@@ -1292,9 +1292,7 @@ def _build_named_tuple_descriptor(cls: type, _core: Any) -> Any:
     # already exists to stop for a property.
     from ._decorators import _collect_annotations
 
-    members = [
-        _build_tuple_member(name, annotation, _core) for name, annotation in _collect_annotations(cls).items()
-    ]
+    members = [_build_tuple_member(name, annotation, _core) for name, annotation in _collect_annotations(cls).items()]
     return _core.NamedTupleDescriptor(name=cls.__name__, module=module, members=members)
 
 

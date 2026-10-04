@@ -1225,7 +1225,7 @@ def test_a_member_read_out_of_a_stored_tuple_is_the_type_it_declares(live_pool, 
         assert str(cast.amount) == '12.3400'
 
         # The property under another name is still the tuple it is.
-        aliased = await client.query(f'select {module}::Line {{ p := .price }} filter .label = \'a\';')
+        aliased = await client.query(f"select {module}::Line {{ p := .price }} filter .label = 'a';")
         assert aliased[0].p.amount == decimal.Decimal('12.3400')
         assert aliased[0].p.currency == 'EUR'
 
@@ -1286,7 +1286,7 @@ def test_a_tuple_parameter_carries_every_member_as_the_type_it_is(live_pool, uni
             'raw': b'\x00\xff\x01binary',
             'big': 9223372036854775807,
             'f': float('inf'),
-            'when': _datetime.datetime(2026, 10, 4, 12, 30, tzinfo=_datetime.timezone.utc),
+            'when': _datetime.datetime(2026, 10, 4, 12, 30, tzinfo=_datetime.UTC),
             'key': _uuid.UUID('01234567-89ab-cdef-0123-456789abcdef'),
             # Wider than a float can hold, so any detour through one shows.
             'amount': decimal.Decimal('0.1000000000000000055511151231257827021181583404541015625'),
@@ -1302,15 +1302,13 @@ def test_a_tuple_parameter_carries_every_member_as_the_type_it_is(live_pool, uni
 
         # And through a column, which is where the datetime member used to
         # fail outright rather than merely come back wrong.
-        await client.execute(
-            f"insert {module}::Box {{ label := 'a', hard := <{module}::Hard>$p }};", p=value
-        )
+        await client.execute(f"insert {module}::Box {{ label := 'a', hard := <{module}::Hard>$p }};", p=value)
         [row] = await client.query(f'select {module}::Box {{ hard }};')
         assert_exact(row.hard, 'the column')
 
         # One per element of an array, too.
         in_array = await client.query_required_single(f'select <array<{module}::Hard>>$p;', p=[value])
-        assert_exact(list(in_array)[0], 'an array element')
+        assert_exact(next(iter(in_array)), 'an array element')
 
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
