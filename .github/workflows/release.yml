@@ -138,10 +138,18 @@ jobs:
       # somebody has to store and rotate.
       id-token: write
     steps:
+      # Named explicitly rather than taking everything the run produced: the
+      # image jobs upload digests too, and anything that is not a wheel or an
+      # sdist makes this job fail on the way in.
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: wheels-*
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          name: sdist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
@@ -294,6 +302,6 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository_owner }}/pylon-server
         run: |
           docker buildx imagetools create \
-            $(jq -cr '.target."docker.metadata-action".tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "$IMAGE@sha256:%s " *)
           docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
