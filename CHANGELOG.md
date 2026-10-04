@@ -108,6 +108,14 @@ what made a webhook's headers unsavable.
   `pylon/query.py`'s `shape_value_tags`, which stays the readable statement
   of the contract.
 
+* A decimal keeps every digit it was written with. `/api/query` parsed one
+  into a float64, so `12.3400` arrived as `12.34` — the scale a money column
+  is written in — and a value beyond float64's reach arrived as the nearest
+  float it has. It travels as its own digits now, with the position tagged
+  `decimal` so the UI still renders it as the number it is rather than as a
+  quoted string. The tag comes from the values, since a shape says only
+  "scalar" for both `numeric` and `float64`.
+
 ### Running a server
 
 `pylon-server` is published as a container image, `ghcr.io/jaldisdev/pylon-server`,

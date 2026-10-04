@@ -120,11 +120,17 @@ pub fn value_to_json(value: &Value) -> Json {
         // choice rather than replicating that latent gap.
         Value::Bytes(b) => Json::from(hex::encode(b)),
         Value::Uuid(u) => Json::from(u.to_string()),
-        // Matches `_to_jsonable`'s own `float(value)` — lossy, but this
-        // keeps wire compatibility with the existing frontend, which
-        // expects a JSON number at a `{"kind": "decimal"}`-tagged shape
-        // position, not a string.
-        Value::Decimal(s) => s.parse::<f64>().map(Json::from).unwrap_or(Json::Null),
+        // Every digit, as its own text. A `numeric` is arbitrary precision
+        // and JSON's number is not — and neither is the browser's, which
+        // parses one into a float64 whatever the wire said, so a number
+        // here loses the value twice over: `12.3400` arrives as `12.34`
+        // (the scale a money column is written in) and a 70-digit value as
+        // the nearest float. `ScalarValue` renders a string at a
+        // `{"kind": "decimal"}`-tagged position exactly as it reads it (the
+        // same branch a pending Data Explorer edit already takes), and
+        // `value_shape::merge_decimal_tags` is what guarantees the
+        // position carries that tag.
+        Value::Decimal(s) => Json::from(s.clone()),
         Value::Duration {
             months,
             days,
@@ -186,5 +192,34 @@ pub fn client_error_payload(err: &pylon_client::Error) -> Json {
             serde_json::json!({"error": e.pg_message(), "errorType": "PylonExecutionError"})
         }
         _ => serde_json::json!({"error": err.to_string(), "errorType": "PylonExecutionError"}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decimal_keeps_every_digit_it_was_written_with() {
+        // Both halves of what a float64 would have cost: the scale a money
+        // column is written in, and a value no float can hold.
+        assert_eq!(
+            value_to_json(&Value::Decimal("12.3400".to_string())),
+            Json::from("12.3400")
+        );
+        let exact = "0.00000039999999999999998189924473035450347424557548947632312774658203125";
+        assert_eq!(value_to_json(&Value::Decimal(exact.to_string())), Json::from(exact));
+    }
+
+    #[test]
+    fn a_non_finite_decimal_travels_as_itself_too() {
+        // Postgres renders `NaN` for numeric; JSON has no literal for it,
+        // and a float64 conversion used to make it `null`.
+        assert_eq!(value_to_json(&Value::Decimal("NaN".to_string())), Json::from("NaN"));
+    }
+
+    #[test]
+    fn a_float_is_still_a_json_number() {
+        assert_eq!(value_to_json(&Value::Float64(1.5)), Json::from(1.5));
     }
 }

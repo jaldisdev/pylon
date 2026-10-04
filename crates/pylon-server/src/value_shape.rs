@@ -33,6 +33,7 @@
 //! Mirrors `pylon/query.py`'s `shape_value_tags`, which stays the readable
 //! statement of this contract.
 
+use pylon_client::Value;
 use pylon_core::query::{JsonMember, JsonMemberKind, ShapeNode};
 use serde_json::{Value as Json, json};
 
@@ -104,6 +105,63 @@ pub fn value_shape_tags(node: &ShapeNode) -> Json {
     }
 }
 
+/// Tags every position holding a decimal, which the shape alone cannot say.
+///
+/// A `ShapeNode::Scalar` carries no type, so nothing in the shape
+/// distinguishes `numeric` from `float64` — and on the wire they are both
+/// text once a decimal keeps its digits (see `to_json`). The values
+/// themselves do know, so the tag tree is folded over the rows: wherever a
+/// row holds a decimal and the shape had nothing to say, the position
+/// becomes `{"kind": "decimal"}`.
+///
+/// Folding over *every* row, rather than reading the first, is what makes a
+/// column whose first row is empty still tag the rows that aren't.
+pub fn merge_decimal_tags(tags: Json, rows: &[Value]) -> Json {
+    rows.iter().fold(tags, merge_row)
+}
+
+fn merge_row(tags: Json, value: &Value) -> Json {
+    match value {
+        // Only an untagged position is claimed: a decimal inside a named
+        // tuple is already described by its member shape.
+        Value::Decimal(_) if tags.is_null() => json!({"kind": "decimal"}),
+        Value::Object(object) => {
+            let Json::Object(mut pointers) = tags["pointers"].clone() else {
+                return tags;
+            };
+            let mut changed = false;
+            for (name, field) in object.json_fields() {
+                let Some(pointer) = pointers.get(name) else {
+                    continue;
+                };
+                let merged = merge_row(pointer.clone(), field);
+                changed |= &merged != pointer;
+                pointers.insert(name.to_string(), merged);
+            }
+            if !changed {
+                return tags;
+            }
+            let mut tags = tags;
+            tags["pointers"] = Json::Object(pointers);
+            tags
+        }
+        Value::Array(items) | Value::Tuple(items) => {
+            // An array's elements share one tag, and a tuple's elements have
+            // one each — but a tuple reads as a named tuple here, whose
+            // members already carry their own shapes, so only the array's
+            // shared element tag is worth folding into.
+            if tags["kind"] != "array" {
+                return tags;
+            }
+            let element = items.iter().fold(tags["element"].clone(), merge_row);
+            let mut tags = tags;
+            tags["element"] = element;
+            tags
+        }
+        _ => tags,
+    }
+}
+
 /// One member's own tag within a jsonb-backed tuple — the member kinds
 /// carry their own type, so this does not go back through `value_shape_tags`.
 fn member_shape_tag(member: &JsonMember) -> Json {
@@ -139,6 +197,7 @@ fn pointer_name(node: &ShapeNode) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pylon_client::DecodedValue;
     use pylon_core::query::Cardinality;
 
     fn scalar(name: &str, position: usize) -> ShapeNode {
@@ -315,6 +374,76 @@ mod tests {
         assert_eq!(tags["kind"], "array");
         assert_eq!(tags["element"]["kind"], "namedTuple");
         assert_eq!(tags["element"]["members"][0]["key"], "name");
+    }
+
+    fn decimal(text: &str) -> Value {
+        Value::Decimal(text.to_string())
+    }
+
+    #[test]
+    fn a_bare_decimal_result_is_tagged_from_its_value() {
+        // `select <decimal>'12.3400'` — the shape says only "a scalar".
+        assert_eq!(
+            merge_decimal_tags(Json::Null, &[decimal("12.3400")]),
+            json!({"kind": "decimal"})
+        );
+    }
+
+    /// A `Cost { amount, note }` row, decoded the way a real result is —
+    /// `Object`'s own fields are the client's to build, and decoding one row
+    /// exercises the same pipeline `/api/query` runs.
+    fn cost_row(amount: DecodedValue) -> (ShapeNode, Value) {
+        let shape = object(
+            Some("default::Cost"),
+            vec![scalar("__type__", 0), scalar("amount", 1), scalar("note", 2)],
+        );
+        let row = DecodedValue::Composite(vec![
+            DecodedValue::Str("default::Cost".to_string()),
+            amount,
+            DecodedValue::Str("rent".to_string()),
+        ]);
+        let value = pylon_client::decode::decode(&shape, &row);
+        (shape, value)
+    }
+
+    #[test]
+    fn a_decimal_pointer_is_tagged_within_its_object() {
+        let (shape, row) = cost_row(DecodedValue::Decimal("12.3400".to_string()));
+        let merged = merge_decimal_tags(value_shape_tags(&shape), &[row]);
+        assert_eq!(merged["pointers"]["amount"], json!({"kind": "decimal"}));
+        assert_eq!(merged["pointers"]["note"], Json::Null);
+    }
+
+    #[test]
+    fn a_row_whose_decimal_is_empty_still_takes_the_tag_from_a_later_one() {
+        let (shape, empty) = cost_row(DecodedValue::Null);
+        let (_, filled) = cost_row(DecodedValue::Decimal("1.00".to_string()));
+        let merged = merge_decimal_tags(value_shape_tags(&shape), &[empty, filled]);
+        assert_eq!(merged["pointers"]["amount"], json!({"kind": "decimal"}));
+    }
+
+    #[test]
+    fn an_array_of_decimals_tags_its_element() {
+        let tags = value_shape_tags(&ShapeNode::Array {
+            name: "amounts".to_string(),
+            position: 1,
+            element: Box::new(scalar("", 0)),
+        });
+        let merged = merge_decimal_tags(tags, &[Value::Array(vec![decimal("1.50"), decimal("2.50")])]);
+        assert_eq!(merged["element"], json!({"kind": "decimal"}));
+    }
+
+    #[test]
+    fn a_position_the_shape_already_described_is_left_alone() {
+        let tags = value_shape_tags(&enum_node("gender", "public::Gender"));
+        assert_eq!(merge_decimal_tags(tags.clone(), &[decimal("1.0")]), tags);
+    }
+
+    #[test]
+    fn a_result_holding_no_decimal_is_untouched() {
+        let (shape, row) = cost_row(DecodedValue::Str("not a decimal".to_string()));
+        let tags = value_shape_tags(&shape);
+        assert_eq!(merge_decimal_tags(tags.clone(), &[row]), tags);
     }
 
     #[test]

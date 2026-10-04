@@ -37,7 +37,7 @@ use pylon_value::DecodedValue;
 use crate::json::json_response;
 use crate::state::AppState;
 use crate::to_json::{client_error_payload, value_to_json};
-use crate::value_shape::value_shape_tags;
+use crate::value_shape::{merge_decimal_tags, value_shape_tags};
 
 fn json_to_cached_value(v: &serde_json::Value) -> DecodedValue {
     match v {
@@ -125,7 +125,9 @@ pub async fn handle_query(state: Arc<AppState>, connection: &str, body: serde_js
         &serde_json::json!({
             "objects": objects.iter().map(value_to_json).collect::<Vec<_>>(),
             "duration_ms": duration_ms,
-            "shape": query_shape_tags(&client, &pyql, &config).await,
+            // The shape alone cannot say which scalars are decimals — the
+            // values can, and do (see `merge_decimal_tags`).
+            "shape": merge_decimal_tags(query_shape_tags(&client, &pyql, &config).await, &objects),
         }),
     )
 }

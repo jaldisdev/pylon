@@ -33,7 +33,7 @@
 
 mod cache;
 mod client;
-mod decode;
+pub mod decode;
 mod error;
 mod exec;
 pub mod json;
