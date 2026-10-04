@@ -2105,6 +2105,14 @@ fn is_integer_expr(expr: &IrExpr) -> bool {
     }
 }
 
+/// A cast to a declared tuple type's *own composite type* — as opposed to
+/// one that travels as jsonb (`<json>`, or a tuple arriving as a
+/// parameter). The value is a composite row, so it is described and
+/// returned like one.
+fn is_composite_tuple_cast(cast: &crate::ir::IrTypeCast) -> bool {
+    cast.tuple_shape.is_some() && cast.pg_type != "jsonb" && !cast.pg_type.ends_with("[]")
+}
+
 fn is_raw_scalar(expr: &IrExpr) -> bool {
     // An array of tuples is the exception: it is described element-wise (see
     // `tuple_array_shape_node`), and a described array is read *at a
@@ -2114,8 +2122,10 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
         || matches!(expr, IrExpr::NamedTuple { .. })
         || matches!(expr, IrExpr::Tuple(_))
         // A row *is* the composite the result column holds; wrapping it in
-        // another would bury its members one level down from the shape.
+        // another would bury its members one level down from the shape. The
+        // same holds once it is cast to a declared tuple type.
         || matches!(expr, IrExpr::Row { .. })
+        || matches!(expr, IrExpr::TypeCast(c) if is_composite_tuple_cast(c))
         || matches!(expr, IrExpr::JsonbField { .. })
         || matches!(expr, IrExpr::JsonbIndex { .. })
 }
@@ -2610,6 +2620,12 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
                 pointers: prepend_type(pointer_nodes),
                 has_implicit_id: shape_has_implicit_id(shape),
             }
+        }
+        // A cast to a declared tuple type's own composite: the value is the
+        // row, read a member at a time, not a jsonb blob.
+        IrExpr::TypeCast(c) if is_composite_tuple_cast(c) => {
+            let shape = c.tuple_shape.as_ref().expect("checked by `is_composite_tuple_cast`");
+            composite_tuple_shape(name, position, shape.type_name.clone(), &shape.members)
         }
         IrExpr::TypeCast(c) if c.tuple_shape.is_some() => {
             let shape = c.tuple_shape.as_ref().unwrap();
@@ -16290,6 +16306,48 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_a_literal_cast_to_a_declared_tuple_type_is_a_value_of_it() {
+        // `<default::Money>(…)` is a value of the type's own composite, which
+        // coerces each member to the attribute it lands in — and makes the
+        // value comparable to a column of that type, which a jsonb one is not.
+        let mut schema = make_schema();
+        schema.named_tuples.push(crate::schema::NamedTupleDescriptor {
+            name: "Money".into(),
+            module: "default".into(),
+            members: vec![
+                crate::schema::TupleMemberDescriptor {
+                    name: Some("amount".into()),
+                    kind: crate::schema::TupleMemberKind::Scalar {
+                        pg_type: "numeric".into(),
+                    },
+                },
+                crate::schema::TupleMemberDescriptor {
+                    name: Some("currency".into()),
+                    kind: crate::schema::TupleMemberKind::Scalar { pg_type: "text".into() },
+                },
+            ],
+        });
+        let out = compile_and_emit_with("SELECT <default::Money>(amount := 1.5, currency := 'EUR')", &schema);
+        assert!(
+            out.sql.contains("ROW((1.5::float8), 'EUR'))::\"public\".\"Money_t\""),
+            "the composite cast coerces each member to its attribute: got:\n{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("jsonb"), "got:\n{}", out.sql);
+        // Named for the type that declared it, so it hydrates to that class.
+        match &out.shape.root {
+            crate::query::ShapeNode::Tuple { type_name, names, .. } => {
+                assert_eq!(type_name.as_deref(), Some("default::Money"));
+                assert_eq!(
+                    names.as_ref().unwrap(),
+                    &vec!["amount".to_string(), "currency".to_string()]
+                );
+            }
+            other => panic!("expected ShapeNode::Tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_an_array_literal_of_tuples_is_described_by_its_elements() {
         // Read as a plain array, its elements come back as bare tuples with
         // their members' names gone — and the array has to be read at a
@@ -16547,15 +16605,12 @@ select owner { posts := (select owner.posts.title) };",
 
     #[test]
     fn test_positional_tuple_literal_cast_to_tuple_type_compiles() {
-        // Each element must be cast to its own declared type — '1' isn't
-        // silently jsonb-wrapped unchanged as a string; it's coerced to
-        // int8.
+        // Each element must be cast to its own declared type, and the row
+        // they make carries those types — so the cast itself has nothing
+        // left to apply.
         let out = compile_and_emit("SELECT <tuple<int64, str>>(1, 'x')");
-        assert!(
-            out.sql.contains("jsonb_build_array((1)::int8, ('x')::text)"),
-            "got:\n{}",
-            out.sql
-        );
+        assert!(out.sql.contains("ROW((1)::int8, ('x')::text)"), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("jsonb"), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -16564,11 +16619,7 @@ select owner { posts := (select owner.posts.title) };",
         // int64 and an int literal to str must actually coerce each one, not
         // just pass the raw literal through untouched.
         let out = compile_and_emit("SELECT <tuple<int64, str>>('1', 3)");
-        assert!(
-            out.sql.contains("jsonb_build_array(('1')::int8, (3)::text)"),
-            "got:\n{}",
-            out.sql
-        );
+        assert!(out.sql.contains("ROW(('1')::int8, (3)::text)"), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -16577,11 +16628,20 @@ select owner { posts := (select owner.posts.title) };",
             "SELECT <tuple<point: tuple<x: float64, y: float64>, label: str>>(point := ('1', 2), label := 5)",
         );
         assert!(
-            out.sql.contains(
-                "jsonb_build_object('point', jsonb_build_object('x', ('1')::float8, 'y', (2)::float8), 'label', (5)::text)"
-            ),
+            out.sql.contains("ROW(ROW(('1')::float8, (2)::float8), (5)::text)"),
             "got:\n{}",
             out.sql
+        );
+        // The names still reach the reader, through the shape rather than
+        // through jsonb keys.
+        let crate::query::ShapeNode::Tuple { names, elements, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Tuple, got {:?}", out.shape.root)
+        };
+        assert_eq!(names.as_ref().unwrap(), &vec!["point".to_string(), "label".to_string()]);
+        assert!(
+            matches!(&elements[0], crate::query::ShapeNode::Tuple { names: Some(n), .. } if n == &vec!["x".to_string(), "y".to_string()]),
+            "got {:?}",
+            elements[0]
         );
     }
 

@@ -2052,6 +2052,23 @@ impl<'a> Compiler<'a> {
     /// inner expression is what makes this reliable: a parameter is the only
     /// thing that reaches `IrExpr::Param`, however the cast was written.
     fn tuple_cast(&mut self, expr: IrExpr, pg_type: String, tuple_shape: Option<TupleCastShape>) -> IrExpr {
+        // A tuple written out and cast to a *declared* tuple type is a value
+        // of that type's own composite — `ROW(…)::geo."Point_t"`, which
+        // coerces each member to the attribute it lands in. Only a declared
+        // type has one to name; a structural target's row carries its
+        // members' types already (see `try_compile_tuple_literal_cast_ctx`),
+        // and a value arriving as a parameter arrives as json.
+        if let IrExpr::Row { .. } = &expr
+            && let Some(shape) = &tuple_shape
+            && let Some(qname) = shape.type_name.as_deref()
+            && let Some((module, name)) = qname.split_once("::")
+        {
+            return IrExpr::TypeCast(Box::new(IrTypeCast {
+                expr,
+                pg_type: crate::schema::tuple_type::type_ref(module, &crate::schema::tuple_type::nominal_name(name)),
+                tuple_shape,
+            }));
+        }
         if let IrExpr::Param { index } = &expr
             && let Some(shape) = &tuple_shape
         {
@@ -3335,15 +3352,11 @@ impl<'a> Compiler<'a> {
             ast::TypeExpr::Tuple { elements } => {
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
                 match self.try_compile_tuple_literal_cast_ctx(elements, &tc.expr, None)? {
-                    // The literal-decompose path already applies each element's own
-                    // cast — still wrap in TypeCast so `tuple_shape` reaches SQL
-                    // emission for decode-time ShapeNode building (jsonb_build_*
-                    // already produces jsonb, so the outer `::jsonb` is a no-op).
-                    Some(ir) => IrExpr::TypeCast(Box::new(IrTypeCast {
-                        expr: ir,
-                        pg_type,
-                        tuple_shape,
-                    })),
+                    // The literal-decompose path applies each element's own
+                    // cast and hands back the row they make, which carries
+                    // its own shape — there is nothing for an outer cast to
+                    // add, and `::jsonb` would undo the types.
+                    Some(ir) => ir,
                     None => {
                         let inner = self.compile_expr_ctx(&tc.expr, None)?;
                         self.tuple_cast(inner, pg_type, tuple_shape)
@@ -3460,19 +3473,19 @@ impl<'a> Compiler<'a> {
         for (elem, value) in target_elements.iter().zip(source_values) {
             casted.push(self.compile_tuple_element_cast_ctx(&elem.ty, value, ctx)?);
         }
-        if named {
-            let fields = target_elements
-                .iter()
-                .zip(casted)
-                .map(|(e, v)| (e.name.clone().unwrap(), v))
-                .collect();
-            Ok(Some(IrExpr::NamedTuple {
-                fields,
-                is_free_object: false,
-            }))
-        } else {
-            Ok(Some(IrExpr::Tuple(casted)))
-        }
+        // The row the tuple is, with each member already cast to the type the
+        // target names — so the cast itself has nothing left to do, and no
+        // outer `::jsonb` to undo it. `as_jsonb_tuple` turns this back into
+        // the jsonb builder where the target really is json.
+        Ok(Some(IrExpr::Row {
+            elements: casted,
+            names: named.then(|| {
+                target_elements
+                    .iter()
+                    .map(|e| e.name.clone().expect("checked by `named`"))
+                    .collect()
+            }),
+        }))
     }
 
     /// When casting an array *literal* to `array<T>`, apply the element
@@ -12751,16 +12764,14 @@ impl<'a> Compiler<'a> {
                 if matches!(&tc.expr, Expr::Set(elems) if elems.is_empty()) {
                     return Ok(IrExpr::Null);
                 }
+                // `<tuple<a: int64, b: str>>(1, 'x')` — the row's own members
+                // carry the types the target names (see
+                // `try_compile_tuple_literal_cast_ctx`), so the cast has
+                // nothing left to apply and no `::jsonb` to undo it.
                 if let ast::TypeExpr::Tuple { elements } = &tc.ty
                     && let Some(ir) = self.try_compile_tuple_literal_cast_ctx(elements, &tc.expr, ctx)?
                 {
-                    let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
-                    let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                    return Ok(IrExpr::TypeCast(Box::new(IrTypeCast {
-                        expr: ir,
-                        pg_type,
-                        tuple_shape,
-                    })));
+                    return Ok(ir);
                 }
                 if let ast::TypeExpr::Array { element } = &tc.ty
                     && let Some(ir) = self.try_compile_array_literal_cast_ctx(element, &tc.expr, ctx)?

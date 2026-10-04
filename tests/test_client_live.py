@@ -1210,6 +1210,20 @@ def test_a_member_read_out_of_a_stored_tuple_is_the_type_it_declares(live_pool, 
         )
         assert found.label == 'a'
 
+        # A literal cast to the declared type is a value of that type, so it
+        # compares against the column and hydrates to the class.
+        [found] = await client.query(
+            f"""select {module}::Line {{ label }}
+                filter .price = <{module}::Money>(amount := <decimal>'12.3400', currency := 'EUR');"""
+        )
+        assert found.label == 'a'
+        cast = await client.query_required_single(
+            f"""select <{module}::Money>(amount := '12.3400', currency := 'EUR');"""
+        )
+        assert isinstance(cast, Money)
+        assert cast.amount == decimal.Decimal('12.3400')
+        assert str(cast.amount) == '12.3400'
+
         # The property under another name is still the tuple it is.
         aliased = await client.query(f'select {module}::Line {{ p := .price }} filter .label = \'a\';')
         assert aliased[0].p.amount == decimal.Decimal('12.3400')

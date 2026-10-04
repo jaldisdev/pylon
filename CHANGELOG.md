@@ -28,6 +28,11 @@ now — one PostgreSQL type per member, all the way down.
 * A tuple written out in a query is a row too, so `(amount :=
   <decimal>'12.3400', note := 'x')` keeps every digit beside a `float64`
   member, and a nested tuple keeps its own members' types.
+* A tuple cast over a tuple written out in the query is a row as well:
+  `<tuple<int64, str>>('1', 3)` coerces each member to the type the cast
+  names, and `<module::Money>(amount := '12.3400', currency := 'EUR')` is a
+  value of that declared type's own composite — so it compares against a
+  column of it, which a json value could not.
 * `<json>` of a tuple is unchanged: a named one becomes an object keyed by
   its member names, a positional one an array.
 * Comparing a tuple against one works: `filter .price = (amount := …,
