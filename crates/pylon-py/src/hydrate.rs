@@ -276,37 +276,24 @@ fn decode<'py>(
             };
             reg.pylon_set.bind(py).call1((PyList::new(py, items)?,))
         }
-        ShapeNode::Tuple { elements, names, .. } => {
-            // An object element is indexed out first and read as its own
-            // root: `decode_object` takes position 0 to mean "this is the
-            // whole row", true of the query's root but not of a tuple's
-            // first element.
-            let items = elements
-                .iter()
-                .map(|e| match e {
-                    ShapeNode::Object {
-                        position,
-                        type_name,
-                        pointers,
-                        ..
-                    } => {
-                        let element = item(value, *position).unwrap_or(&NULL);
-                        decode_object(py, element, type_name.as_deref(), pointers, reg)
-                    }
-                    _ => decode(py, value, e, reg),
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            // A named tuple emitted as a composite still hydrates to the
-            // value a named tuple gives, not to a plain tuple.
-            let Some(names) = names else {
-                return Ok(PyTuple::new(py, items)?.into_any());
-            };
-            let kwargs = PyDict::new(py);
-            for (name, item) in names.iter().zip(items) {
-                kwargs.set_item(name, item)?;
-            }
-            reg.named_tuple_value.bind(py).call((), Some(&kwargs))
-        }
+        // A nested tuple is a composite *inside* the row, so it is indexed
+        // out before its own elements are read at their positions within
+        // it. At the root there is nothing to index out of — see
+        // `decode_row`/`decode_at_root`.
+        ShapeNode::Tuple {
+            position,
+            elements,
+            names,
+            type_name,
+            ..
+        } => decode_tuple(
+            py,
+            item(value, *position).unwrap_or(&NULL),
+            elements,
+            names.as_deref(),
+            type_name.as_deref(),
+            reg,
+        ),
         ShapeNode::Group {
             key_nodes,
             grouping_position,
@@ -385,6 +372,12 @@ fn decode_at_root<'py>(
             };
             decode_json_tuple(py, raw, type_name.as_deref(), members.as_deref(), reg)
         }
+        ShapeNode::Tuple {
+            elements,
+            names,
+            type_name,
+            ..
+        } => decode_tuple(py, value, elements, names.as_deref(), type_name.as_deref(), reg),
         // An enum inside an array *is* the label, not a field of a record, so
         // there is no composite to read a position out of.
         ShapeNode::Enum { enum_type, .. } if !matches!(value, DecodedValue::Composite(_)) => {
@@ -495,6 +488,57 @@ fn decode_object<'py>(
 }
 
 /// Mirrors `_decode_json_tuple`.
+/// A tuple read as a composite row: each element at its own position
+/// inside `value`, which *is* the tuple (the caller has already indexed it
+/// out of whatever held it).
+///
+/// Unlike the jsonb form (`decode_json_tuple`), every member arrives already
+/// typed — a `decimal` member is a `Decimal` because the column said so, not
+/// because the declaration had to be consulted to tell it from a float.
+fn decode_tuple<'py>(
+    py: Python<'py>,
+    value: &DecodedValue,
+    elements: &[ShapeNode],
+    names: Option<&[String]>,
+    type_name: Option<&str>,
+    reg: &HydrationRegistry,
+) -> PyResult<Bound<'py, PyAny>> {
+    if matches!(value, DecodedValue::Null) {
+        return Ok(py.None().into_bound(py));
+    }
+    // An object element is indexed out first and read as its own root:
+    // `decode_object` takes position 0 to mean "this is the whole row",
+    // true of the query's root but not of a tuple's first element.
+    let items = elements
+        .iter()
+        .map(|e| match e {
+            ShapeNode::Object {
+                position,
+                type_name,
+                pointers,
+                ..
+            } => {
+                let element = item(value, *position).unwrap_or(&NULL);
+                decode_object(py, element, type_name.as_deref(), pointers, reg)
+            }
+            _ => decode(py, value, e, reg),
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let Some(names) = names else {
+        return Ok(PyTuple::new(py, items)?.into_any());
+    };
+    let kwargs = PyDict::new(py);
+    for (name, item) in names.iter().zip(items) {
+        kwargs.set_item(name, item)?;
+    }
+    // A declared named tuple hydrates to the class that declared it; an
+    // undeclared one to the generic value a named tuple gives.
+    if let Some(info) = type_name.and_then(|name| reg.classes.get(name)) {
+        return info.cls.bind(py).call((), Some(&kwargs));
+    }
+    reg.named_tuple_value.bind(py).call((), Some(&kwargs))
+}
+
 fn decode_json_tuple<'py>(
     py: Python<'py>,
     value: &DecodedValue,
@@ -586,6 +630,7 @@ fn shape_node_name(node: &ShapeNode) -> &str {
         | ShapeNode::Object { name, .. }
         | ShapeNode::Array { name, .. }
         | ShapeNode::NamedTuple { name, .. }
+        | ShapeNode::Tuple { name, .. }
         | ShapeNode::Enum { name, .. } => name,
         _ => "",
     }
@@ -632,6 +677,12 @@ fn decode_row<'py>(
         ShapeNode::Object {
             type_name, pointers, ..
         } => decode_object(py, row, type_name.as_deref(), pointers, reg),
+        ShapeNode::Tuple {
+            elements,
+            names,
+            type_name,
+            ..
+        } => decode_tuple(py, row, elements, names.as_deref(), type_name.as_deref(), reg),
         _ => decode(py, row, root, reg),
     }
 }

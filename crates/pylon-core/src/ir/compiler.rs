@@ -1310,7 +1310,7 @@ pub fn default_blocker(expr: &IrExpr) -> Option<&'static str> {
             .or_else(|| default_blocker(&i.if_))
             .or_else(|| default_blocker(&i.else_)),
         E::FunctionCall(f) => f.args.iter().find_map(default_blocker),
-        E::Array(items) | E::Tuple(items) => items.iter().find_map(default_blocker),
+        E::Array(items) | E::Tuple(items) | E::Row(items) => items.iter().find_map(default_blocker),
         E::NamedTuple { fields, .. } => fields.iter().find_map(|(_, e)| default_blocker(e)),
         E::Subscript { expr, index, .. } => default_blocker(expr).or_else(|| default_blocker(index)),
         E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } => default_blocker(expr),
@@ -3068,6 +3068,65 @@ impl<'a> Compiler<'a> {
                     .map(|pg| pg_type_to_pyql(&pg).to_string())
                     .unwrap_or_else(|_| name.clone()),
             },
+        }
+    }
+
+    /// A value on its way into a tuple-typed column, as the composite row
+    /// that column holds. Every other property's value passes through.
+    ///
+    /// A tuple written out in the query becomes a real `ROW(…)` cast to the
+    /// column's type, so each member is written as the type it is — a
+    /// `decimal` member keeps its scale instead of becoming one of jsonb's
+    /// single number type on the way in.
+    ///
+    /// Anything else — a parameter, a cast, another row's tuple column — is
+    /// read through `_pylon.populate_tuple`, which takes the value as the
+    /// object its member names describe. `to_jsonb` is the identity on the
+    /// jsonb a parameter arrives as and turns a composite into that same
+    /// object, so one expression covers every way a tuple can be handed in.
+    fn into_column_tuple(expr: IrExpr, prop: &PropertyDescriptor, module: &str) -> IrExpr {
+        let Some(column_type) = crate::schema::tuple_type::property_column_type(prop, module) else {
+            return expr;
+        };
+        if matches!(expr, IrExpr::Null) {
+            return expr;
+        }
+        // An array property's value is a set of tuples, not one tuple, so the
+        // row form does not apply to it element-wise here.
+        let is_array = column_type.ends_with("[]");
+        let row = match (&expr, is_array) {
+            (IrExpr::NamedTuple { fields, .. }, false) => {
+                Some(IrExpr::Row(fields.iter().map(|(_, e)| e.clone()).collect()))
+            }
+            (IrExpr::Tuple(elements), false) => Some(IrExpr::Row(elements.clone())),
+            _ => None,
+        };
+        match row {
+            Some(row) => IrExpr::TypeCast(Box::new(crate::ir::IrTypeCast {
+                expr: row,
+                pg_type: column_type,
+                tuple_shape: None,
+            })),
+            None => {
+                let element = column_type.strip_suffix("[]").unwrap_or(&column_type).to_string();
+                let call = |schema: Option<&str>, name: &str, args: Vec<IrExpr>| {
+                    IrExpr::FunctionCall(crate::ir::IrFunctionCall {
+                        return_pg_type: None,
+                        schema: schema.map(str::to_string),
+                        name: name.to_string(),
+                        args,
+                        sql_template: None,
+                    })
+                };
+                let as_json = call(None, "to_jsonb", vec![expr]);
+                let typed_null = IrExpr::TypeCast(Box::new(crate::ir::IrTypeCast {
+                    expr: IrExpr::Null,
+                    pg_type: element,
+                    tuple_shape: None,
+                }));
+                let helper = if is_array { "populate_tuples" } else { "populate_tuple" };
+                call(Some("_pylon"), helper, vec![typed_null, as_json])
+            }
         }
     }
 
@@ -8762,7 +8821,11 @@ impl<'a> Compiler<'a> {
                 let ir_expr = if matches!(expr, Expr::Set(v) if v.is_empty()) {
                     IrExpr::Null
                 } else {
-                    self.compile_expr(expr, td, alias)?
+                    let compiled = self.compile_expr(expr, td, alias)?;
+                    match Self::resolve_property(td, pointer_name) {
+                        Some(p) => Self::into_column_tuple(compiled, p, &td.module),
+                        None => compiled,
+                    }
                 };
                 Ok((column, ir_expr))
             })

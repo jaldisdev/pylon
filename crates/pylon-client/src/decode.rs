@@ -36,6 +36,9 @@ pub fn decode(shape: &ShapeNode, value: &DecodedValue) -> Value {
     match shape {
         // The row is the root object's own tuple.
         ShapeNode::Object { position: 0, .. } => decode_inner(shape, value, Some(0)),
+        // And a root tuple *is* the row, with nothing to index out of — the
+        // same distinction `decode_row`/`decode_at_root` draw in `pylon-py`.
+        ShapeNode::Tuple { position: 0, .. } => decode_inner(shape, value, Some(0)),
         _ => decode_inner(shape, value, None),
     }
 }
@@ -83,8 +86,21 @@ fn decode_inner(shape: &ShapeNode, value: &DecodedValue, position_override: Opti
         ShapeNode::Enum {
             position, enum_type, ..
         } => decode_enum(value, position_override.unwrap_or(*position), enum_type),
-        ShapeNode::Tuple { elements, .. } => {
-            Value::Tuple(elements.iter().map(|e| decode_inner(e, value, None)).collect())
+        // A nested tuple is a composite inside the row, indexed out before
+        // its elements are read at their own positions within it. At the
+        // root the row *is* the tuple, which `position_override` says.
+        ShapeNode::Tuple {
+            position,
+            elements,
+            names,
+            type_name,
+            ..
+        } => {
+            let row = match position_override {
+                Some(_) => value.clone(),
+                None => composite_at(value, *position),
+            };
+            decode_composite_tuple(&row, elements, names.as_deref(), type_name.as_deref())
         }
         ShapeNode::Group {
             key_nodes,
@@ -128,6 +144,7 @@ fn pointer_name(node: &ShapeNode) -> &str {
         ShapeNode::Scalar { name, .. }
         | ShapeNode::Enum { name, .. }
         | ShapeNode::NamedTuple { name, .. }
+        | ShapeNode::Tuple { name, .. }
         | ShapeNode::Object { name, .. }
         | ShapeNode::Array { name, .. } => name,
         other => unreachable!("shape node kind never appears as an object's own pointer: {other:?}"),
@@ -213,6 +230,33 @@ fn decode_array(value: &DecodedValue, position: usize, element: &ShapeNode) -> V
         _ => vec![],
     };
     Value::Array(items.iter().map(|item| decode_inner(element, item, Some(0))).collect())
+}
+
+/// A tuple read as the composite row it is — each element at its own
+/// position inside `row`, every member already carrying its own PostgreSQL
+/// type rather than being recovered from a jsonb number.
+///
+/// A positional tuple is a `Value::Tuple`; a named one is a `Value::Object`,
+/// the same shape `decode_json_tuple` gives a named tuple, so a caller reads
+/// one the same way however it was stored.
+fn decode_composite_tuple(
+    row: &DecodedValue,
+    elements: &[ShapeNode],
+    names: Option<&[String]>,
+    type_name: Option<&str>,
+) -> Value {
+    if matches!(row, DecodedValue::Null) {
+        return Value::Null;
+    }
+    let items: Vec<Value> = elements.iter().map(|e| decode_inner(e, row, None)).collect();
+    match names {
+        None => Value::Tuple(items),
+        Some(names) => Value::Object(Object {
+            type_name: type_name.map(str::to_string),
+            fields: names.iter().cloned().zip(items).collect(),
+            implicit_id: false,
+        }),
+    }
 }
 
 fn decode_named_tuple(
@@ -801,6 +845,7 @@ mod tests {
     fn decodes_a_positional_structural_tuple() {
         let value = comp(vec![DecodedValue::I64(1), DecodedValue::I64(2)]);
         let shape = ShapeNode::Tuple {
+            name: String::new(),
             position: 0,
             elements: vec![
                 ShapeNode::Scalar {
@@ -813,6 +858,7 @@ mod tests {
                 },
             ],
             names: None,
+            type_name: None,
         };
         assert_eq!(
             decode(&shape, &value),

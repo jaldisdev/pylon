@@ -546,8 +546,11 @@ def test_an_array_of_named_tuples_round_trips_as_the_type_it_declares(live_pool,
 
         schema = _build_schema(*snapshot(), named_tuples=[Point])
         ddl = export_schema(schema)
-        assert '"waypoints" jsonb[]' in ddl, ddl
-        assert '"headers" jsonb[]' in ddl, ddl
+        # Each element is the composite type its declaration asks for, so
+        # every member keeps its own Postgres type. A declared named tuple is
+        # named for itself; a structural one for its content.
+        assert f'"waypoints" "{module}"."Point_t"[]' in ddl, ddl
+        assert '"headers" "' in ddl and '"."t_' in ddl, ddl
 
         await live_pool.batch_execute(ddl)
         await migration_ensure_internal_schema(live_pool)

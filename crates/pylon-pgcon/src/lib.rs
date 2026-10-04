@@ -1100,6 +1100,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn decodes_a_real_named_composite_through_connect_time_discovery() {
+        // A tuple's column type: the type is the database's own, so its OID
+        // is database-assigned and only the registry can say it is readable.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        pool.query_raw(
+            "DO $$ BEGIN CREATE TYPE pgcon_disc_tuple AS (\"amount\" numeric, \"note\" text); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        )
+        .await
+        .ok();
+
+        pool.refresh_types().await.unwrap();
+
+        let rows = pool
+            .query_composite(
+                "SELECT (
+                     ROW(12.3400, 'x')::pgcon_disc_tuple,
+                     ARRAY[ROW(1.500, 'y')::pgcon_disc_tuple]
+                 ) AS result",
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+
+        let DecodedValue::Composite(fields) = &rows[0] else {
+            panic!("expected Composite, got {:?}", rows[0])
+        };
+        assert_eq!(
+            fields[0],
+            DecodedValue::Composite(vec![
+                DecodedValue::Decimal("12.3400".to_string()),
+                DecodedValue::Str("x".to_string()),
+            ]),
+            "each member keeps its own type, scale included"
+        );
+        assert_eq!(
+            fields[1],
+            DecodedValue::Array(vec![DecodedValue::Composite(vec![
+                DecodedValue::Decimal("1.500".to_string()),
+                DecodedValue::Str("y".to_string()),
+            ])]),
+            "an array of them reads element-wise"
+        );
+    }
+
     // ── a registry that goes stale underneath a running pool ────────────
 
     /// Read as `int8`, so this needs no registry of its own.

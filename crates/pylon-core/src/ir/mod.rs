@@ -1063,6 +1063,14 @@ pub enum IrExpr {
     ObjectSubquery(Box<IrSelect>),
     /// Positional tuple construction: `(1, 'x')` → `jsonb_build_array(1, 'x')`.
     Tuple(Vec<IrExpr>),
+    /// A tuple as the composite row a column of one holds — `ROW(1, 'x')`,
+    /// cast to that column's own type by the `TypeCast` wrapped around it.
+    ///
+    /// Distinct from `Tuple`/`NamedTuple`, which build the jsonb value a
+    /// tuple travels as *inside a query*: a composite row keeps one
+    /// PostgreSQL type per member, which is the whole point of a tuple's
+    /// column having a type of its own (see `schema::tuple_type`).
+    Row(Vec<IrExpr>),
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.
     GlobalParam {
         index: usize,

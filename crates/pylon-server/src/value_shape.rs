@@ -77,12 +77,31 @@ pub fn value_shape_tags(node: &ShapeNode) -> Json {
                 }),
             })
         }
-        ShapeNode::Tuple { elements, .. } => json!({
+        // A tuple read as a composite row describes itself exactly as a
+        // jsonb-backed one does — the frontend renders `(key := value, …)`
+        // from this, and which of the two a value was stored as is not
+        // something it should be able to tell.
+        ShapeNode::Tuple {
+            elements,
+            names,
+            type_name,
+            ..
+        } => json!({
             "kind": "namedTuple",
-            "typeName": Json::Null,
+            "typeName": match type_name {
+                Some(name) => json!(name),
+                None => Json::Null,
+            },
             "members": elements
                 .iter()
-                .map(|element| json!({"key": Json::Null, "shape": value_shape_tags(element)}))
+                .enumerate()
+                .map(|(i, element)| json!({
+                    "key": match names.as_ref().and_then(|names| names.get(i)) {
+                        Some(name) => json!(name),
+                        None => Json::Null,
+                    },
+                    "shape": value_shape_tags(element),
+                }))
                 .collect::<Vec<_>>(),
         }),
         ShapeNode::Object {
@@ -189,6 +208,7 @@ fn pointer_name(node: &ShapeNode) -> &str {
         ShapeNode::Scalar { name, .. }
         | ShapeNode::Enum { name, .. }
         | ShapeNode::NamedTuple { name, .. }
+        | ShapeNode::Tuple { name, .. }
         | ShapeNode::Object { name, .. }
         | ShapeNode::Array { name, .. } => name,
         _ => "",
@@ -467,9 +487,11 @@ mod tests {
     #[test]
     fn a_positional_tuple_reads_as_a_named_tuple_with_no_keys() {
         let node = ShapeNode::Tuple {
+            name: String::new(),
             position: 0,
             elements: vec![scalar("", 0), enum_node("", "public::Gender")],
             names: None,
+            type_name: None,
         };
         let tags = value_shape_tags(&node);
         assert_eq!(tags["kind"], "namedTuple");

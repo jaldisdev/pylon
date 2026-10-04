@@ -1283,7 +1283,18 @@ def _build_tuple_member(name: str | None, annotation: Any, _core: Any) -> Any:
 
 def _build_named_tuple_descriptor(cls: type, _core: Any) -> Any:
     module = getattr(cls, '__pylon_module__', None) or ((cls.__module__ or 'default').rpartition('.')[-1] or 'default')
-    members = [_build_tuple_member(name, annotation, _core) for name, annotation in cls.__annotations__.items()]
+    # Resolved, not raw: under `from __future__ import annotations` every
+    # member arrives as a *string*, which fell through `_to_pg_type` to its
+    # bare-Python-type fallback and became `text`. Each member's own type is
+    # what its column is declared with (see `schema::tuple_type` on the Rust
+    # side), so a `float64` member silently stored as text is a wrong column,
+    # not just a wrong label — the same failure `_collect_annotations`
+    # already exists to stop for a property.
+    from ._decorators import _collect_annotations
+
+    members = [
+        _build_tuple_member(name, annotation, _core) for name, annotation in _collect_annotations(cls).items()
+    ]
     return _core.NamedTupleDescriptor(name=cls.__name__, module=module, members=members)
 
 

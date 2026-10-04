@@ -465,7 +465,7 @@ fn collect_expr(expr: &IrExpr, tags: &mut Vec<String>) {
                 collect_path_select(b, tags);
             }
         }
-        IrExpr::Array(elems) | IrExpr::Tuple(elems) => {
+        IrExpr::Array(elems) | IrExpr::Tuple(elems) | IrExpr::Row(elems) => {
             for e in elems {
                 collect_expr(e, tags);
             }

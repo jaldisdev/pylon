@@ -153,17 +153,23 @@ pub struct ExtensionOids {
     /// Domain OID to the OID of the type it wraps. A domain's wire format is
     /// its base type's, so these decode by recursing on the base.
     pub domains: std::collections::HashMap<u32, u32>,
-    /// Array types whose element is one of the enums or domains above. The
-    /// element OID travels in the array's own binary header, so recognising
-    /// the array OID is all `decode_array` needs; without this an
-    /// `AuthenticationMethod[]` column is an `UnknownTypeOid` even though
+    /// Every composite type OID — the types tuples compile to, and every
+    /// table's own row type, which share one wire format. Their fields
+    /// carry their own OIDs in the payload (see `decode_record`), so
+    /// recognising the composite OID is all that is needed to read one.
+    pub composites: std::collections::HashSet<u32>,
+    /// Array types whose element is one of the enums, domains or composites
+    /// above. The element OID travels in the array's own binary header, so
+    /// recognising the array OID is all `decode_array` needs; without this
+    /// an `AuthenticationMethod[]` column is an `UnknownTypeOid` even though
     /// every value in it would decode.
     pub arrays: std::collections::HashSet<u32>,
 }
 
 /// One round trip that classifies every non-builtin type in the database:
 /// the `vector` extension type, all enums, all domains with the base type
-/// each resolves to, and the array types over any of those.
+/// each resolves to, every composite type, and the array types over any of
+/// those.
 ///
 /// Arrays are reported with a `'A'` in the typtype column. Postgres never
 /// uses that letter itself (`b`, `c`, `d`, `e`, `m`, `p`, `r` are the real
@@ -173,12 +179,12 @@ pub(crate) const TYPE_DISCOVERY_SQL: &str = "\
 SELECT t.oid::int8, t.typtype::text, COALESCE(b.oid, 0)::int8, t.typname::text \
 FROM pg_type t \
 LEFT JOIN pg_type b ON b.oid = t.typbasetype \
-WHERE t.typtype IN ('e', 'd') OR t.typname = 'vector' \
+WHERE t.typtype IN ('e', 'd', 'c') OR t.typname = 'vector' \
 UNION ALL \
 SELECT a.oid::int8, 'A', e.oid::int8, a.typname::text \
 FROM pg_type a \
 JOIN pg_type e ON e.oid = a.typelem \
-WHERE a.typcategory = 'A' AND e.typtype IN ('e', 'd')";
+WHERE a.typcategory = 'A' AND e.typtype IN ('e', 'd', 'c')";
 
 impl ExtensionOids {
     /// Builds a registry from `TYPE_DISCOVERY_SQL`'s rows, given as
@@ -192,6 +198,9 @@ impl ExtensionOids {
                 }
                 "d" if base_oid != 0 => {
                     out.domains.insert(oid, base_oid);
+                }
+                "c" => {
+                    out.composites.insert(oid);
                 }
                 "A" => {
                     out.arrays.insert(oid);
@@ -258,6 +267,10 @@ pub fn decode_value(oid: u32, data: &[u8], ext: &ExtensionOids) -> Result<Decode
             // An enum's binary representation is its label, as text.
             Ok(DecodedValue::Str(std::str::from_utf8(data)?.to_string()))
         }
+        // A named composite is written exactly as an anonymous `record` is,
+        // one type OID per field, so the type's own identity adds nothing to
+        // reading it.
+        _ if ext.composites.contains(&oid) => decode_record(data, ext),
         // The element OID is in the array's own header, so this only has to
         // recognise that the type is an array at all.
         _ if ext.arrays.contains(&oid) => decode_array(data, ext),
@@ -1231,6 +1244,68 @@ mod tests {
         ]);
         assert!(ext.enums.contains(&50_001));
         assert!(ext.arrays.contains(&50_010));
+    }
+
+    #[test]
+    fn discovery_rows_record_composite_types_and_their_arrays() {
+        let ext = ExtensionOids::from_discovery_rows([
+            (50_020, "c".to_string(), 0, "Point_t".to_string()),
+            (50_021, "A".to_string(), 50_020, "_Point_t".to_string()),
+        ]);
+        assert!(ext.composites.contains(&50_020));
+        assert!(ext.arrays.contains(&50_021));
+    }
+
+    #[test]
+    fn decodes_a_named_composite_as_the_record_it_is_written_as() {
+        // A tuple's column type. Its OID is database-assigned, so without
+        // discovery the value is an UnknownTypeOid — but the payload is a
+        // plain record, every field carrying its own type.
+        let ext = ExtensionOids {
+            composites: std::collections::HashSet::from([50_020]),
+            ..Default::default()
+        };
+        let numeric = {
+            // 12.3400: four digits of scale, two base-10000 groups.
+            let mut out = 2i16.to_be_bytes().to_vec(); // ndigits
+            out.extend_from_slice(&0i16.to_be_bytes()); // weight
+            out.extend_from_slice(&0i16.to_be_bytes()); // sign (positive)
+            out.extend_from_slice(&4i16.to_be_bytes()); // dscale
+            out.extend_from_slice(&12i16.to_be_bytes());
+            out.extend_from_slice(&3400i16.to_be_bytes());
+            out
+        };
+        let encoded = encode_record(&[(OID_NUMERIC, Some(&numeric)), (OID_TEXT, Some(b"x"))]);
+
+        let decoded = decode_value(50_020, &encoded, &ext).unwrap();
+        assert_eq!(
+            decoded,
+            DecodedValue::Composite(vec![
+                DecodedValue::Decimal("12.3400".to_string()),
+                DecodedValue::Str("x".to_string()),
+            ]),
+            "a decimal member keeps its own scale, which is the whole reason for the type"
+        );
+    }
+
+    #[test]
+    fn decodes_an_array_of_a_discovered_composite() {
+        // An `array<tuple<…>>` column.
+        let ext = ExtensionOids {
+            composites: std::collections::HashSet::from([50_020]),
+            arrays: std::collections::HashSet::from([50_021]),
+            ..Default::default()
+        };
+        let one = encode_record(&[(OID_INT8, Some(&1i64.to_be_bytes()))]);
+        let two = encode_record(&[(OID_INT8, Some(&2i64.to_be_bytes()))]);
+        let encoded = encode_array(50_020, &[Some(&one), Some(&two)]);
+        assert_eq!(
+            decode_value(50_021, &encoded, &ext).unwrap(),
+            DecodedValue::Array(vec![
+                DecodedValue::Composite(vec![DecodedValue::I64(1)]),
+                DecodedValue::Composite(vec![DecodedValue::I64(2)]),
+            ])
+        );
     }
 
     #[test]

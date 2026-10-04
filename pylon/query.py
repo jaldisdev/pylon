@@ -292,24 +292,38 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         return PylonSet(_decode(item, {**element, 'position': 0}, registry) for item in arr)
 
     if kind == 'tuple':
+        # A nested tuple is a composite *inside* the row, so it is indexed
+        # out before its own elements are read at their positions within it.
+        # At the root the row is the tuple itself, which `position` 0 means
+        # here the same way it does for an object.
+        pos = node.get('position', 0)
+        row = value if pos == 0 else value[pos]
+        if row is None:
+            return None
         # An object element is indexed out first and read as its own root,
         # the way `array` does above: the object branch takes position 0 to
         # mean "this is the whole row", which is true of the query's root
         # but not of a tuple's first element.
         items = [
-            _decode(value[e['position']], {**e, 'position': 0}, registry)
+            _decode(row[e['position']], {**e, 'position': 0}, registry)
             if e['kind'] == 'object'
-            else _decode(value, e, registry)
+            else _decode(row, e, registry)
             for e in node['elements']
         ]
-        # A named tuple emitted as a composite still hydrates to the value a
-        # named tuple gives, not to a plain tuple.
+        # A tuple read as a composite row still hydrates to the value a named
+        # tuple gives, not to a plain tuple.
         names = node.get('names')
         if names is None:
             return tuple(items)
+        kwargs = dict(zip(names, items, strict=True))
+        type_name = node.get('type_name')
+        if type_name is not None:
+            cls = registry.get(type_name) or registry.get(type_name.split('::')[-1])
+            if cls is not None:
+                return cls(**kwargs)
         from pylon.datatypes import NamedTupleValue
 
-        return NamedTupleValue(**dict(zip(names, items, strict=True)))
+        return NamedTupleValue(**kwargs)
 
     if kind == 'group':
         key_nodes = node['key_nodes']
@@ -408,10 +422,17 @@ def shape_value_tags(node: dict) -> Any:
             'members': None if members is None else [{'key': m['key'], 'shape': _member_shape_tag(m)} for m in members],
         }
     if kind == 'tuple':
+        # A tuple read as a composite row describes itself exactly as a
+        # jsonb-backed one does: which of the two a value was stored as is
+        # not something the frontend should be able to tell.
+        names = node.get('names') or []
         return {
             'kind': 'namedTuple',
-            'typeName': None,
-            'members': [{'key': None, 'shape': shape_value_tags(e)} for e in node['elements']],
+            'typeName': node.get('type_name'),
+            'members': [
+                {'key': names[i] if i < len(names) else None, 'shape': shape_value_tags(e)}
+                for i, e in enumerate(node['elements'])
+            ],
         }
     if kind == 'object':
         return {

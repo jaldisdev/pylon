@@ -358,10 +358,11 @@ class TestEnums:
 
 class TestTupleProperties:
     def test_a_decimal_tuple_member_hydrates_as_one(self):
-        # jsonb has one number type, so only the member's own declaration
-        # says this is a decimal rather than a float.
+        # The column is a composite type, so the member arrives as the
+        # numeric it is — nothing has to consult the declaration to tell it
+        # from a float, and a tuple reads as the row it is stored as.
         compiled = _compile('select m::Post { price }')
-        price = {'amount': _decimal.Decimal('12.3400'), 'currency': 'EUR'}
+        price = (_decimal.Decimal('12.3400'), 'EUR')
         native = assert_parity([('m::Post', _id(1), price)], compiled)
         assert native[0].price.amount == _decimal.Decimal('12.3400')
         assert isinstance(native[0].price.amount, _decimal.Decimal)
@@ -369,18 +370,18 @@ class TestTupleProperties:
 
     def test_an_empty_decimal_member_stays_empty(self):
         compiled = _compile('select m::Post { price }')
-        native = assert_parity([('m::Post', _id(1), {'amount': None, 'currency': 'EUR'})], compiled)
+        native = assert_parity([('m::Post', _id(1), (None, 'EUR'))], compiled)
         assert native[0].price.amount is None
 
     def test_a_nominal_named_tuple_property_hydrates_to_its_class(self):
         compiled = _compile('select m::Post { origin }')
-        native = assert_parity([('m::Post', _id(1), {'x': 1.0, 'y': 2.0})], compiled)
+        native = assert_parity([('m::Post', _id(1), (1.0, 2.0))], compiled)
         assert isinstance(native[0].origin, Point)
         assert (native[0].origin.x, native[0].origin.y) == (1.0, 2.0)
 
     def test_an_array_of_nominal_named_tuples_hydrates_each_element(self):
         compiled = _compile('select m::Post { route }')
-        rows = [('m::Post', _id(1), [{'x': 1.0, 'y': 2.0}, {'x': 3.0, 'y': 4.0}])]
+        rows = [('m::Post', _id(1), [(1.0, 2.0), (3.0, 4.0)])]
         native = assert_parity(rows, compiled)
         route = list(native[0].route)
         assert all(isinstance(point, Point) for point in route)
@@ -388,7 +389,7 @@ class TestTupleProperties:
 
     def test_an_array_of_named_tuples_property(self):
         compiled = _compile('select m::Post { headers }')
-        rows = [('m::Post', _id(1), [{'name': 'X-Foo', 'value': 'bar'}, {'name': 'X-Baz', 'value': 'qux'}])]
+        rows = [('m::Post', _id(1), [('X-Foo', 'bar'), ('X-Baz', 'qux')])]
         native = assert_parity(rows, compiled)
         headers = list(native[0].headers)
         assert all(isinstance(h, NamedTupleValue) for h in headers)

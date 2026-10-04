@@ -2511,13 +2511,17 @@ fn shape_node_to_py<'py>(
             d.set_item("element", shape_node_to_py(py, element)?)?;
         }
         ShapeNode::Tuple {
+            name,
             position,
             elements,
             names,
+            type_name,
         } => {
             d.set_item("kind", "tuple")?;
+            d.set_item("name", name.as_str())?;
             d.set_item("position", position)?;
             d.set_item("names", names.clone())?;
+            d.set_item("type_name", type_name.clone())?;
             let py_elems = PyList::new(
                 py,
                 elements

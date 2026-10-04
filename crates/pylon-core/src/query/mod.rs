@@ -127,16 +127,29 @@ pub enum ShapeNode {
         position: usize,
         element: Box<ShapeNode>,
     },
-    /// Anonymous positional tuple decoded to a Python tuple. No type name — no registry lookup.
-    /// A composite tuple row, read by indexing rather than out of jsonb.
-    /// `names` is set for a named tuple that had to be emitted as a composite
-    /// because an element holds an object -- jsonb has no member kind for one
-    /// (see `JsonMemberKind`) -- and decides whether this hydrates to a plain
-    /// tuple or a `NamedTupleValue`.
+    /// A tuple read as the composite row it is: each element at its own
+    /// position, carrying its own PostgreSQL type, rather than out of a
+    /// jsonb value where every number is one type (see `NamedTuple`).
+    ///
+    /// `position` follows the same convention as every other node — the
+    /// index of this value inside the row that holds it — except at the
+    /// root, where the row *is* the tuple and there is nothing to index out
+    /// of. Decoders dispatch those two cases separately (`decode_row` /
+    /// `decode_at_root` against `decode` in the hydrators).
+    ///
+    /// `names` is `None` for a positional tuple, which hydrates to a plain
+    /// tuple; `Some` for a named one, which hydrates to a `NamedTupleValue`
+    /// — or, when `type_name` names a registered `@pylon.named_tuple`
+    /// class, to that class.
     Tuple {
+        /// The pointer name within the parent object, empty at the root —
+        /// the same convention `Scalar`/`Object`/`Array` follow, and what
+        /// lets a tuple-typed property name itself in a shape.
+        name: String,
         position: usize,
         elements: Vec<ShapeNode>,
         names: Option<Vec<String>>,
+        type_name: Option<String>,
     },
     /// Named tuple decoded from jsonb. When `type_name` is Some, hydrated to the registered class.
     /// `members` carries the full per-member decode plan when statically known (a registered
