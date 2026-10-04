@@ -3216,6 +3216,47 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Both sides of a comparison involving a tuple-typed column, as values
+    /// of that column's own composite type — and whether anything was done,
+    /// since a reconciled pair is the same type by construction and has
+    /// nothing left for the operand check to judge.
+    ///
+    /// Two tuple columns are left alone: they already have a type each, and
+    /// reading one back out of json would only lose it.
+    fn reconcile_tuple_comparison(
+        &self,
+        left: IrExpr,
+        right: IrExpr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> (IrExpr, IrExpr, bool) {
+        let Some((td, _)) = ctx else {
+            return (left, right, false);
+        };
+        let left_prop = Self::tuple_property_of(&left, td);
+        let right_prop = Self::tuple_property_of(&right, td);
+        match (left_prop, right_prop) {
+            (Some(_), Some(_)) => (left, right, true),
+            (Some(prop), None) => {
+                let right = self.column_tuple_value(right, prop, &td.module);
+                (left, right, true)
+            }
+            (None, Some(prop)) => {
+                let left = self.column_tuple_value(left, prop, &td.module);
+                (left, right, true)
+            }
+            (None, None) => (left, right, false),
+        }
+    }
+
+    /// The tuple-typed property a column reference names, if it names one.
+    fn tuple_property_of<'p>(expr: &IrExpr, td: &'p TypeDescriptor) -> Option<&'p PropertyDescriptor> {
+        let IrExpr::ColumnRef { column, .. } = expr else {
+            return None;
+        };
+        let prop = td.properties.iter().find(|p| p.name == *column)?;
+        (prop.pg_type.starts_with("__nt__:") || prop.tuple_members.is_some()).then_some(prop)
+    }
+
     /// A tuple property's members, nominal or structural — `None` for a
     /// property that is not a tuple, or a nominal one whose declaration is
     /// not in the schema.
@@ -10708,6 +10749,28 @@ impl<'a> Compiler<'a> {
                     expr: IrExpr::ArrayFromSelect(src),
                 }));
             }
+            // `p := .price` is the property itself under another name, and a
+            // tuple's members are reachable by name only through the shape
+            // its own pointer carries — a computed has none to put them in,
+            // so the value would hydrate as a bare tuple.
+            if let IrExpr::ColumnRef {
+                alias: column_alias,
+                column,
+                pg_type,
+            } = &ir
+                && column_alias == alias
+                && let Some(prop) = Self::resolve_property(td, column)
+                && let Some(shape) = self.resolve_property_tuple_shape(prop)
+            {
+                return Ok(IrShapePointer::Scalar(IrScalarPointer {
+                    implicit_id: false,
+                    marker_offset: el.marker_offset,
+                    alias: pointer_name.to_string(),
+                    column: column.clone(),
+                    pg_type: pg_type.clone(),
+                    tuple_shape: Some(shape),
+                }));
+            }
             return Ok(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset: el.marker_offset,
                 alias: pointer_name.to_string(),
@@ -13045,7 +13108,14 @@ impl<'a> Compiler<'a> {
                         });
                     }
                 }
-                if let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right))
+                // A tuple's column holds a composite row, so a value compared
+                // against it has to be one of the same type: a row literal is
+                // anonymous until it is cast, and a parameter arrives as jsonb.
+                // Reconciling here makes the two the same type by
+                // construction, which is why the check below is then skipped.
+                let (left, right, reconciled) = self.reconcile_tuple_comparison(left, right, ctx);
+                if !reconciled
+                    && let (Some(lt), Some(rt)) = (infer_ir_type(&left), infer_ir_type(&right))
                     && !types_compatible(lt, rt)
                     && !datetime_arithmetic_compatible(&b.op, lt, rt)
                 {

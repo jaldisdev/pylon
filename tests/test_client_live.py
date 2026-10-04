@@ -1196,6 +1196,25 @@ def test_a_member_read_out_of_a_stored_tuple_is_the_type_it_declares(live_pool, 
         assert "'nope' is not a member" in str(refused.value), refused.value
         assert 'amount, currency' in str(refused.value), refused.value
 
+        # A whole tuple compared against one: the literal is anonymous until
+        # it is cast to the column's own type, and a parameter arrives as
+        # json, so neither can be handed to Postgres as it stands.
+        [found] = await client.query(
+            f"""select {module}::Line {{ label }}
+                filter .price = (amount := <decimal>'12.3400', currency := 'EUR');"""
+        )
+        assert found.label == 'a'
+        [found] = await client.query(
+            f'select {module}::Line {{ label }} filter .price = <{module}::Money>$p;',
+            p={'amount': decimal.Decimal('12.3400'), 'currency': 'EUR'},
+        )
+        assert found.label == 'a'
+
+        # The property under another name is still the tuple it is.
+        aliased = await client.query(f'select {module}::Line {{ p := .price }} filter .label = \'a\';')
+        assert aliased[0].p.amount == decimal.Decimal('12.3400')
+        assert aliased[0].p.currency == 'EUR'
+
         await client.aclose()
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 

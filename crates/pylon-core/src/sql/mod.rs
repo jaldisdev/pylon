@@ -15892,6 +15892,59 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_a_tuple_column_compared_to_a_literal_gets_the_columns_own_type() {
+        // A row literal is anonymous until it is cast, and Postgres refuses
+        // to compare one against a named composite ("cannot compare
+        // dissimilar column types").
+        let schema = make_schema_with_a_structural_tuple_property();
+        let out = compile_and_emit_with(
+            "SELECT Person { address } FILTER .address = (street := 'Main', zip := '1000')",
+            &schema,
+        );
+        let name =
+            crate::schema::tuple_type::structural_name(schema.types[0].properties[0].tuple_members.as_ref().unwrap());
+        assert!(
+            out.sql
+                .contains(&format!("(ROW('Main', '1000'))::\"public\".\"{name}\"")),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_tuple_column_compared_to_a_parameter_is_read_into_the_columns_type() {
+        let schema = make_schema_with_a_structural_tuple_property();
+        let out = compile_and_emit_with(
+            "SELECT Person { address } FILTER .address = <tuple<street: str, zip: str>>$a",
+            &schema,
+        );
+        assert!(out.sql.contains("\"_pylon\".\"populate_tuple\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_tuple_property_under_another_name_keeps_its_members() {
+        // `p := .address` is the property itself, so its members stay
+        // reachable by name — a computed carries no shape of its own to put
+        // them in, and the value would hydrate as a bare tuple.
+        let schema = make_schema_with_a_structural_tuple_property();
+        let out = compile_and_emit_with("SELECT Person { p := .address }", &schema);
+        let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Object, got {:?}", out.shape.root)
+        };
+        let p = pointers
+            .iter()
+            .find(|ptr| matches!(ptr, crate::query::ShapeNode::Tuple { name, .. } if name == "p"))
+            .unwrap_or_else(|| panic!("expected a tuple pointer named 'p', got {pointers:?}"));
+        let crate::query::ShapeNode::Tuple { names, .. } = p else {
+            unreachable!("matched as a tuple just above")
+        };
+        assert_eq!(
+            names.as_ref().expect("a named tuple's members name themselves"),
+            &vec!["street".to_string(), "zip".to_string()]
+        );
+    }
+
+    #[test]
     fn test_a_tuple_parameter_assigned_to_a_column_is_read_into_it() {
         // A parameter arrives as jsonb, and there is no cast from jsonb to a
         // composite — `_pylon.populate_tuple` is how one is read, taking the

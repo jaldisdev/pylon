@@ -30,6 +30,12 @@ now — one PostgreSQL type per member, all the way down.
   member, and a nested tuple keeps its own members' types.
 * `<json>` of a tuple is unchanged: a named one becomes an object keyed by
   its member names, a positional one an array.
+* Comparing a tuple against one works: `filter .price = (amount := …,
+  currency := …)` and `filter .price = <module::Money>$p` both read the
+  value into the column's own type first, where the literal was refused as
+  a dissimilar type and the parameter as a `std::json`.
+* A tuple property under another name (`Line { p := .price }`) keeps its
+  members reachable by name, rather than hydrating as a bare tuple.
 * A member of a tuple that is unset — or of a tuple that is itself unset —
   contributes nothing to a path's results, matching every other empty. A
   tuple with one empty member is still a value, where `IS NOT NULL` on a
