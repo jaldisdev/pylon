@@ -33,6 +33,15 @@ now — one PostgreSQL type per member, all the way down.
   names, and `<module::Money>(amount := '12.3400', currency := 'EUR')` is a
   value of that declared type's own composite — so it compares against a
   column of it, which a json value could not.
+* A tuple **parameter** is bound as a value of the tuple's own composite
+  type, so each member arrives as the type it is declared with. Carried as
+  json — which is how this used to travel — several member types had no
+  representation at all: a `bytes` member arrived as hex text, a non-finite
+  `float64` as nothing, a `uuid` as a string, and a `datetime` as something
+  no timestamp accepts, which failed outright on the way into a column.
+  A structural `tuple<…>` binds against whatever property declares that
+  shape; where nothing does and a member is one json cannot carry, the query
+  is refused with what to declare rather than arriving as the wrong thing.
 * `<json>` of a tuple is unchanged: a named one becomes an object keyed by
   its member names, a positional one an array.
 * Comparing a tuple against one works: `filter .price = (amount := …,

@@ -316,6 +316,17 @@ pub struct ParamTupleType {
     /// structural `tuple<…>`.
     pub type_name: Option<String>,
     pub members: Vec<JsonMember>,
+    /// True when the parameter is bound as a value of the tuple's own
+    /// composite type rather than as jsonb — so the value travels as a
+    /// positional row in member order, and every member keeps the
+    /// PostgreSQL type it is declared with.
+    ///
+    /// jsonb cannot carry several of them at all: a `bytes` member becomes
+    /// text, a non-finite `float64` becomes nothing, and a `datetime`
+    /// arrives as something no timestamp accepts. Only a *declared* tuple
+    /// type has a composite to bind against, so a structural `tuple<…>`
+    /// whose shape nothing declares still travels as jsonb.
+    pub as_composite: bool,
 }
 
 /// The output of a successful PyQL compilation.

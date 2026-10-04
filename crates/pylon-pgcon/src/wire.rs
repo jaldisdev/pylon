@@ -675,14 +675,43 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             write_cached_json(value, &mut json);
             out.put_slice(json.as_bytes());
         }
-        DecodedValue::Composite(_) => {
-            // Outside jsonb, a composite only arises from *decoding* a query
-            // result (see `decode_record`): PyQL binds no raw record as a
-            // parameter, and encoding one correctly would need a per-field
-            // Postgres type that isn't available here (only the original
-            // compiled query's shape carries that). Erroring is safer than
-            // guessing wrong field types.
-            return Err(Error::message("cannot bind a composite value as a query parameter"));
+        DecodedValue::Composite(fields) => {
+            // A tuple parameter, bound as a value of the composite type its
+            // column or cast names. The driver resolves that type's own
+            // attributes when it prepares the statement, so each field is
+            // encoded against the type it really has — which is the whole
+            // point of binding it this way rather than as jsonb, where a
+            // `bytes` member becomes text and a non-finite `float64` becomes
+            // nothing at all.
+            //
+            // An anonymous `record` has no attributes to resolve, so it
+            // stays refused: there would be nothing to encode against.
+            let postgres_types::Kind::Composite(attributes) = ty.kind() else {
+                return Err(Error::message("cannot bind a composite value as a query parameter"));
+            };
+            if attributes.len() != fields.len() {
+                return Err(Error::message(format!(
+                    "cannot bind a composite value as {}: it has {} member(s), the type has {}",
+                    ty.name(),
+                    fields.len(),
+                    attributes.len()
+                )));
+            }
+            out.put_i32(i32::try_from(fields.len()).map_err(|_| Error::message("composite is too wide"))?);
+            for (field, attribute) in fields.iter().zip(attributes) {
+                out.put_u32(attribute.type_().oid());
+                // Same length-prefixed, -1-for-NULL framing every field of a
+                // composite uses on the way out (see `decode_record`).
+                let len_at = out.len();
+                out.put_i32(-1);
+                let before = out.len();
+                if let IsNull::No = encode_value(field, attribute.type_(), out)? {
+                    let written = i32::try_from(out.len() - before)
+                        .map_err(|_| Error::message("composite field is too large"))?;
+                    out[len_at..len_at + 4].copy_from_slice(&written.to_be_bytes());
+                }
+            }
+            return Ok(IsNull::No);
         }
         DecodedValue::Object(fields) => {
             out.put_u8(1); // jsonb binary format version prefix
@@ -1818,6 +1847,91 @@ mod tests {
         );
     }
 
+    /// A composite type with the given attributes, as the driver reports one
+    /// it resolved from the catalog.
+    fn composite_type(name: &str, attributes: &[(&str, postgres_types::Type)]) -> postgres_types::Type {
+        postgres_types::Type::new(
+            name.to_string(),
+            50_020,
+            postgres_types::Kind::Composite(
+                attributes
+                    .iter()
+                    .map(|(n, t)| postgres_types::Field::new((*n).to_string(), t.clone()))
+                    .collect(),
+            ),
+            "public".to_string(),
+        )
+    }
+
+    #[test]
+    fn encodes_a_composite_against_the_types_own_attributes() {
+        // The reason a tuple parameter is bound this way at all: every member
+        // travels as the type it is. Through jsonb a `bytes` member becomes
+        // text and a non-finite `float64` has no representation at all.
+        let ty = composite_type(
+            "t_hard",
+            &[
+                ("raw", postgres_types::Type::BYTEA),
+                ("f", postgres_types::Type::FLOAT8),
+            ],
+        );
+        let value = DecodedValue::Composite(vec![
+            DecodedValue::Bytes(vec![0x00, 0xff]),
+            DecodedValue::F64(f64::INFINITY),
+        ]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &ty, &mut out).unwrap();
+
+        // Read it back the way Postgres would send it, which is the same
+        // layout — so this checks the framing as well as the values.
+        let ext = ExtensionOids {
+            composites: std::collections::HashSet::from([50_020]),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_value(50_020, &out, &ext).unwrap(),
+            DecodedValue::Composite(vec![
+                DecodedValue::Bytes(vec![0x00, 0xff]),
+                DecodedValue::F64(f64::INFINITY),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_null_member_of_a_composite_parameter_stays_absent() {
+        let ty = composite_type(
+            "t_opt",
+            &[("a", postgres_types::Type::INT8), ("b", postgres_types::Type::TEXT)],
+        );
+        let value = DecodedValue::Composite(vec![DecodedValue::Null, DecodedValue::Str("x".into())]);
+        let mut out = bytes::BytesMut::new();
+        encode_value(&value, &ty, &mut out).unwrap();
+
+        let ext = ExtensionOids {
+            composites: std::collections::HashSet::from([50_020]),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_value(50_020, &out, &ext).unwrap(),
+            DecodedValue::Composite(vec![DecodedValue::Null, DecodedValue::Str("x".into())])
+        );
+    }
+
+    #[test]
+    fn a_composite_parameter_with_the_wrong_member_count_is_refused() {
+        let ty = composite_type(
+            "t_two",
+            &[("a", postgres_types::Type::INT8), ("b", postgres_types::Type::TEXT)],
+        );
+        let value = DecodedValue::Composite(vec![DecodedValue::I64(1)]);
+        let mut out = bytes::BytesMut::new();
+        let refused = encode_value(&value, &ty, &mut out);
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("it has 1 member(s), the type has 2")),
+            "a member count that cannot line up has to say so"
+        );
+    }
+
     #[test]
     fn encodes_a_composite_as_a_jsonb_array_but_refuses_it_elsewhere() {
         // An all-unnamed `tuple<str, bool>` parameter is a jsonb array, and
@@ -1832,7 +1946,7 @@ mod tests {
         let refused = encode_value(&value, &postgres_types::Type::RECORD, &mut out);
         assert!(
             refused.is_err_and(|e| e.to_string().contains("cannot bind a composite value")),
-            "a record parameter has no per-field type to encode against"
+            "an anonymous record has no attributes to encode against"
         );
     }
 }

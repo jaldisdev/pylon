@@ -1233,3 +1233,86 @@ def test_a_member_read_out_of_a_stored_tuple_is_the_type_it_declares(live_pool, 
         await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
     asyncio.run(run())
+
+
+@pytest.mark.live_db
+def test_a_tuple_parameter_carries_every_member_as_the_type_it_is(live_pool, unique_module):
+    """A tuple parameter is bound as a value of the tuple's own composite
+    type, so each member travels as the PostgreSQL type it is declared with.
+
+    Through jsonb — which is how this used to travel — several member types
+    had no representation at all: `bytes` arrived as hex text, a non-finite
+    `float64` as nothing, a `uuid` as a string, and a `datetime` as the raw
+    wire struct, which then failed to store outright.
+    """
+    import datetime as _datetime
+
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_tuple_param_types')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.named_tuple
+        class Hard(pylon.NamedTuple):
+            raw: pylon.Bytes
+            big: pylon.Int64
+            f: pylon.Float64
+            when: pylon.DateTime
+            key: pylon.UUID
+            amount: pylon.Decimal
+
+        Hard.__pylon_module__ = module
+
+        @pylon.type(module=module, name='Box')
+        class Box:
+            label: pylon.Str
+            hard: Hard | None
+
+        schema = _build_schema(*snapshot(), named_tuples=[Hard])
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json())
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        value = {
+            'raw': b'\x00\xff\x01binary',
+            'big': 9223372036854775807,
+            'f': float('inf'),
+            'when': _datetime.datetime(2026, 10, 4, 12, 30, tzinfo=_datetime.timezone.utc),
+            'key': _uuid.UUID('01234567-89ab-cdef-0123-456789abcdef'),
+            # Wider than a float can hold, so any detour through one shows.
+            'amount': decimal.Decimal('0.1000000000000000055511151231257827021181583404541015625'),
+        }
+
+        def assert_exact(got, where):
+            for name, expected in value.items():
+                actual = getattr(got, name)
+                assert actual == expected, f'{where}: {name} was {actual!r}, expected {expected!r}'
+                assert type(actual) is type(expected), f'{where}: {name} came back as {type(actual).__name__}'
+
+        assert_exact(await client.query_required_single(f'select <{module}::Hard>$p;', p=value), 'the cast')
+
+        # And through a column, which is where the datetime member used to
+        # fail outright rather than merely come back wrong.
+        await client.execute(
+            f"insert {module}::Box {{ label := 'a', hard := <{module}::Hard>$p }};", p=value
+        )
+        [row] = await client.query(f'select {module}::Box {{ hard }};')
+        assert_exact(row.hard, 'the column')
+
+        # One per element of an array, too.
+        in_array = await client.query_required_single(f'select <array<{module}::Hard>>$p;', p=[value])
+        assert_exact(list(in_array)[0], 'an array element')
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())

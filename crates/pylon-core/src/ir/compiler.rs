@@ -2051,7 +2051,13 @@ impl<'a> Compiler<'a> {
     /// parameter (see `crate::query::ParamTupleType`). Taking the *compiled*
     /// inner expression is what makes this reliable: a parameter is the only
     /// thing that reaches `IrExpr::Param`, however the cast was written.
-    fn tuple_cast(&mut self, expr: IrExpr, pg_type: String, tuple_shape: Option<TupleCastShape>) -> IrExpr {
+    fn tuple_cast(
+        &mut self,
+        expr: IrExpr,
+        pg_type: String,
+        tuple_shape: Option<TupleCastShape>,
+        target: &ast::TypeExpr,
+    ) -> IrExpr {
         // A tuple written out and cast to a *declared* tuple type is a value
         // of that type's own composite — `ROW(…)::geo."Point_t"`, which
         // coerces each member to the attribute it lands in. Only a declared
@@ -2072,11 +2078,36 @@ impl<'a> Compiler<'a> {
         if let IrExpr::Param { index } = &expr
             && let Some(shape) = &tuple_shape
         {
+            let is_array = pg_type.ends_with("[]");
+            // Bound as the tuple's own composite type where there is one to
+            // name, so each member travels as the type it is declared with.
+            let element = match shape.type_name.as_deref().and_then(|qname| qname.split_once("::")) {
+                Some((module, name)) => Some(crate::schema::tuple_type::type_ref(
+                    module,
+                    &crate::schema::tuple_type::nominal_name(name),
+                )),
+                // A structural tuple has no name of its own, so the only
+                // composite it can bind against is the one some module
+                // already declares for exactly this shape.
+                None => self.declared_structural_composite(target),
+            };
+            let composite = element.map(|element| match is_array {
+                true => format!("{element}[]"),
+                false => element,
+            });
             self.param_tuple_types[*index] = Some(crate::query::ParamTupleType {
-                is_array: pg_type.ends_with("[]"),
+                is_array,
                 type_name: shape.type_name.clone(),
                 members: shape.members.clone(),
+                as_composite: composite.is_some(),
             });
+            if let Some(pg_type) = composite {
+                return IrExpr::TypeCast(Box::new(IrTypeCast {
+                    expr,
+                    pg_type,
+                    tuple_shape,
+                }));
+            }
         }
         IrExpr::TypeCast(Box::new(IrTypeCast {
             expr,
@@ -3274,6 +3305,84 @@ impl<'a> Compiler<'a> {
         (prop.pg_type.starts_with("__nt__:") || prop.tuple_members.is_some()).then_some(prop)
     }
 
+    /// Refuses a tuple parameter whose shape has no composite type to bind
+    /// against *and* a member json cannot carry.
+    ///
+    /// Such a value travels as jsonb, where `bytes` becomes text, a `uuid`
+    /// becomes a string and every date/time type becomes something no
+    /// timestamp accepts — so it would arrive as the wrong thing with
+    /// nothing to say so. A shape some module declares has a composite and
+    /// never reaches this; declaring the tuple is the fix.
+    fn refuse_unbindable_tuple_param(&self, target: &ast::TypeExpr, inner: &IrExpr) -> Result<(), PyQLError> {
+        /// Types whose value does not survive a round trip through json.
+        const UNCARRIED: &[&str] = &["bytea", "uuid", "timestamptz", "timestamp", "date", "time", "interval"];
+
+        if !matches!(inner, IrExpr::Param { .. }) {
+            return Ok(());
+        }
+        let ast::TypeExpr::Tuple { elements } = Self::cast_element_type(target) else {
+            return Ok(());
+        };
+        if self.declared_structural_composite(target).is_some() {
+            return Ok(());
+        }
+        for element in elements {
+            let Ok(pg_type) = self.resolve_cast_pg_type(&element.ty) else {
+                continue;
+            };
+            if !UNCARRIED.contains(&pg_type.as_str()) {
+                continue;
+            }
+            let member = element.name.clone().unwrap_or_else(|| "its".to_string());
+            return Err(self.type_err(&format!(
+                "a '{}' member cannot be carried by a tuple parameter of this shape: \
+                 nothing declares it, so '{member}' would arrive as text. Declare the tuple \
+                 (`@pylon.named_tuple`) or give some property this shape, and the parameter \
+                 binds as that type instead",
+                pg_type_to_pyql(&pg_type),
+            )));
+        }
+        Ok(())
+    }
+
+    /// The composite type a structural `tuple<…>` can be bound against — the
+    /// one a module already declares for exactly this shape.
+    ///
+    /// A structural tuple is named for its content, so the type exists only
+    /// because some property is declared with that shape (see
+    /// `schema::tuple_type`). Matching on the attributes rather than
+    /// recomputing the content hash keeps this honest about what it can
+    /// find: a shape with a nested tuple in it resolves to no single
+    /// attribute type here, finds nothing, and travels as jsonb.
+    fn declared_structural_composite(&self, target: &ast::TypeExpr) -> Option<String> {
+        let ast::TypeExpr::Tuple { elements } = Self::cast_element_type(target) else {
+            return None;
+        };
+        let wanted: Vec<(String, String)> = elements
+            .iter()
+            .map(|e| Some((e.name.clone()?, self.resolve_cast_pg_type(&e.ty).ok()?)))
+            .collect::<Option<Vec<_>>>()?;
+        let declared = crate::schema::tuple_type::collect(self.schema).ok()?;
+        let found = declared.into_iter().find(|t| {
+            t.nominal.is_none()
+                && t.attributes.len() == wanted.len()
+                && t.attributes
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(attribute, (name, pg_type))| attribute.name == *name && attribute.pg_type == *pg_type)
+        })?;
+        Some(crate::schema::tuple_type::type_ref(&found.module, &found.name))
+    }
+
+    /// `array<tuple<…>>`'s element, or the type itself — a parameter binds
+    /// one composite per element either way.
+    fn cast_element_type(target: &ast::TypeExpr) -> &ast::TypeExpr {
+        match target {
+            ast::TypeExpr::Array { element } => element,
+            other => other,
+        }
+    }
+
     /// A tuple property's members, nominal or structural — `None` for a
     /// property that is not a tuple, or a nominal one whose declaration is
     /// not in the schema.
@@ -3359,14 +3468,17 @@ impl<'a> Compiler<'a> {
                     Some(ir) => ir,
                     None => {
                         let inner = self.compile_expr_ctx(&tc.expr, None)?;
-                        self.tuple_cast(inner, pg_type, tuple_shape)
+                        self.refuse_unbindable_tuple_param(&tc.ty, &inner)?;
+                        self.refuse_unbindable_tuple_param(&tc.ty, &inner)?;
+                        self.tuple_cast(inner, pg_type, tuple_shape, &tc.ty)
                     }
                 }
             }
             _ => {
                 let inner = self.compile_expr_ctx(&tc.expr, None)?;
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                self.tuple_cast(inner, pg_type, tuple_shape)
+                self.refuse_unbindable_tuple_param(&tc.ty, &inner)?;
+                self.tuple_cast(inner, pg_type, tuple_shape, &tc.ty)
             }
         };
         Ok(IrStmt::Select(IrSelect {
@@ -12929,7 +13041,8 @@ impl<'a> Compiler<'a> {
                 };
 
                 let tuple_shape = self.resolve_tuple_cast_shape(&tc.ty);
-                Ok(self.tuple_cast(inner, pg_type, tuple_shape))
+                self.refuse_unbindable_tuple_param(&tc.ty, &inner)?;
+                Ok(self.tuple_cast(inner, pg_type, tuple_shape, &tc.ty))
             }
 
             // The same coalesce with no shape after it — `(… ?? …)` standing

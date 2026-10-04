@@ -2110,7 +2110,7 @@ fn is_integer_expr(expr: &IrExpr) -> bool {
 /// parameter). The value is a composite row, so it is described and
 /// returned like one.
 fn is_composite_tuple_cast(cast: &crate::ir::IrTypeCast) -> bool {
-    cast.tuple_shape.is_some() && cast.pg_type != "jsonb" && !cast.pg_type.ends_with("[]")
+    cast.tuple_shape.is_some() && cast.pg_type != "jsonb" && cast.pg_type != "jsonb[]"
 }
 
 fn is_raw_scalar(expr: &IrExpr) -> bool {
@@ -2125,7 +2125,9 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
         // another would bury its members one level down from the shape. The
         // same holds once it is cast to a declared tuple type.
         || matches!(expr, IrExpr::Row { .. })
-        || matches!(expr, IrExpr::TypeCast(c) if is_composite_tuple_cast(c))
+        // An *array* of them is read at a position like any other array,
+        // so only a single composite is the result column itself.
+        || matches!(expr, IrExpr::TypeCast(c) if is_composite_tuple_cast(c) && !c.pg_type.ends_with("[]"))
         || matches!(expr, IrExpr::JsonbField { .. })
         || matches!(expr, IrExpr::JsonbIndex { .. })
 }
@@ -2625,7 +2627,23 @@ fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::
         // row, read a member at a time, not a jsonb blob.
         IrExpr::TypeCast(c) if is_composite_tuple_cast(c) => {
             let shape = c.tuple_shape.as_ref().expect("checked by `is_composite_tuple_cast`");
-            composite_tuple_shape(name, position, shape.type_name.clone(), &shape.members)
+            // `<array<module::Money>>`: the shape resolved above is one
+            // element's, each the whole of its own value.
+            let is_array = c.pg_type.ends_with("[]");
+            let tuple = composite_tuple_shape(
+                if is_array { "" } else { name },
+                if is_array { 0 } else { position },
+                shape.type_name.clone(),
+                &shape.members,
+            );
+            match is_array {
+                true => ShapeNode::Array {
+                    name: name.to_string(),
+                    position,
+                    element: Box::new(tuple),
+                },
+                false => tuple,
+            }
         }
         IrExpr::TypeCast(c) if c.tuple_shape.is_some() => {
             let shape = c.tuple_shape.as_ref().unwrap();
@@ -6459,6 +6477,15 @@ mod tests {
         let ast = parse::parse(query).expect("parse failed");
         let ir = ir::compile(&ast, schema).expect("IR compile failed");
         emit(&ir)
+    }
+
+    /// The message a query the compiler refuses reports.
+    fn compile_err_with(query: &str, schema: &SchemaDescriptor) -> String {
+        let ast = parse::parse(query).expect("parse failed");
+        match ir::compile(&ast, schema) {
+            Ok(_) => panic!("expected this to be refused: {query}"),
+            Err(e) => e.to_string(),
+        }
     }
 
     /// A set literal is the haystack `in` reads, so a walk that crosses a
@@ -15477,7 +15504,45 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
-    fn test_nominal_named_tuple_cast_resolves_to_jsonb() {
+    fn test_a_tuple_parameter_binds_as_the_shape_a_property_declares() {
+        // A structural tuple has no name, so the composite it binds against
+        // is the one a property already declares for that shape.
+        let schema = make_schema_with_a_structural_tuple_property();
+        let name =
+            crate::schema::tuple_type::structural_name(schema.types[0].properties[0].tuple_members.as_ref().unwrap());
+        let out = compile_and_emit_with("SELECT <tuple<street: str, zip: str>>$p", &schema);
+        assert!(
+            out.sql.contains(&format!("($1)::\"public\".\"{name}\"")),
+            "got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_tuple_parameter_no_one_declares_keeps_the_json_it_travelled_as() {
+        // Nothing declares this shape, so there is no composite to bind —
+        // and every member here survives json, so it still travels that way.
+        let schema = make_schema_with_a_structural_tuple_property();
+        let out = compile_and_emit_with("SELECT <tuple<other: str, n: int64>>$p", &schema);
+        assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_tuple_parameter_json_cannot_carry_is_refused() {
+        // Refused rather than silently arriving as text: there is no
+        // composite to bind against, and jsonb has no `bytes`.
+        let schema = make_schema_with_a_structural_tuple_property();
+        let err = compile_err_with("SELECT <tuple<raw: bytes, n: int64>>$p", &schema);
+        assert!(err.contains("std::bytes"), "got: {err}");
+        assert!(err.contains("nothing declares it"), "got: {err}");
+        assert!(err.contains("named_tuple"), "the error has to say what to do: {err}");
+    }
+
+    #[test]
+    fn test_nominal_named_tuple_cast_resolves_to_the_declared_composite() {
+        // Bound as a value of the type's own composite, not as jsonb: that is
+        // what lets a `bytes` member stay bytes and a non-finite `float64`
+        // arrive at all.
         let mut schema = make_schema();
         schema.named_tuples.push(NamedTupleDescriptor {
             name: "Point".into(),
@@ -15485,7 +15550,8 @@ select owner { posts := (select owner.posts.title) };",
             members: vec![],
         });
         let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
-        assert!(out.sql.contains("($1)::jsonb"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("($1)::\"public\".\"Point_t\""), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("jsonb"), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -15586,14 +15652,11 @@ select owner { posts := (select owner.posts.title) };",
         });
         let out = compile_and_emit_with("SELECT <default::Point>$p", &schema);
         match &out.shape.root {
-            crate::query::ShapeNode::NamedTuple { type_name, members, .. } => {
+            crate::query::ShapeNode::Tuple { type_name, names, .. } => {
                 assert_eq!(type_name.as_deref(), Some("default::Point"));
-                let members = members.as_ref().expect("expected resolved members");
-                assert_eq!(members.len(), 2);
-                assert_eq!(members[0].key.as_deref(), Some("x"));
-                assert_eq!(members[1].key.as_deref(), Some("y"));
+                assert_eq!(names.as_ref().unwrap(), &vec!["x".to_string(), "y".to_string()]);
             }
-            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+            other => panic!("expected ShapeNode::Tuple, got {other:?}"),
         }
     }
 

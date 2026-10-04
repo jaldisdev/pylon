@@ -324,7 +324,13 @@ pub(crate) fn py_params_to_cached(
                     if plan.is_array {
                         tuple_array_to_cached(value, plan, &argument)
                     } else {
-                        tuple_to_cached(value, &plan.members, plan.type_name.as_deref(), &argument)
+                        tuple_to_cached(
+                            value,
+                            &plan.members,
+                            plan.type_name.as_deref(),
+                            &argument,
+                            plan.as_composite,
+                        )
                     }
                 }
             },
@@ -388,19 +394,33 @@ fn tuple_array_to_cached(
         )));
     };
     let elements = items
-        .map(|item| tuple_to_cached(&item?, &plan.members, plan.type_name.as_deref(), argument))
+        .map(|item| {
+            tuple_to_cached(
+                &item?,
+                &plan.members,
+                plan.type_name.as_deref(),
+                argument,
+                plan.as_composite,
+            )
+        })
         .collect::<PyResult<Vec<_>>>()?;
     Ok(DecodedValue::Array(elements))
 }
 
-/// One tuple value as the jsonb it travels as: an object keyed by the member
-/// names, or — for an all-unnamed `tuple<str, bool>` — a positional
-/// `Composite`, which `wire.rs` writes as a jsonb array.
+/// One tuple value as what it travels as.
+///
+/// Bound as its own composite type (`as_composite`) it is a positional row
+/// in member order, and each member keeps the PostgreSQL type it is declared
+/// with. Bound as jsonb — a structural tuple whose shape nothing declares —
+/// it is an object keyed by the member names, or a positional `Composite`
+/// for an all-unnamed `tuple<str, bool>`, which `wire.rs` writes as a jsonb
+/// array.
 fn tuple_to_cached(
     value: &Bound<'_, PyAny>,
     members: &[JsonMember],
     type_name: Option<&str>,
     argument: &Argument<'_, '_>,
+    as_composite: bool,
 ) -> PyResult<DecodedValue> {
     if value.is_none() {
         return Ok(DecodedValue::Null);
@@ -408,48 +428,60 @@ fn tuple_to_cached(
     let keys: Vec<&str> = members.iter().filter_map(|m| m.key.as_deref()).collect();
     if keys.is_empty() {
         return Ok(DecodedValue::Composite(positional_members(
-            value, members, type_name, argument,
+            value,
+            members,
+            type_name,
+            argument,
+            as_composite,
         )?));
     }
+    // The members, in declaration order, however the caller held them.
+    let ordered = |values: Vec<DecodedValue>| match as_composite {
+        true => DecodedValue::Composite(values),
+        false => DecodedValue::Object(
+            members
+                .iter()
+                .map(|m| m.key.clone().unwrap_or_default())
+                .zip(values)
+                .collect(),
+        ),
+    };
 
     // A mapping reads by key; so does anything carrying an attribute per
     // member — an instance of a `@pylon.named_tuple` class, or a
     // `NamedTupleValue` from an earlier result. A plain tuple has neither
     // and is read by position.
     if let Ok(dict) = value.cast::<PyDict>() {
-        return Ok(DecodedValue::Object(
+        return Ok(ordered(
             members
                 .iter()
-                .map(|member| {
-                    let key = member.key.clone().unwrap_or_default();
-                    let item = match dict.get_item(&key)? {
-                        Some(item) => member_to_cached(&item, member, argument)?,
-                        None => DecodedValue::Null,
-                    };
-                    Ok((key, item))
-                })
+                .map(
+                    |member| match dict.get_item(member.key.as_deref().unwrap_or_default())? {
+                        Some(item) => member_to_cached(&item, member, argument, as_composite),
+                        None => Ok(DecodedValue::Null),
+                    },
+                )
                 .collect::<PyResult<Vec<_>>>()?,
         ));
     }
     if keys.iter().all(|key| value.hasattr(*key).unwrap_or(false)) {
-        return Ok(DecodedValue::Object(
+        return Ok(ordered(
             members
                 .iter()
                 .map(|member| {
-                    let key = member.key.clone().unwrap_or_default();
-                    let item = member_to_cached(&value.getattr(&key)?, member, argument)?;
-                    Ok((key, item))
+                    let item = value.getattr(member.key.as_deref().unwrap_or_default())?;
+                    member_to_cached(&item, member, argument, as_composite)
                 })
                 .collect::<PyResult<Vec<_>>>()?,
         ));
     }
-    Ok(DecodedValue::Object(
-        members
-            .iter()
-            .zip(positional_members(value, members, type_name, argument)?)
-            .map(|(member, item)| (member.key.clone().unwrap_or_default(), item))
-            .collect(),
-    ))
+    Ok(ordered(positional_members(
+        value,
+        members,
+        type_name,
+        argument,
+        as_composite,
+    )?))
 }
 
 /// The members read off a sequence by position — the form a plain Python
@@ -460,6 +492,7 @@ fn positional_members(
     members: &[JsonMember],
     type_name: Option<&str>,
     argument: &Argument<'_, '_>,
+    as_composite: bool,
 ) -> PyResult<Vec<DecodedValue>> {
     let described = describe_tuple_type(members, type_name);
     let items: Vec<Bound<'_, PyAny>> = match value.try_iter() {
@@ -482,7 +515,7 @@ fn positional_members(
     items
         .iter()
         .zip(members)
-        .map(|(item, member)| member_to_cached(item, member, argument))
+        .map(|(item, member)| member_to_cached(item, member, argument, as_composite))
         .collect()
 }
 
@@ -493,9 +526,13 @@ fn member_to_cached(
     value: &Bound<'_, PyAny>,
     member: &JsonMember,
     argument: &Argument<'_, '_>,
+    as_composite: bool,
 ) -> PyResult<DecodedValue> {
     match &member.kind {
-        JsonMemberKind::Tuple { type_name, members } => tuple_to_cached(value, members, type_name.as_deref(), argument),
+        // A member that is itself a tuple is a row inside the row.
+        JsonMemberKind::Tuple { type_name, members } => {
+            tuple_to_cached(value, members, type_name.as_deref(), argument, as_composite)
+        }
         _ => py_to_cached(value),
     }
 }
