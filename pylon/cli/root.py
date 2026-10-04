@@ -102,7 +102,7 @@ def cli(ctx: click.Context, db_name: str | None) -> None:
             ctx.exit(1)
         cfg = ctx.obj['config']
         project_name = cfg.project.name if cfg and cfg.project else None
-        repl(project_name=project_name)
+        repl(project_name=project_name, config=cfg)
 
 
 # --- groups -------------------------------------------------------------------

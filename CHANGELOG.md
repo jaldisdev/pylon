@@ -75,6 +75,14 @@ tuples (stored as json arrays) included. A named tuple whose members change
 has its type replaced rather than altered — PostgreSQL can append an
 attribute but not insert one, and a tuple's members are read by position.
 
+### Command line
+
+* `pylon -d <name> query …` runs against the connection it names. It silently
+  ran against the base `[database]` instead, so a query could read one
+  database while reporting on another's schema; `pylon -d <name>` with no
+  subcommand opened the interactive session on the base connection the same
+  way.
+
 ## 0.4.0 — 2026-10-04
 
 ### Connections

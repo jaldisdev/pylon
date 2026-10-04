@@ -32,8 +32,10 @@ from prompt_toolkit.keys import Keys
 
 import pylon
 from pylon.client import create_async_client
+from pylon.config import Config
 
 from ..banner import print_banner
+from ..config import requires_config
 
 # Regex that matches `set global name := expression` (case-insensitive SET/GLOBAL)
 _SET_GLOBAL_RE = re.compile(
@@ -151,7 +153,7 @@ def _history_path(project_name: str | None) -> Path:
     return history_dir / name
 
 
-def repl(*, as_json: bool = False, project_name: str | None = None) -> None:
+def repl(*, as_json: bool = False, project_name: str | None = None, config: Config | None = None) -> None:
     """Start an interactive PyQL session.
 
     Statements are terminated by a semicolon. Type \\help for help,
@@ -165,10 +167,10 @@ def repl(*, as_json: bool = False, project_name: str | None = None) -> None:
 
     print_banner(info_line='Type \\help for help, \\quit to quit.')
 
-    asyncio.run(_async_repl(as_json=as_json, project_name=project_name))
+    asyncio.run(_async_repl(as_json=as_json, project_name=project_name, config=config))
 
 
-async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
+async def _async_repl(*, as_json: bool, project_name: str | None, config: Config | None) -> None:
     session: PromptSession[str] = PromptSession(
         multiline=True,
         key_bindings=_make_bindings(),
@@ -179,7 +181,7 @@ async def _async_repl(*, as_json: bool, project_name: str | None) -> None:
     # Session globals: qualified_name → value (e.g. "default::current_user_id" → uuid)
     _session_globals: dict[str, Any] = {}
 
-    async with create_async_client() as client:
+    async with create_async_client(config) as client:
         while True:
             try:
                 text = await session.prompt_async('pylon> ')
@@ -413,7 +415,9 @@ def _selected(value: object, node: dict) -> object:
 @click.command('query')
 @click.argument('pyql_query')
 @click.option('--json', 'as_json', is_flag=True, default=False, help='Return results as JSON.')
-def query_cmd(pyql_query: str, as_json: bool) -> None:
+@requires_config
+@click.pass_context
+def query_cmd(ctx: click.Context, pyql_query: str, as_json: bool) -> None:
     """Execute a single PyQL query and print the result.
 
     Example:
@@ -427,9 +431,13 @@ def query_cmd(pyql_query: str, as_json: bool) -> None:
         raise SystemExit(1) from e
 
     pyql = pyql_query.rstrip(';').strip()
+    # The config the root group resolved, so `-d name` selects the database
+    # this query runs against; `create_async_client()` with no argument
+    # re-loads pylon.toml and would always reach the base `[database]`.
+    config = ctx.obj['config']
 
     async def run() -> None:
-        async with create_async_client() as client:
+        async with create_async_client(config) as client:
             await _execute(client, pyql, as_json=as_json, repl=False)
 
     asyncio.run(run())
