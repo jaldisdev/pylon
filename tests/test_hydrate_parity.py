@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pylon.schema as pylon
 from pylon.datatypes import LinkSet, NamedTupleValue, Object, PylonSet
-from pylon.query import _decode, hydration_registry
+from pylon.query import decode_row, hydration_registry
 from pylon.schema import Link, MultiLink
 from pylon.schema._registry import clear as clear_registry
 from pylon.schema._registry import named_tuples_snapshot, snapshot
@@ -231,7 +231,7 @@ def assert_parity(rows: list, compiled):
     from pylon._core import hydrate
 
     native = hydrate(_rowset(rows), compiled, hydration_registry())
-    reference = [_decode(row, compiled.shape, _python_registry()) for row in rows]
+    reference = [decode_row(row, compiled.shape, _python_registry()) for row in rows]
     assert [_describe(v) for v in native] == [_describe(v) for v in reference]
     return native
 
@@ -427,6 +427,33 @@ class TestFreeObjectsAndScalars:
         native = assert_parity([(('m::Author', _id(1), 'Alice'), 1)], compiled)
         assert isinstance(native[0], NamedTupleValue)
         assert (native[0].who.name, native[0].n) == ('Alice', 1)
+
+    def test_a_nested_free_object_keeps_its_fields_own_types(self):
+        """A free object is the composite row a tuple is, which is what gives
+        each field its own type — nested, it used to be jsonb, so a `decimal`
+        field came back as the nearest float and a `uuid` as a string.
+
+        It is still described as an *object*: it reads as one, hydrates to
+        `pylon.Object`, and the web UI renders it expandable rather than as
+        `(a := 1)`.
+        """
+
+        compiled = _compile("select { nested := { amount := <decimal>'1.2300' } }")
+        assert compiled.shape['kind'] == 'object'
+        [nested] = compiled.shape['pointers']
+        assert nested['kind'] == 'object', nested
+        native = assert_parity([((_decimal.Decimal('1.2300'),),)], compiled)
+        assert isinstance(native[0], Object)
+        assert isinstance(native[0].nested, Object)
+        assert native[0].nested.amount == _decimal.Decimal('1.2300')
+        assert str(native[0].nested.amount) == '1.2300'
+
+    def test_a_tuple_inside_a_free_object_is_still_a_tuple(self):
+        compiled = _compile("select { t := (a := <decimal>'1.2300') }")
+        native = assert_parity([((_decimal.Decimal('1.2300'),),)], compiled)
+        assert isinstance(native[0], Object)
+        assert isinstance(native[0].t, NamedTupleValue)
+        assert native[0].t.a == _decimal.Decimal('1.2300')
 
     def test_a_named_tuple_of_scalars_is_the_row_it_is(self):
         """Every tuple is a composite row — that is what keeps one Postgres

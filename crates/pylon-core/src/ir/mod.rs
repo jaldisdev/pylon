@@ -1088,10 +1088,17 @@ pub enum IrExpr {
     ///
     /// `names` is `None` for a positional tuple; the shape is built from
     /// this node, so they cannot live only in the SQL.
+    ///
+    /// `is_free_object` marks the curly-brace form (`{ a := 1 }`). It is the
+    /// same row either way — which is what gives its fields their own types
+    /// — but it reads as an object rather than a tuple, so it is described
+    /// as one (`ShapeNode::Object`) and renders as one.
     Row {
         elements: Vec<IrExpr>,
         names: Option<Vec<String>>,
+        is_free_object: bool,
     },
+
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.
     GlobalParam {
         index: usize,
@@ -1293,6 +1300,26 @@ pub struct IrFunctionCall {
     /// Set for `SqlExpression` impls: raw SQL template where `$1`, `$2`, … are
     /// replaced with the emitted arg expressions.
     pub sql_template: Option<String>,
+}
+
+impl IrExpr {
+    /// A free object's fields, name and value together.
+    ///
+    /// `Row` keeps the names beside the elements rather than interleaved, so
+    /// the places that read a free object *by field* — projecting one out,
+    /// validating a path into a nested one — pair them back up here.
+    /// `None` for anything that is not a free object.
+    pub fn free_object_fields(&self) -> Option<Vec<(&str, &IrExpr)>> {
+        let IrExpr::Row {
+            elements,
+            names: Some(names),
+            is_free_object: true,
+        } = self
+        else {
+            return None;
+        };
+        Some(names.iter().map(String::as_str).zip(elements).collect())
+    }
 }
 
 #[derive(Debug, Clone)]

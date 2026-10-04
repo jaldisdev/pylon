@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 from pylon.datatypes import Object
-from pylon.query import _decode, _decode_json_tuple, deserialize, shape_value_tags
+from pylon.query import _decode, _decode_json_tuple, decode_row, deserialize, shape_value_tags
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -96,15 +96,16 @@ class TestDecodeObject:
             'default::Person',
             [_scalar('name', 1), _scalar('age', 2)],
         )
-        # Root object: value IS the tuple (position 0 means "I am the root")
+        # Root object: the row *is* the object, which is what `decode_row`
+        # says — `_decode` alone reads every node at a position inside a row.
         value = ('default::Person', 'Alice', 30)
-        result = _decode(value, shape, REGISTRY)
+        result = decode_row(value, shape, REGISTRY)
         assert result == Person(name='Alice', age=30)
 
     def test_unknown_type_returns_dict(self):
         shape = _object('', 'default::Unknown', [_scalar('name', 1)])
         value = ('default::Unknown', 'foo')
-        result = _decode(value, shape, {})
+        result = decode_row(value, shape, {})
         assert result == {'name': 'foo'}
 
     def test_nested_object_reads_from_position(self):
@@ -148,7 +149,7 @@ class TestDecodeObject:
             'pointers': [_scalar('test', 0)],
         }
         value = (1,)
-        decoded = _decode(value, shape, {})
+        decoded = decode_row(value, shape, {})
         assert isinstance(decoded, Object)
         assert decoded.test == 1
 

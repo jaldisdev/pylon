@@ -2460,7 +2460,12 @@ fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
 /// Without this the array is read as a plain scalar and its elements come
 /// back as bare tuples, their members' names gone.
 fn tuple_array_shape_node(name: &str, position: usize, items: &[IrExpr]) -> Option<crate::query::ShapeNode> {
-    let IrExpr::Row { elements, names } = items.first()? else {
+    let IrExpr::Row {
+        elements,
+        names,
+        is_free_object,
+    } = items.first()?
+    else {
         return None;
     };
     Some(crate::query::ShapeNode::Array {
@@ -2468,7 +2473,7 @@ fn tuple_array_shape_node(name: &str, position: usize, items: &[IrExpr]) -> Opti
         position,
         // Each element is the whole of its own value, the way an array of
         // objects reads.
-        element: Box::new(row_shape_node("", 0, elements, names)),
+        element: Box::new(row_shape_node("", 0, elements, names, *is_free_object)),
     })
 }
 
@@ -2483,22 +2488,39 @@ fn row_shape_node(
     position: usize,
     elements: &[IrExpr],
     names: &Option<Vec<String>>,
+    is_free_object: bool,
 ) -> crate::query::ShapeNode {
-    crate::query::ShapeNode::Tuple {
+    use crate::query::{Cardinality, ShapeNode};
+    let members: Vec<ShapeNode> = elements
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let member = names
+                .as_ref()
+                .and_then(|ns| ns.get(i))
+                .map(String::as_str)
+                .unwrap_or("");
+            free_field_shape_node(member, i, e)
+        })
+        .collect();
+    // The same row either way — but `{ a := 1 }` reads as an object, so it
+    // is described as one: its fields are a free object's pointers rather
+    // than a tuple's members, which is what hydrates it to `pylon.Object`
+    // and renders it expandable instead of as `(a := 1)`.
+    if is_free_object {
+        return ShapeNode::Object {
+            name: name.to_string(),
+            type_name: None,
+            position,
+            cardinality: Cardinality::Many,
+            pointers: members,
+            has_implicit_id: false,
+        };
+    }
+    ShapeNode::Tuple {
         name: name.to_string(),
         position,
-        elements: elements
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let member = names
-                    .as_ref()
-                    .and_then(|ns| ns.get(i))
-                    .map(String::as_str)
-                    .unwrap_or("");
-                free_field_shape_node(member, i, e)
-            })
-            .collect(),
+        elements: members,
         names: names.clone(),
         // A tuple written out in the query names no declared type to
         // hydrate into.
@@ -2510,8 +2532,13 @@ fn row_shape_node(
 /// value is enum-typed (see `enum_type_of_expr`), else a plain `Scalar`.
 fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
-    if let IrExpr::Row { elements, names } = expr {
-        return row_shape_node(name, position, elements, names);
+    if let IrExpr::Row {
+        elements,
+        names,
+        is_free_object,
+    } = expr
+    {
+        return row_shape_node(name, position, elements, names, *is_free_object);
     }
     if let IrExpr::Array(items) = expr
         && let Some(node) = tuple_array_shape_node(name, position, items)
@@ -2567,7 +2594,11 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
 fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match expr {
-        IrExpr::Row { elements, names } => row_shape_node(name, position, elements, names),
+        IrExpr::Row {
+            elements,
+            names,
+            is_free_object,
+        } => row_shape_node(name, position, elements, names, *is_free_object),
         IrExpr::Array(items) if matches!(items.first(), Some(IrExpr::Row { .. })) => {
             tuple_array_shape_node(name, position, items).expect("matched as an array of rows just above")
         }
@@ -12267,15 +12298,21 @@ select owner { posts := (select owner.posts.title) };",
         };
         let test_node = pointers
             .iter()
-            .find(|p| matches!(p, ShapeNode::NamedTuple { name, .. } if name == "test"))
-            .unwrap_or_else(|| panic!("expected a NamedTuple shape node for 'test', got {:?}", pointers));
-        assert!(matches!(
-            test_node,
-            ShapeNode::NamedTuple {
-                is_free_object: true,
-                ..
-            }
-        ));
+            .find(|p| matches!(p, ShapeNode::Object { name, .. } if name == "test"))
+            .unwrap_or_else(|| panic!("expected an Object shape node for 'test', got {:?}", pointers));
+        // A free object reads as an object, and its one field keeps its own
+        // type rather than being read back out of jsonb.
+        let ShapeNode::Object {
+            type_name, pointers, ..
+        } = test_node
+        else {
+            unreachable!("matched as an object just above")
+        };
+        assert_eq!(*type_name, None);
+        assert!(
+            matches!(&pointers[..], [ShapeNode::Scalar { name, .. }] if name == "foo"),
+            "got {pointers:?}"
+        );
     }
 
     #[test]
@@ -12289,7 +12326,7 @@ select owner { posts := (select owner.posts.title) };",
              select default::Person { id, test := test };",
         );
         assert!(
-            out.sql.contains("jsonb_build_object()"),
+            out.sql.contains("ROW()"),
             "expected an empty free object, got:\n{}",
             out.sql
         );
@@ -12304,7 +12341,12 @@ select owner { posts := (select owner.posts.title) };",
             "with\n  test := { test2 := 1.0, test3 := 'str' }\n\
              select default::Person { id, test := test { test2 } };",
         );
-        assert!(out.sql.contains("jsonb_build_object('test2'"), "got:\n{}", out.sql);
+        // Projected out of the row, so the field keeps its own type.
+        assert!(
+            out.sql.contains("ROW((SELECT \"test2\" FROM \"test\"))"),
+            "got:\n{}",
+            out.sql
+        );
         assert!(
             !out.sql.contains("'test3'"),
             "test3 should not be projected, got:\n{}",
@@ -16530,28 +16572,28 @@ select owner { posts := (select owner.posts.title) };",
 
     #[test]
     fn test_a_free_object_literal_carries_no_member_plan() {
-        // `{ foo := 'bar' }` as a computed compiles to the same node a tuple
-        // literal does, but it is not a tuple to its reader: a member plan
-        // would hydrate it as a named-tuple value instead of the mapping it
-        // reads as.
+        // `{ foo := 'bar' }` is the same composite row a tuple literal is —
+        // which is what gives each field its own type — but it is not a
+        // tuple to its reader, so it is described as the object it reads as.
         let out = compile_and_emit("SELECT Person { meta := { foo := 'bar' } }");
         let crate::query::ShapeNode::Object { pointers, .. } = &out.shape.root else {
             panic!("expected ShapeNode::Object, got {:?}", out.shape.root)
         };
         let meta = pointers
             .iter()
-            .find(|p| matches!(p, crate::query::ShapeNode::NamedTuple { name, .. } if name == "meta"))
+            .find(|p| matches!(p, crate::query::ShapeNode::Object { name, .. } if name == "meta"))
             .expect("expected the meta pointer");
         match meta {
-            crate::query::ShapeNode::NamedTuple {
-                members,
-                is_free_object,
-                ..
+            crate::query::ShapeNode::Object {
+                type_name, pointers, ..
             } => {
-                assert!(is_free_object);
-                assert!(members.is_none(), "got {members:?}");
+                assert_eq!(*type_name, None, "a free object names no declared type");
+                assert!(
+                    matches!(&pointers[..], [crate::query::ShapeNode::Scalar { name, .. }] if name == "foo"),
+                    "got {pointers:?}"
+                );
             }
-            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+            other => panic!("expected ShapeNode::Object, got {other:?}"),
         }
     }
 

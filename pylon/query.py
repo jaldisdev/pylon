@@ -108,8 +108,20 @@ def deserialize(
     stays because a contract that only exists as an optimized Rust walk is a
     contract nobody can read.
     """
-    shape = query.shape
-    return [_decode(row, shape, registry) for row in rows]
+    return [decode_row(row, query.shape, registry) for row in rows]
+
+
+def decode_row(row: Any, shape: dict, registry: dict[str, type]) -> Any:
+    """One result row, read against the shape's root.
+
+    An object or a tuple at the root *is* the row, with nothing to index it
+    out of; every other node reads a field of it. Mirrors `decode_row` in the
+    native walk, and is the entry point both it and the parity suite check —
+    `_decode` alone cannot tell a root from a node that happens to sit at
+    position 0 of its parent.
+    """
+    root = {**shape, 'position': None} if shape['kind'] in ('object', 'tuple') else shape
+    return _decode(row, root, registry)
 
 
 def _decode_json_member(value: Any, node: dict, registry: dict[str, type]) -> Any:
@@ -215,8 +227,12 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
 
     if kind == 'object':
         pos = node['position']
-        # Root object sits at the top level; nested objects are at a tuple position.
-        obj_tuple = value if pos == 0 else value[pos]
+        # `None` means the caller has already indexed this value out of
+        # whatever held it — the query's root, or an array/group element.
+        # Position 0 used to carry that meaning, which broke a node sitting
+        # at position 0 of its parent: it decoded against the parent
+        # instead. A free object's first field is exactly that.
+        obj_tuple = value if pos is None else value[pos]
         if obj_tuple is None:
             return None
         pointers = node['pointers']
@@ -289,7 +305,7 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
                 return None
             arr = []
         # Array elements are anonymous records; decode each one as a root object.
-        return PylonSet(_decode(item, {**element, 'position': 0}, registry) for item in arr)
+        return PylonSet(_decode(item, {**element, 'position': None}, registry) for item in arr)
 
     if kind == 'tuple':
         # A nested tuple is a composite *inside* the row, so it is indexed
@@ -297,7 +313,7 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         # At the root the row is the tuple itself, which `position` 0 means
         # here the same way it does for an object.
         pos = node.get('position', 0)
-        row = value if pos == 0 else value[pos]
+        row = value if pos is None else value[pos]
         if row is None:
             return None
         # An object element is indexed out first and read as its own root,
@@ -305,8 +321,8 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         # mean "this is the whole row", which is true of the query's root
         # but not of a tuple's first element.
         items = [
-            _decode(row[e['position']], {**e, 'position': 0}, registry)
-            if e['kind'] == 'object'
+            _decode(row[e['position']], {**e, 'position': None}, registry)
+            if e['kind'] in ('object', 'tuple')
             else _decode(row, e, registry)
             for e in node['elements']
         ]
@@ -330,7 +346,7 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         key_obj = {kn['name']: _decode(value, kn, registry) for kn in key_nodes}
         grouping = list(value[node['grouping_position']] or [])
         elements = [
-            _decode(item, {**node['element'], 'position': 0}, registry)
+            _decode(item, {**node['element'], 'position': None}, registry)
             for item in (value[node['elements_position']] or [])
         ]
         return {'key': key_obj, 'grouping': grouping, 'elements': elements}
@@ -339,14 +355,14 @@ def _decode(value: Any, node: dict, registry: dict[str, type]) -> Any:
         # Outer tuple: (NULL, object_record, distance_float)
         obj_tuple = value[node['object_position']]
         distance = value[node['distance_position']]
-        obj = _decode(obj_tuple, {**node['object_node'], 'position': 0}, registry)
+        obj = _decode(obj_tuple, {**node['object_node'], 'position': None}, registry)
         return {'object': obj, 'distance': distance}
 
     if kind == 'fts_search':
         # Outer tuple: (NULL, object_record, score_float)
         obj_tuple = value[node['object_position']]
         score = value[node['rank_position']]
-        obj = _decode(obj_tuple, {**node['object_node'], 'position': 0}, registry)
+        obj = _decode(obj_tuple, {**node['object_node'], 'position': None}, registry)
         return {'object': obj, 'score': score}
 
     raise ValueError(f'unknown shape node kind: {kind!r}')

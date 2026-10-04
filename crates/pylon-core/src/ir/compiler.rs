@@ -1945,12 +1945,8 @@ impl<'a> Compiler<'a> {
             pg_type: infer_ir_type(current).map(str::to_string),
         };
         for step in rest {
-            if let IrExpr::NamedTuple {
-                fields: nested,
-                is_free_object: true,
-            } = current
-            {
-                match nested.iter().find(|(n, _)| n == step) {
+            if let Some(nested) = current.free_object_fields() {
+                match nested.into_iter().find(|(n, _)| n == step) {
                     Some((_, next)) => current = next,
                     None => {
                         return Some(Err(
@@ -2251,11 +2247,8 @@ impl<'a> Compiler<'a> {
     /// left unread still runs: a mutation among them is a data-modifying CTE,
     /// which Postgres executes whether or not the outer query reads it.
     fn project_free_object_field(expr: IrExpr, field: &str) -> IrExpr {
-        if let IrExpr::NamedTuple {
-            fields,
-            is_free_object: true,
-        } = &expr
-            && let Some((_, value)) = fields.iter().find(|(name, _)| name == field)
+        if let Some(fields) = expr.free_object_fields()
+            && let Some((_, value)) = fields.into_iter().find(|(name, _)| *name == field)
         {
             return value.clone();
         }
@@ -3234,7 +3227,28 @@ impl<'a> Compiler<'a> {
                 }
             })
             .collect();
-        Some(cast(IrExpr::Row { elements, names: None }, type_ref.to_string()))
+        Some(cast(
+            IrExpr::Row {
+                elements,
+                names: None,
+                is_free_object: false,
+            },
+            type_ref.to_string(),
+        ))
+    }
+
+    /// `{ a := 1 }` as the composite row it is.
+    ///
+    /// A free object is a row like a tuple, which is what gives each field
+    /// its own PostgreSQL type — carried as jsonb, a `decimal` field came
+    /// back as the nearest float and a `bytes` one as text. It is still
+    /// described as an *object* (see `sql::row_shape_node`): it reads as one.
+    fn free_object_row(fields: Vec<(String, IrExpr)>) -> IrExpr {
+        IrExpr::Row {
+            names: Some(fields.iter().map(|(name, _)| name.clone()).collect()),
+            elements: fields.into_iter().map(|(_, e)| e).collect(),
+            is_free_object: true,
+        }
     }
 
     /// A tuple as the jsonb value it becomes on its way into `std::json`.
@@ -3250,16 +3264,17 @@ impl<'a> Compiler<'a> {
             IrExpr::Row {
                 elements,
                 names: Some(names),
+                is_free_object,
             } => IrExpr::NamedTuple {
                 fields: names
                     .into_iter()
                     .zip(elements.into_iter().map(Self::as_jsonb_tuple))
                     .collect(),
-                is_free_object: false,
+                is_free_object,
             },
-            IrExpr::Row { elements, names: None } => {
-                IrExpr::Tuple(elements.into_iter().map(Self::as_jsonb_tuple).collect())
-            }
+            IrExpr::Row {
+                elements, names: None, ..
+            } => IrExpr::Tuple(elements.into_iter().map(Self::as_jsonb_tuple).collect()),
             other => other,
         }
     }
@@ -3590,6 +3605,7 @@ impl<'a> Compiler<'a> {
         // outer `::jsonb` to undo it. `as_jsonb_tuple` turns this back into
         // the jsonb builder where the target really is json.
         Ok(Some(IrExpr::Row {
+            is_free_object: false,
             elements: casted,
             names: named.then(|| {
                 target_elements
@@ -14115,6 +14131,7 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::Row {
                     names: Some(ir.iter().map(|(name, _)| name.clone()).collect()),
                     elements: ir.into_iter().map(|(_, e)| e).collect(),
+                    is_free_object: false,
                 })
             }
 
@@ -14126,6 +14143,7 @@ impl<'a> Compiler<'a> {
                 Ok(IrExpr::Row {
                     elements: ir,
                     names: None,
+                    is_free_object: false,
                 })
             }
 
@@ -14288,10 +14306,7 @@ impl<'a> Compiler<'a> {
                         Ok((name, compiled))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::NamedTuple {
-                    fields,
-                    is_free_object: true,
-                })
+                Ok(Self::free_object_row(fields))
             }
 
             // A shape applied to a WITH-bound free object (`test := test {
@@ -14325,10 +14340,7 @@ impl<'a> Compiler<'a> {
                         Ok((name, expr))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(IrExpr::NamedTuple {
-                    fields,
-                    is_free_object: true,
-                })
+                Ok(Self::free_object_row(fields))
             }
 
             // `(.<prices[is Listing] union .<sale_prices[is Listing]) { id }`
@@ -14796,10 +14808,7 @@ impl<'a> Compiler<'a> {
         // the generic `IrExpr::CteRef` below would reference a column that
         // doesn't exist.
         if let Some(IrFreeExpr::FreeObject(_)) = self.cte_free_items.get(name) {
-            return Some(IrExpr::NamedTuple {
-                fields: vec![],
-                is_free_object: true,
-            });
+            return Some(Self::free_object_row(vec![]));
         }
         if let Some(ir) = self.inline_bindings.get(name) {
             return Some(ir.clone());
@@ -17821,18 +17830,14 @@ impl<'a> Compiler<'a> {
                     )));
                 }
                 let ir = self.compile_expr_ctx(payload_arg, ctx)?;
-                let IrExpr::NamedTuple {
-                    fields,
-                    is_free_object: true,
-                } = &ir
-                else {
+                let Some(fields) = ir.free_object_fields() else {
                     return Err(self.type_err(&format!(
                         "notify(): payload for Channel '{full_channel_name}' (an Object channel) must be a free object literal"
                     )));
                 };
                 let declared_names: std::collections::HashSet<&str> =
                     declared_fields.iter().map(|(n, _)| n.as_str()).collect();
-                let actual_names: std::collections::HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                let actual_names: std::collections::HashSet<&str> = fields.iter().map(|(n, _)| *n).collect();
                 if declared_names != actual_names {
                     let mut expected: Vec<&str> = declared_names.iter().copied().collect();
                     expected.sort();
@@ -17843,7 +17848,7 @@ impl<'a> Compiler<'a> {
                         expected.join(", "), actual.join(", ")
                     )));
                 }
-                for (name, expr) in fields {
+                for (name, expr) in &fields {
                     let Some((_, declared_pg_type)) = declared_fields.iter().find(|(n, _)| n == name) else {
                         continue;
                     };
@@ -17857,7 +17862,10 @@ impl<'a> Compiler<'a> {
                             )));
                     }
                 }
-                ir
+                // The listener reads the payload as json (`($1)::text` below),
+                // so it is built as the jsonb object it is read back as — a
+                // composite row's text form is not json.
+                Self::as_jsonb_tuple(ir)
             }
         };
 

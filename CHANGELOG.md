@@ -42,8 +42,14 @@ now — one PostgreSQL type per member, all the way down.
   A structural `tuple<…>` binds against whatever property declares that
   shape; where nothing does and a member is one json cannot carry, the query
   is refused with what to declare rather than arriving as the wrong thing.
+* A free object (`{ a := 1 }`) is the same composite row, so a nested one's
+  fields keep their own types too — `{ nested := { amount :=
+  <decimal>'1.2300' } }` read back as a plain mapping of json-parsed values,
+  losing a `decimal`'s digits and turning a `uuid` into a string. It is
+  still described and rendered as an object, not a tuple.
 * `<json>` of a tuple is unchanged: a named one becomes an object keyed by
-  its member names, a positional one an array.
+  its member names, a positional one an array. A `notify()` payload also
+  still travels as json, which is how a listener reads it.
 * Comparing a tuple against one works: `filter .price = (amount := …,
   currency := …)` and `filter .price = <module::Money>$p` both read the
   value into the column's own type first, where the literal was refused as
