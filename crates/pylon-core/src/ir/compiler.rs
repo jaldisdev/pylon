@@ -1310,7 +1310,8 @@ pub fn default_blocker(expr: &IrExpr) -> Option<&'static str> {
             .or_else(|| default_blocker(&i.if_))
             .or_else(|| default_blocker(&i.else_)),
         E::FunctionCall(f) => f.args.iter().find_map(default_blocker),
-        E::Array(items) | E::Tuple(items) | E::Row(items) => items.iter().find_map(default_blocker),
+        E::Array(items) | E::Tuple(items) => items.iter().find_map(default_blocker),
+        E::Row { elements, .. } => elements.iter().find_map(default_blocker),
         E::NamedTuple { fields, .. } => fields.iter().find_map(|(_, e)| default_blocker(e)),
         E::Subscript { expr, index, .. } => default_blocker(expr).or_else(|| default_blocker(index)),
         E::JsonbField { expr, .. } | E::JsonbIndex { expr, .. } | E::CompositeField { expr, .. } => {
@@ -3150,6 +3151,9 @@ impl<'a> Compiler<'a> {
         module: &str,
     ) -> Option<IrExpr> {
         let elements: Vec<IrExpr> = match expr {
+            // What a tuple literal compiles to.
+            IrExpr::Row { elements, .. } => elements.clone(),
+            // And the jsonb forms, which a tuple-typed cast still produces.
             IrExpr::NamedTuple { fields, .. } => fields.iter().map(|(_, e)| e.clone()).collect(),
             IrExpr::Tuple(elements) => elements.clone(),
             _ => return None,
@@ -3182,7 +3186,34 @@ impl<'a> Compiler<'a> {
                 }
             })
             .collect();
-        Some(cast(IrExpr::Row(elements), type_ref.to_string()))
+        Some(cast(IrExpr::Row { elements, names: None }, type_ref.to_string()))
+    }
+
+    /// A tuple as the jsonb value it becomes on its way into `std::json`.
+    ///
+    /// A composite row cannot go there directly: `to_jsonb` of an anonymous
+    /// row names its members `f1`, `f2`, … , and the names are the whole
+    /// content of a named tuple's json form. So the jsonb builders
+    /// (`IrExpr::NamedTuple`/`IrExpr::Tuple`) stay, and a row on its way to
+    /// json is rewritten back into one. Recurses, since a nested member has
+    /// to become json too.
+    fn as_jsonb_tuple(expr: IrExpr) -> IrExpr {
+        match expr {
+            IrExpr::Row {
+                elements,
+                names: Some(names),
+            } => IrExpr::NamedTuple {
+                fields: names
+                    .into_iter()
+                    .zip(elements.into_iter().map(Self::as_jsonb_tuple))
+                    .collect(),
+                is_free_object: false,
+            },
+            IrExpr::Row { elements, names: None } => {
+                IrExpr::Tuple(elements.into_iter().map(Self::as_jsonb_tuple).collect())
+            }
+            other => other,
+        }
     }
 
     /// A tuple property's members, nominal or structural — `None` for a
@@ -6508,30 +6539,13 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|(name, e)| Ok((name.clone(), self.free_object_field(e)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                // jsonb has no member kind for an object, so a tuple holding
-                // one is emitted as a composite row instead; the rest stay on
-                // the jsonb encoding they have always had.
-                // An array of objects (`brands := array_agg((select b { * }))`)
-                // flattens in jsonb the same way.
-                let holds_an_object = ir.iter().any(|(_, e)| match e {
-                    IrExpr::ObjectSubquery(_) | IrExpr::ObjectPathSubquery(_) => true,
-                    IrExpr::ArrayFromSelect(source) => match source.as_ref() {
-                        IrArraySource::ObjectSelect(_) | IrArraySource::ObjectFunction(_) | IrArraySource::Group(_) => {
-                            true
-                        }
-                        IrArraySource::PathSelect(ps) => matches!(ps.result, IrPathResult::Object { .. }),
-                        _ => false,
-                    },
-                    _ => false,
-                });
-                if holds_an_object {
-                    vec![IrFreeExpr::NamedTupleRow(ir)]
-                } else {
-                    vec![IrFreeExpr::Scalar(IrExpr::NamedTuple {
-                        fields: ir,
-                        is_free_object: false,
-                    })]
-                }
+                // A tuple is a composite row, whatever it holds: that is what
+                // keeps one PostgreSQL type per member, so a `decimal` member
+                // stays a decimal beside a `float64` one rather than both
+                // becoming jsonb's single number type. (It was only a row when
+                // a member held an *object*, which jsonb has no member kind
+                // for at all.)
+                vec![IrFreeExpr::NamedTupleRow(ir)]
             }
             other => vec![IrFreeExpr::Scalar(self.compile_free_expr(other)?)],
         };
@@ -12726,6 +12740,13 @@ impl<'a> Compiler<'a> {
                     self.compile_expr_ctx(&tc.expr, ctx)?
                 };
                 let pg_type = self.resolve_cast_pg_type(&tc.ty)?;
+                // A tuple on its way into jsonb — `<json>(a := 1)`, or a
+                // tuple-typed cast, which travels as jsonb — is built as the
+                // jsonb it becomes rather than as the row it otherwise is.
+                let inner = match pg_type == "jsonb" {
+                    true => Self::as_jsonb_tuple(inner),
+                    false => inner,
+                };
 
                 // PostgreSQL has no native jsonb -> {uuid, date/time family,
                 // interval, array<T>} cast (only jsonb -> {bool, numeric
@@ -13894,9 +13915,12 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|(name, e)| Ok((name.clone(), self.compile_expr_ctx(e, ctx)?)))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                Ok(IrExpr::NamedTuple {
-                    fields: ir,
-                    is_free_object: false,
+                // A tuple is the composite row it is — one PostgreSQL type
+                // per member. `as_jsonb_tuple` turns it back into the jsonb
+                // builder where a tuple is on its way into `std::json`.
+                Ok(IrExpr::Row {
+                    names: Some(ir.iter().map(|(name, _)| name.clone()).collect()),
+                    elements: ir.into_iter().map(|(_, e)| e).collect(),
                 })
             }
 
@@ -13905,7 +13929,10 @@ impl<'a> Compiler<'a> {
                     .iter()
                     .map(|e| self.compile_expr_ctx(e, ctx))
                     .collect::<Result<Vec<_>, PyQLError>>()?;
-                Ok(IrExpr::Tuple(ir))
+                Ok(IrExpr::Row {
+                    elements: ir,
+                    names: None,
+                })
             }
 
             Expr::FieldAccess { expr: inner, field } => {

@@ -2055,7 +2055,9 @@ fn emit_conflict(sql: &mut String, conflict: &IrConflict) {
     // composite value: Postgres infers the arbiter index from a column list,
     // and would look for an expression index on the tuple instead.
     let on_sql = conflict.on.as_ref().map(|e| match e {
-        IrExpr::Tuple(elements) => format!("({})", elements.iter().map(emit_expr).collect::<Vec<_>>().join(", ")),
+        IrExpr::Tuple(elements) | IrExpr::Row { elements, .. } => {
+            format!("({})", elements.iter().map(emit_expr).collect::<Vec<_>>().join(", "))
+        }
         other => format!("({})", emit_expr(other)),
     });
     match (&on_sql, &conflict.do_update) {
@@ -2108,6 +2110,9 @@ fn is_raw_scalar(expr: &IrExpr) -> bool {
         || matches!(expr, IrExpr::TypeCast(c) if c.pg_type == "jsonb")
         || matches!(expr, IrExpr::NamedTuple { .. })
         || matches!(expr, IrExpr::Tuple(_))
+        // A row *is* the composite the result column holds; wrapping it in
+        // another would bury its members one level down from the shape.
+        || matches!(expr, IrExpr::Row { .. })
         || matches!(expr, IrExpr::JsonbField { .. })
         || matches!(expr, IrExpr::JsonbIndex { .. })
 }
@@ -2433,10 +2438,47 @@ fn pg_schema_qualified_to_pylon(qualified: &str) -> String {
     }
 }
 
+/// The shape of a tuple literal — the composite row it compiles to, one
+/// element per member at the position the row holds it.
+///
+/// Each member is described by what it holds, so a nested tuple recurses and
+/// an object element keeps its own shape: unlike the jsonb form, a composite
+/// row has a place for either.
+fn row_shape_node(
+    name: &str,
+    position: usize,
+    elements: &[IrExpr],
+    names: &Option<Vec<String>>,
+) -> crate::query::ShapeNode {
+    crate::query::ShapeNode::Tuple {
+        name: name.to_string(),
+        position,
+        elements: elements
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let member = names
+                    .as_ref()
+                    .and_then(|ns| ns.get(i))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                free_field_shape_node(member, i, e)
+            })
+            .collect(),
+        names: names.clone(),
+        // A tuple written out in the query names no declared type to
+        // hydrate into.
+        type_name: None,
+    }
+}
+
 /// Shape node for one free scalar/object/tuple field — `Enum` when the
 /// value is enum-typed (see `enum_type_of_expr`), else a plain `Scalar`.
 fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
+    if let IrExpr::Row { elements, names } = expr {
+        return row_shape_node(name, position, elements, names);
+    }
     if let IrExpr::ObjectSubquery(sel) = expr {
         let [IrRowSource::Bound { source, shape }] = sel.rows.as_slice() else {
             unreachable!("an object subquery is always schema-bound")
@@ -2486,6 +2528,7 @@ fn free_field_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::q
 fn expr_shape_node(name: &str, position: usize, expr: &IrExpr) -> crate::query::ShapeNode {
     use crate::query::{Cardinality, ShapeNode};
     match expr {
+        IrExpr::Row { elements, names } => row_shape_node(name, position, elements, names),
         IrExpr::ObjectPathUnion { branches, multi, .. } => {
             let first = branches.first().expect("a union has at least one branch");
             let IrPathResult::Object {
@@ -5549,8 +5592,8 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("jsonb_build_array({})", items.join(", "))
         }
 
-        IrExpr::Row(elems) => {
-            let items: Vec<String> = elems.iter().map(emit_expr).collect();
+        IrExpr::Row { elements, .. } => {
+            let items: Vec<String> = elements.iter().map(emit_expr).collect();
             format!("ROW({})", items.join(", "))
         }
 
@@ -15833,13 +15876,17 @@ select owner { posts := (select owner.posts.title) };",
         let name =
             crate::schema::tuple_type::structural_name(schema.types[0].properties[0].tuple_members.as_ref().unwrap());
         assert!(
-            out.sql.contains("ROW('Main', '1000')") && out.sql.contains(&format!("::\"public\".\"{name}\"")),
+            out.sql
+                .contains(&format!("VALUES ((ROW('Main', '1000'))::\"public\".\"{name}\")")),
             "got:\n{}",
             out.sql
         );
+        // Written straight, not read back out of json: the members are right
+        // here, and a round trip through `to_jsonb` of an anonymous row would
+        // lose their names entirely (`f1`, `f2`, …).
         assert!(
-            !out.sql.contains("jsonb_build_object"),
-            "a tuple on its way into a column is a row, not jsonb: got:\n{}",
+            !out.sql.contains("populate_tuple") && !out.sql.contains("jsonb"),
+            "a tuple literal on its way into a column is a row: got:\n{}",
             out.sql
         );
     }
@@ -16160,36 +16207,74 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_a_tuple_on_its_way_into_json_is_built_as_json() {
+        // A tuple is a composite row everywhere else, but `to_jsonb` of an
+        // anonymous row names its members `f1`, `f2`, … — and a named
+        // tuple's json form is its keys. So this one case keeps the jsonb
+        // builders.
+        let named = compile_and_emit("SELECT <json>(a := 1, b := 'x')");
+        assert!(
+            named.sql.contains("jsonb_build_object('a', 1, 'b', 'x')"),
+            "got:\n{}",
+            named.sql
+        );
+        // A positional tuple's json form is an array, not an object with
+        // index keys.
+        let positional = compile_and_emit("SELECT <json>(1, 'x')");
+        assert!(
+            positional.sql.contains("jsonb_build_array(1, 'x')"),
+            "got:\n{}",
+            positional.sql
+        );
+        // And a nested member becomes json too, rather than staying a row
+        // inside a jsonb value.
+        let nested = compile_and_emit("SELECT <json>(deep := (a := 1), b := 'x')");
+        assert!(
+            nested.sql.contains("jsonb_build_object('a', 1)"),
+            "got:\n{}",
+            nested.sql
+        );
+        assert!(!nested.sql.contains("ROW("), "got:\n{}", nested.sql);
+    }
+
+    #[test]
     fn test_a_tuple_literal_carries_the_members_it_names() {
         // `(amount := 9.99, note := 'x')` says what its members are called,
-        // but the shape used to carry none — so the value hydrated as a
-        // plain mapping rather than a named tuple, and the web UI, which
-        // renders `(key := value, …)` from this list, showed `()`.
+        // and the shape carries them: the web UI renders `(key := value, …)`
+        // from this list, and a reader hydrates a named-tuple value from it.
         let out = compile_and_emit("SELECT (amount := 9.99, note := 'x')");
         match &out.shape.root {
-            crate::query::ShapeNode::NamedTuple { members, .. } => {
-                let members = members.as_ref().expect("a literal names its own members");
-                let keys: Vec<_> = members.iter().map(|m| m.key.as_deref()).collect();
-                assert_eq!(keys, vec![Some("amount"), Some("note")]);
+            crate::query::ShapeNode::Tuple { names, elements, .. } => {
+                let names = names.as_ref().expect("a literal names its own members");
+                assert_eq!(names, &vec!["amount".to_string(), "note".to_string()]);
+                assert_eq!(elements.len(), 2);
             }
-            other => panic!("expected ShapeNode::NamedTuple, got {other:?}"),
+            other => panic!("expected ShapeNode::Tuple, got {other:?}"),
         }
     }
 
     #[test]
     fn test_a_tuple_literal_member_that_is_itself_a_tuple_recurses() {
         let out = compile_and_emit("SELECT (origin := (x := 1, y := 2), label := 'a')");
-        let crate::query::ShapeNode::NamedTuple { members, .. } = &out.shape.root else {
-            panic!("expected ShapeNode::NamedTuple, got {:?}", out.shape.root)
+        let crate::query::ShapeNode::Tuple { elements, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Tuple, got {:?}", out.shape.root)
         };
-        let members = members.as_ref().expect("a literal names its own members");
-        match &members[0].kind {
-            crate::query::JsonMemberKind::Tuple { members, .. } => {
-                let keys: Vec<_> = members.iter().map(|m| m.key.as_deref()).collect();
-                assert_eq!(keys, vec![Some("x"), Some("y")]);
+        match &elements[0] {
+            crate::query::ShapeNode::Tuple { name, names, .. } => {
+                assert_eq!(name, "origin");
+                let names = names.as_ref().expect("a nested literal names its members too");
+                assert_eq!(names, &vec!["x".to_string(), "y".to_string()]);
             }
             other => panic!("expected a nested tuple member, got {other:?}"),
         }
+        // Nested rows all the way down, rather than a jsonb value built
+        // inside one.
+        assert!(
+            out.sql.contains("ROW(1, 2)") || out.sql.contains("(1, 2)"),
+            "got:\n{}",
+            out.sql
+        );
+        assert!(!out.sql.contains("jsonb_build"), "got:\n{}", out.sql);
     }
 
     #[test]
@@ -16202,13 +16287,13 @@ select owner { posts := (select owner.posts.title) };",
             members: vec!["Male".into(), "Female".into()],
         });
         let out = compile_and_emit_with("SELECT (shade := default::Gender.Male, label := 'a')", &schema);
-        let crate::query::ShapeNode::NamedTuple { members, .. } = &out.shape.root else {
-            panic!("expected ShapeNode::NamedTuple, got {:?}", out.shape.root)
+        let crate::query::ShapeNode::Tuple { elements, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Tuple, got {:?}", out.shape.root)
         };
-        let members = members.as_ref().expect("a literal names its own members");
-        match &members[0].kind {
-            // Pylon-qualified, the way a member's enum type always is.
-            crate::query::JsonMemberKind::Enum { enum_type } => assert_eq!(enum_type, "default::Gender"),
+        match &elements[0] {
+            // Postgres-schema-qualified, the way `ShapeNode::Enum`'s own
+            // type always is.
+            crate::query::ShapeNode::Enum { enum_type, .. } => assert_eq!(enum_type, "public::Gender"),
             other => panic!("expected an enum member, got {other:?}"),
         }
     }
@@ -16394,14 +16479,27 @@ select owner { posts := (select owner.posts.title) };",
     #[test]
     fn test_positional_tuple_literal_nested_inside_named_tuple_compiles() {
         let out = compile_and_emit("SELECT (point := (1, 2), label := 'origin')");
-        assert!(out.sql.contains("jsonb_build_array(1, 2)"), "got:\n{}", out.sql);
-        assert!(out.sql.contains("jsonb_build_object("), "got:\n{}", out.sql);
+        // Rows inside rows: each member keeps its own type, and the nested
+        // one is a value of the outer row rather than jsonb built inside it.
+        assert!(out.sql.contains("ROW(1, 2)"), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("jsonb_build"), "got:\n{}", out.sql);
+        let crate::query::ShapeNode::Tuple { elements, names, .. } = &out.shape.root else {
+            panic!("expected ShapeNode::Tuple, got {:?}", out.shape.root)
+        };
+        assert_eq!(names.as_ref().unwrap(), &vec!["point".to_string(), "label".to_string()]);
+        // The nested one is positional, so it hydrates to a plain tuple.
+        assert!(
+            matches!(&elements[0], crate::query::ShapeNode::Tuple { names: None, .. }),
+            "got {:?}",
+            elements[0]
+        );
     }
 
     #[test]
     fn test_positional_tuple_literal_in_schema_bound_shape_field_compiles() {
         let out = compile_and_emit("SELECT Person { name, pair := (1, 2) }");
-        assert!(out.sql.contains("jsonb_build_array(1, 2)"), "got:\n{}", out.sql);
+        assert!(out.sql.contains("ROW(1, 2)"), "got:\n{}", out.sql);
+        assert!(!out.sql.contains("jsonb_build"), "got:\n{}", out.sql);
     }
 
     // ── search index outbox enqueue tests ─────────────────────────────────────

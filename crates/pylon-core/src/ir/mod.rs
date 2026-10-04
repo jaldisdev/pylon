@@ -1075,14 +1075,23 @@ pub enum IrExpr {
         field: String,
         pg_type: Option<String>,
     },
-    /// A tuple as the composite row a column of one holds — `ROW(1, 'x')`,
-    /// cast to that column's own type by the `TypeCast` wrapped around it.
+    /// A tuple as the composite row it is — `ROW(1, 'x')`.
     ///
-    /// Distinct from `Tuple`/`NamedTuple`, which build the jsonb value a
-    /// tuple travels as *inside a query*: a composite row keeps one
-    /// PostgreSQL type per member, which is the whole point of a tuple's
-    /// column having a type of its own (see `schema::tuple_type`).
-    Row(Vec<IrExpr>),
+    /// What every tuple literal compiles to: one PostgreSQL type per member,
+    /// so a `decimal` member stays a decimal beside a `float64` one. A
+    /// `TypeCast` around it names the column's own type where the row is on
+    /// its way into one (see `schema::tuple_type`).
+    ///
+    /// `Tuple`/`NamedTuple` remain the *jsonb* builders, which is what a
+    /// tuple becomes on its way into `std::json` — where the member names
+    /// have to survive as keys, and an anonymous row's do not.
+    ///
+    /// `names` is `None` for a positional tuple; the shape is built from
+    /// this node, so they cannot live only in the SQL.
+    Row {
+        elements: Vec<IrExpr>,
+        names: Option<Vec<String>>,
+    },
     /// Session global: emits `$N::pg_type` directly. The parameter slot carries the `__global__` prefix.
     GlobalParam {
         index: usize,

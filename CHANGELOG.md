@@ -4,6 +4,47 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.5.0
+
+### Tuples
+
+A tuple was stored and carried as jsonb, which has one number type and no
+scale, so a `decimal` member read back as the nearest float and was
+indistinguishable from a `float64` one. A tuple is the composite row it is
+now — one PostgreSQL type per member, all the way down.
+
+* A tuple-typed property's column is a composite type of its own, in the
+  Postgres schema of the module that declares it: a `@pylon.named_tuple`
+  class is named for itself (`geo::Point` becomes `geo."Point_t"`), and a
+  structural `pylon.Tuple[...]` for its content. An `array<tuple<…>>`
+  property holds one composite per element.
+* Reading one back gives each member the type it was declared with, scale
+  included, in a `Type { property }` shape, a bare `select Type.property`,
+  and an aggregated set of them alike.
+* `select Type.property.member` reads a field of that row. It arrives as
+  the type it is declared with rather than as raw json, and naming a member
+  the tuple doesn't declare is a compile error listing the ones it does —
+  a composite has no absent key to hand back as an empty value.
+* A tuple written out in a query is a row too, so `(amount :=
+  <decimal>'12.3400', note := 'x')` keeps every digit beside a `float64`
+  member, and a nested tuple keeps its own members' types.
+* `<json>` of a tuple is unchanged: a named one becomes an object keyed by
+  its member names, a positional one an array.
+* A member of a tuple that is unset — or of a tuple that is itself unset —
+  contributes nothing to a path's results, matching every other empty. A
+  tuple with one empty member is still a value, where `IS NOT NULL` on a
+  composite would have discarded it for not being wholly set.
+* A `@pylon.named_tuple` declared in a module using `from __future__ import
+  annotations` had every member silently typed `text`, since its annotations
+  arrived as strings. They are resolved the way a `@pylon.type`'s already
+  were.
+
+A database that stored tuples as jsonb is converted by its next migration:
+each column is retyped and its rows read into the composite, positional
+tuples (stored as json arrays) included. A named tuple whose members change
+has its type replaced rather than altered — PostgreSQL can append an
+attribute but not insert one, and a tuple's members are read by position.
+
 ## 0.4.0 — 2026-10-04
 
 ### Connections

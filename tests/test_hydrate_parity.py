@@ -420,8 +420,7 @@ class TestFreeObjectsAndScalars:
         assert (author.name, number) == ('Alice', 1)
 
     def test_a_named_tuple_element_holding_an_object(self):
-        """jsonb has no member kind for an object, so a named tuple holding
-        one is emitted as a composite -- and must still come back as the value
+        """A named tuple holding an object must still come back as the value
         a named tuple gives, not as a plain tuple."""
 
         compiled = _compile('with a := (select m::Author limit 1) select (who := a { name }, n := 1)')
@@ -429,11 +428,22 @@ class TestFreeObjectsAndScalars:
         assert isinstance(native[0], NamedTupleValue)
         assert (native[0].who.name, native[0].n) == ('Alice', 1)
 
-    def test_a_named_tuple_of_scalars_still_travels_as_jsonb(self):
-        """Nothing forced the composite, so the encoding is unchanged."""
+    def test_a_named_tuple_of_scalars_is_the_row_it_is(self):
+        """Every tuple is a composite row — that is what keeps one Postgres
+        type per member instead of jsonb's single number type."""
 
         compiled = _compile('select (x := 1, y := 2)')
-        assert compiled.shape['kind'] == 'named_tuple'
+        assert compiled.shape['kind'] == 'tuple'
+        assert compiled.shape['names'] == ['x', 'y']
+        native = assert_parity([(1, 2)], compiled)
+        assert isinstance(native[0], NamedTupleValue)
+        assert (native[0].x, native[0].y) == (1, 2)
+
+    def test_a_positional_tuple_of_scalars_is_a_plain_tuple(self):
+        compiled = _compile('select (1, 2)')
+        assert compiled.shape['names'] is None
+        native = assert_parity([(1, 2)], compiled)
+        assert native == [(1, 2)]
 
     def test_a_bare_scalar(self):
         # A bare `select <expr>` compiles to a Scalar node at position 0, so
