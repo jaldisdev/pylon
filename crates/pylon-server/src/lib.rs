@@ -30,6 +30,7 @@ pub mod server;
 pub mod state;
 pub mod static_files;
 pub mod to_json;
+pub mod value_shape;
 pub mod workers;
 
 /// Re-exported from the standalone `pylon-config` crate — moved out so a

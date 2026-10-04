@@ -99,6 +99,15 @@ what made a webhook's headers unsavable.
   tuple<name: …, value: …>, got 3)`) before the statement is sent, leaving the
   connection usable.
 
+### The web UI
+
+* `/api/query` carries the value-tag tree its `shape` field was always
+  declared to: an enum reads as `module::Enum.Member`, a named tuple as
+  `(x := 1, y := 2)`, a uuid as `<uuid>`. It was `null` until now, so the
+  query editor rendered every value as the plain JSON it arrives as. Mirrors
+  `pylon/query.py`'s `shape_value_tags`, which stays the readable statement
+  of the contract.
+
 ### Running a server
 
 `pylon-server` is published as a container image, `ghcr.io/jaldisdev/pylon-server`,

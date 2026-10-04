@@ -19,13 +19,11 @@
 
 //! `/api/...` route handlers.
 //!
-//! **Known gap, flagged explicitly rather than silently shipped**: the
-//! `shape` field `/api/query`'s response carries (driving the frontend's
-//! type-aware `JsonTree` rendering — `shape_value_tags`/`_mark_decimals`/
-//! decimal-aware shape tagging) is not implemented yet; this returns
-//! `"shape": null` for now. Porting it is real, separate work (walking
-//! `ShapeNode` into the frontend's value-tree-aligned tag format) — noted
-//! here so it isn't mistaken for an oversight.
+//! `/api/query`'s `shape` carries the value-tag tree the frontend's
+//! `JsonTree` renders types from — see `crate::value_shape`. A value the
+//! frontend cannot place by itself (a bare cast, a tuple inside a free
+//! object) has no schema pointer to look up, and the body alone says only
+//! what JSON can say: a uuid and a str are both strings.
 
 use std::sync::Arc;
 
@@ -39,6 +37,7 @@ use pylon_value::DecodedValue;
 use crate::json::json_response;
 use crate::state::AppState;
 use crate::to_json::{client_error_payload, value_to_json};
+use crate::value_shape::value_shape_tags;
 
 fn json_to_cached_value(v: &serde_json::Value) -> DecodedValue {
     match v {
@@ -107,6 +106,10 @@ pub async fn handle_query(state: Arc<AppState>, connection: &str, body: serde_js
         Err(e) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &client_error_payload(&e)),
     };
     let req = parse_query_request(&body);
+    // Both outlive the request itself, which hands its globals and config to
+    // the client view below.
+    let pyql = req.pyql.clone();
+    let config = req.config.clone();
     let target = client.with_globals(req.globals).with_config(req.config);
     let param_refs: Vec<(&str, DecodedValue)> = req.params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -122,9 +125,24 @@ pub async fn handle_query(state: Arc<AppState>, connection: &str, body: serde_js
         &serde_json::json!({
             "objects": objects.iter().map(value_to_json).collect::<Vec<_>>(),
             "duration_ms": duration_ms,
-            "shape": serde_json::Value::Null,
+            "shape": query_shape_tags(&client, &pyql, &config).await,
         }),
     )
+}
+
+/// The tag tree for one row of this query's result, or `null` when there is
+/// none to give — compilation is cached, so asking for it again after the
+/// query ran is a lookup rather than a second compile. A script (several
+/// statements) has no single shape and does not compile here as one, so it
+/// simply goes untagged, exactly as it did before.
+async fn query_shape_tags(client: &pylon_client::Client, pyql: &str, config: &SessionConfig) -> serde_json::Value {
+    let Ok(schema) = client.schema().await else {
+        return serde_json::Value::Null;
+    };
+    match pylon_core::query::compile_with_config(pyql, &schema, config) {
+        Ok(compiled) => value_shape_tags(&compiled.shape.root),
+        Err(_) => serde_json::Value::Null,
+    }
 }
 
 pub async fn handle_analyze(state: Arc<AppState>, connection: &str, body: serde_json::Value) -> Response<Full<Bytes>> {
