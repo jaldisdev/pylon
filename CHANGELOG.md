@@ -4,6 +4,15 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.6.0
+
+### Python
+
+* Python 3.15 is tested and released against. The extension is not abi3, so
+  each interpreter needs a wheel of its own; `pylon-db` now publishes
+  `cp315` wheels for every platform it already covered, alongside the `cp313`
+  and `cp314` ones. The supported floor is unchanged at 3.13.
+
 ## 0.5.0 — 2026-10-04
 
 ### Tuples

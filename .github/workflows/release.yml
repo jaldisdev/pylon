@@ -43,7 +43,7 @@ jobs:
         # C struct, which the stable ABI does not expose, so the extension is
         # not abi3 and every supported interpreter needs its own wheel. A new
         # Python release means adding it here, same as in test.yml.
-        python-version: ["3.13", "3.14"]
+        python-version: ["3.13", "3.14", "3.15"]
         platform:
           - runner: ubuntu-26.04
             target: x86_64
