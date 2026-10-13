@@ -18522,19 +18522,66 @@ impl<'a> Compiler<'a> {
             return Err(self.type_err("fts::search requires at least 2 arguments: (TypeName, $query)"));
         }
 
-        // First argument: a bare type name reference.
-        let type_qname = match &fc.args[0] {
-            ast::Expr::Path(p) if !p.partial && p.steps.len() == 1 => {
-                if let ast::PathStep::Name(n) = &p.steps[0] {
-                    let td = self
-                        .resolve_type(n)
-                        .map_err(|_| self.type_err(&format!("fts::search: '{}' is not a known type", n)))?;
-                    format!("{}::{}", td.module, td.name)
+        // First argument: a type name or a filtered subquery narrowing the candidate set,
+        // the same two forms `vector::search` takes.
+        //   - Bare name:     `Product` or `default::Product`
+        //   - Subquery:      `(select Product filter .price < 100)`
+        //
+        // The subquery's filter is kept as raw AST and compiled below, once the source
+        // alias exists, so its column references carry that alias.
+        let (type_qname, inner_filter_ast): (String, Option<ast::Expr>) = match &fc.args[0] {
+            ast::Expr::Path(p) if !p.partial => {
+                let name = p
+                    .steps
+                    .iter()
+                    .filter_map(|s| {
+                        if let ast::PathStep::Name(n) = s {
+                            Some(n.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let td = self
+                    .resolve_type(&name)
+                    .map_err(|_| self.type_err(&format!("fts::search: '{}' is not a known type", name)))?;
+                (format!("{}::{}", td.module, td.name), None)
+            }
+            ast::Expr::SubQuery(stmt) => {
+                if let ast::Stmt::Select(inner_sel) = stmt.as_ref() {
+                    let inner_type_name = match &inner_sel.result {
+                        ast::Expr::Path(p) if !p.partial => p
+                            .steps
+                            .iter()
+                            .filter_map(|s| {
+                                if let ast::PathStep::Name(n) = s {
+                                    Some(n.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                        _ => {
+                            return Err(self.type_err(
+                                "fts::search: subquery first argument must select a single type (e.g. select Product filter …)",
+                            ));
+                        }
+                    };
+                    let td = self.resolve_type(&inner_type_name).map_err(|_| {
+                        self.type_err(&format!("fts::search: '{}' is not a known type", inner_type_name))
+                    })?;
+                    (format!("{}::{}", td.module, td.name), inner_sel.filter.clone())
                 } else {
-                    return Err(self.type_err("fts::search: first argument must be a type name"));
+                    return Err(self.type_err("fts::search: subquery first argument must be a SELECT"));
                 }
             }
-            _ => return Err(self.type_err("fts::search: first argument must be a bare type name")),
+            _ => {
+                return Err(self.type_err(
+                    "fts::search: first argument must be a type name or a filtered subquery (e.g. select Product filter …)",
+                ));
+            }
         };
 
         // Optional named arguments.
@@ -18629,6 +18676,11 @@ impl<'a> Compiler<'a> {
             alias: alias.clone(),
         };
 
+        let pre_filter: Option<IrExpr> = match inner_filter_ast {
+            Some(ref f) => Some(self.as_condition(|c| c.compile_expr(f, &td, &alias))?),
+            None => None,
+        };
+
         // Compile the object shape from `object { … }` in the outer shape.
         let mut object_shape: Vec<IrShapePointer> = vec![];
         for el in elements {
@@ -18654,7 +18706,17 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let (filter, order_by_rank, offset, limit) = self.compile_fts_modifiers(s)?;
+        let (outer_filter, order_by_rank, offset, limit) = self.compile_fts_modifiers(s)?;
+
+        let filter = match (pre_filter, outer_filter) {
+            (Some(a), Some(b)) => Some(IrExpr::BinOp(Box::new(IrBinOp {
+                left: a,
+                op: ast::BinOpKind::And,
+                right: b,
+            }))),
+            (Some(f), None) | (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
 
         Ok(Some(IrFtsSearch {
             source,

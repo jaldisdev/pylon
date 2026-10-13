@@ -16802,6 +16802,114 @@ select owner { posts := (select owner.posts.title) };",
         );
     }
 
+    // ── fts::search candidate-set tests ───────────────────────────────────────
+    //
+    // `fts::search` takes an object *set*, the same as `vector::search`: a
+    // filtered subquery is how a search is narrowed to the rows the caller may
+    // see. It used to accept a bare type name only, which left a multi-tenant
+    // search no way to say whose rows it was searching.
+
+    #[test]
+    fn test_fts_search_subquery_filter_included_in_where() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Postgres);
+        let out = compile_and_emit_with(
+            "WITH hits := fts::search((select Person filter .age > 18), 'alice') \
+             SELECT hits { object { name }, score }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("\"age\""),
+            "expected the pre-filter, got:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("18"), "expected the filter value, got:\n{}", out.sql);
+        assert!(
+            out.sql.contains("websearch_to_tsquery"),
+            "expected a tsquery search, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_fts_search_qualified_type_name() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Postgres);
+        let out = compile_and_emit_with(
+            "WITH hits := fts::search(default::Person, 'alice') SELECT hits { object { name }, score }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("\"Person\""),
+            "expected Person table, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_fts_search_deferred_applies_the_subquery_filter_and_the_page() {
+        // The backend returns its own window of ids by relevance; the filter and
+        // the page are then the database's to apply, so both have to reach SQL.
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "WITH hits := fts::search((select Person filter .age > 18), $query) \
+             SELECT hits { object { name }, score } ORDER BY .score DESC LIMIT <int16>$limit",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("UNNEST("),
+            "expected the injected id join, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("\"age\""),
+            "expected the pre-filter, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("LIMIT"),
+            "expected the limit in SQL, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("websearch_to_tsquery"),
+            "a deferred backend does not search in Postgres, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_fts_search_reads_the_query_parameter_through_a_cast() {
+        // A written-out cast is the usual way to spell a parameter's type, and the
+        // deferred plan reads the name off the AST rather than compiling it — so a
+        // cast used to leave it with nothing to resolve and the search ran for ''.
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "WITH hits := fts::search(Person, <str>$query) SELECT hits { object { name }, score }",
+            &schema,
+        );
+        let plan = out
+            .inference_plan
+            .expect("a deferred backend carries an inference plan");
+        match plan {
+            InferencePlan::Search { query_param_name, .. } => {
+                assert_eq!(query_param_name, "query");
+            }
+            other => panic!("expected a search plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fts_search_rejects_a_first_argument_that_is_neither_a_type_nor_a_select() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Postgres);
+        let err = compile_err_with(
+            "WITH hits := fts::search('Person', 'alice') SELECT hits { object { name }, score }",
+            &schema,
+        );
+        assert!(
+            err.contains("type name or a filtered subquery"),
+            "expected the two supported forms to be named, got: {err}"
+        );
+    }
+
     #[test]
     fn test_range_intrinsic_resolves_int_literals_to_int8range() {
         // Regression: std::range's ImplStrategy::TranspilerIntrinsic had no

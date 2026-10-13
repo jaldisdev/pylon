@@ -60,6 +60,11 @@ Similarity search over a [`VectorIndex`](../schema/indexes.md#vectorindex-embedd
 
 ```pyql
 select fts::search(Product, $query) { object { name }, score }
+select fts::search((select Product filter .seller = <uuid>$seller), $query) { object { name }, score }
+    order by .score desc
+    limit <int16>$limit
 ```
 
-Full-text search over a [`SearchIndex`](../schema/indexes.md#searchindex-full-text-search). Same fixed-shape convention as `vector::search`, with `score` instead of `distance`. For a Postgres-backed index this compiles to a synchronous `tsvector`/GIN query; for an OpenSearch/Meilisearch-backed index, the client performs the HTTP search first and injects the matching IDs/scores as query parameters before the SQL runs.
+Full-text search over a [`SearchIndex`](../schema/indexes.md#searchindex-full-text-search). Same fixed-shape convention as `vector::search`, with `score` instead of `distance`, and the same two forms of first argument: a type name, or a filtered subquery narrowing the candidate set — which is how a search is restricted to the rows its caller may see. `order by .score`, `limit` and `offset` apply to the result set.
+
+For a Postgres-backed index this compiles to a synchronous `tsvector`/GIN query; for an OpenSearch/Meilisearch-backed index, the client performs the HTTP search first and injects the matching IDs/scores as query parameters before the SQL runs. That order has one consequence worth knowing for the deferred backends: the backend returns a window of its best matches — sized by a literal `limit`, else 100 — and the filter applies to that window rather than to the whole index, so a narrow filter over a large index can come back with fewer rows than the limit asked for.
