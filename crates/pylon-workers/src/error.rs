@@ -33,6 +33,8 @@ pub enum Error {
     Unsupported(String),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error("{0}")]
+    Search(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for Error {

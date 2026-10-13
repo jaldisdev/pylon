@@ -87,6 +87,10 @@ class OpenSearchClient:
         }
         url = f'{self._base_url}/{index}/_search'
         resp = await self._http().post(url, json=body)
+        if resp.status_code == 404 and resp.json().get('error', {}).get('type') == 'index_not_found_exception':
+            # As in `MeilisearchClient.search`: an index nothing has been written to
+            # yet does not exist, and that is no hits rather than a failed search.
+            return []
         resp.raise_for_status()
         hits = resp.json()['hits']['hits']
         return [(h['_id'], h['_score']) for h in hits]

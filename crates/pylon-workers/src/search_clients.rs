@@ -69,7 +69,18 @@ impl MeilisearchClient {
     async fn search_inner(&self, index: &str, query_text: &str, size: usize) -> Result<Vec<(String, f64)>> {
         let url = format!("{}/indexes/{index}/search", self.base_url);
         let body = serde_json::json!({"q": query_text, "limit": size, "showRankingScore": true});
-        let resp = self.http.post(&url).json(&body).send().await?.error_for_status()?;
+        let resp = self.http.post(&url).json(&body).send().await?;
+        // The index comes into being with the first document pushed to it, so it is
+        // absent until an object of the type has been written. No documents is no
+        // hits, not a failed search. Mirrors `MeilisearchClient.search` in Python.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let data: serde_json::Value = resp.json().await?;
+            if data["code"] == "index_not_found" {
+                return Ok(Vec::new());
+            }
+            return Err(Error::Search(format!("meilisearch: {data}")));
+        }
+        let resp = resp.error_for_status()?;
         let data: serde_json::Value = resp.json().await?;
         let hits = data["hits"].as_array().cloned().unwrap_or_default();
         Ok(hits
@@ -171,7 +182,17 @@ impl OpenSearchClient {
             "_source": false,
             "size": size,
         });
-        let resp = self.http.post(&url).json(&body).send().await?.error_for_status()?;
+        let resp = self.http.post(&url).json(&body).send().await?;
+        // As in `MeilisearchClient::search_inner`: an index nothing has been written
+        // to yet does not exist, and that is no hits rather than a failed search.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let data: serde_json::Value = resp.json().await?;
+            if data["error"]["type"] == "index_not_found_exception" {
+                return Ok(Vec::new());
+            }
+            return Err(Error::Search(format!("opensearch: {data}")));
+        }
+        let resp = resp.error_for_status()?;
         let data: serde_json::Value = resp.json().await?;
         let hits = data["hits"]["hits"].as_array().cloned().unwrap_or_default();
         Ok(hits

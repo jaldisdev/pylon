@@ -42,6 +42,7 @@ fn workers_err(err: pylon_workers::Error) -> PyErr {
         pylon_workers::Error::Schema(msg) => PyValueError::new_err(msg),
         pylon_workers::Error::Unsupported(msg) => PyNotImplementedError::new_err(msg),
         pylon_workers::Error::Http(e) => PyRuntimeError::new_err(format!("search backend request failed: {e}")),
+        pylon_workers::Error::Search(msg) => PyRuntimeError::new_err(format!("search backend request failed: {msg}")),
     }
 }
 

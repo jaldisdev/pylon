@@ -78,6 +78,12 @@ class MeilisearchClient:
             url,
             json={'q': query_text, 'limit': size, 'showRankingScore': True},
         )
+        if resp.status_code == 404 and resp.json().get('code') == 'index_not_found':
+            # The index comes into being with the first document the index worker
+            # pushes, so it is absent for as long as no object of the type has been
+            # written. No documents is no hits, not a failed search — a surface would
+            # otherwise raise until something happened to be indexed.
+            return []
         resp.raise_for_status()
         hits = resp.json()['hits']
         return [(str(h['id']), h.get('_rankingScore', 1.0)) for h in hits]
