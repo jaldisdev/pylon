@@ -368,7 +368,11 @@ _RESERVED_TOP_LEVEL = frozenset({'project', 'database', 'search', 'models'})
 _DATABASE_SCALAR_KEYS = frozenset(
     {'dsn', 'host', 'port', 'name', 'user', 'password', 'password_env', 'pool_min_size', 'pool_max_size'}
 )
-_SEARCH_SCALAR_KEYS = frozenset({'host', 'port', 'user', 'password', 'password_env'})
+# A key this set does not name is taken for a named connection, and dropped when it is not a
+# sub-table either — which is how `backend = "meilisearch"` parsed as the default it overrides.
+_SEARCH_SCALAR_KEYS = frozenset(
+    {'host', 'port', 'backend', 'user', 'password', 'password_env', 'api_key', 'api_key_env'}
+)
 _MODELS_SCALAR_KEYS = frozenset({'api_style', 'api_url', 'model', 'client_id', 'secret', 'secret_env', 'purpose'})
 _CACHE_SCALAR_KEYS = frozenset({'enabled', 'backend', 'max_size_mb', 'path'})
 

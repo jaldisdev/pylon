@@ -239,6 +239,31 @@ class TestLoadConfig:
         assert cfg.search_registry['default'].host == 'localhost'
         assert cfg.search_registry['default'].password == 'opensearch_pw'
 
+    def test_search_section_carries_the_backend_and_its_api_key(self, toml_dir, monkeypatch):
+        # Both used to be dropped: a key the scalar set does not name is taken for a named
+        # connection, so `backend` parsed as the OpenSearch default it was there to override.
+        monkeypatch.setenv('MEILI_KEY', 'masterkey')
+        d = toml_dir("""
+            [project]
+            schema-dir = "dbschema"
+
+            [database]
+            host = "localhost"
+            port = 5432
+            name = "mydb"
+            user = "myuser"
+
+            [search]
+            backend = "meilisearch"
+            host = "localhost"
+            port = 7700
+            api_key_env = "MEILI_KEY"
+        """)
+        cfg = load_config(d / 'pylon.toml')
+        assert cfg.search_registry['default'].backend == 'meilisearch'
+        assert cfg.search_registry['default'].api_key == 'masterkey'
+        assert list(cfg.search_registry) == ['default']
+
     def test_search_named_branch(self, toml_dir):
         d = toml_dir("""
             [project]

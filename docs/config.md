@@ -92,17 +92,20 @@ dsn = "pylon://myuser:secret@localhost:5432/mydb"
 
 ## `[search]`
 
-**Optional.** OpenSearch connection. Supports named branch configs via `[search.branch_name]`.
+**Optional.** The backend a deferred [`SearchIndex`](schema/indexes.md#searchindex-full-text-search) is filled from and queried through — OpenSearch or Meilisearch. Supports named branch configs via `[search.branch_name]`.
 
 Named sub-tables are sparse overrides of the base `[search]` block — only differing keys need to be specified.
 
 | Key | Type | Required | Description |
 |---|---|---|---|
-| `host` | string | yes | OpenSearch host. |
-| `port` | integer | yes | OpenSearch port. |
+| `host` | string | yes | Search backend host. |
+| `port` | integer | yes | Search backend port. |
+| `backend` | string | no | `"opensearch"` (default) or `"meilisearch"`. |
 | `user` | string | no | OpenSearch user. |
 | `password` | string | no | Direct password value. Prefer `password_env`. |
 | `password_env` | string | no | Name of the env var holding the password. |
+| `api_key` | string | no | Meilisearch API key, sent as a bearer token. Prefer `api_key_env`. |
+| `api_key_env` | string | no | Name of the env var holding the API key. |
 
 **Example:**
 
@@ -359,17 +362,21 @@ from pylon import SearchConfig
 SearchConfig(
     host: str,
     port: int,
+    backend: str = 'opensearch',
     user: str | None = None,
     password: str | None = None,
+    api_key: str | None = None,
 )
 ```
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `host` | string | yes | OpenSearch host. |
-| `port` | integer | yes | OpenSearch port. |
+| `host` | string | yes | Search backend host. |
+| `port` | integer | yes | Search backend port. |
+| `backend` | string | no | `'opensearch'` (default) or `'meilisearch'`. |
 | `user` | string | no | OpenSearch user. |
 | `password` | string | no | OpenSearch password. |
+| `api_key` | string | no | Meilisearch API key, sent as a bearer token. |
 
 ---
 
