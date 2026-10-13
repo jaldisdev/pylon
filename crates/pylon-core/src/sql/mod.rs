@@ -6085,7 +6085,9 @@ fn emit_fts_search_deferred(fs: &IrFtsSearch) -> SqlOutput {
         };
         sql.push_str(&format!("\nORDER BY \"_os\".\"score\" {}", dir_sql));
     }
-    // limit/offset are passed to OpenSearch as size/from, not emitted in Postgres SQL.
+    // The filter runs after the backend's window, so only SQL can trim the survivors to the
+    // page — and a parameterised limit reaches the backend as nothing at all.
+    append_offset_limit(&mut sql, &fs.offset, &fs.limit);
     let size = fs.limit.as_ref().and_then(|lim| {
         if let IrExpr::Literal(IrLiteral::Int(n)) = lim {
             Some(*n as usize)
