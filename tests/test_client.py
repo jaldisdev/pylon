@@ -257,6 +257,80 @@ class TestCompileAndBind:
             _compile_and_bind('select 1', {})
 
 
+class TestBindDeferred:
+    """`_bind_deferred` — the parameters of a query whose search or embedding
+    runs before its SQL does."""
+
+    def _make_compiled(self, param_names: list[str]):
+        compiled = MagicMock()
+        compiled.sql = 'SELECT 1'
+        compiled.param_names = param_names
+        return compiled
+
+    def _plan(self, query_param_name: str = 'query'):
+        return {'kind': 'search', 'query_param_name': query_param_name, 'query_literal': None}
+
+    def test_injected_arrays_are_bound_without_being_asked_for(self):
+        from pylon.client import _bind_deferred
+
+        compiled = self._make_compiled(['__deferred_ids__', '__deferred_scores__'])
+        injected = {'__deferred_ids__': ['id'], '__deferred_scores__': [1.0]}
+
+        params = _bind_deferred(compiled, {'query': 'alice'}, None, injected, self._plan())
+
+        assert params == [['id'], [1.0]]
+
+    def test_the_querys_own_parameters_bind_alongside_them(self):
+        # A search narrowed to one account carries that account's id; binding
+        # used to read the injected arrays only and raised KeyError on it.
+        from pylon.client import _bind_deferred
+
+        compiled = self._make_compiled(['__deferred_ids__', '__deferred_scores__', 'account', 'limit'])
+        injected = {'__deferred_ids__': [], '__deferred_scores__': []}
+
+        params = _bind_deferred(
+            compiled,
+            {'query': 'alice', 'account': 'acc-1', 'limit': 30},
+            None,
+            injected,
+            self._plan(),
+        )
+
+        assert params == [[], [], 'acc-1', 30]
+
+    def test_a_session_global_is_filled_from_the_session(self):
+        from pylon.client import _bind_deferred
+
+        compiled = self._make_compiled(['__deferred_ids__', '__deferred_scores__', '__global__actor'])
+        injected = {'__deferred_ids__': [], '__deferred_scores__': []}
+
+        params = _bind_deferred(compiled, {'query': 'alice'}, {'actor': 'a'}, injected, self._plan())
+
+        assert params == [[], [], 'a']
+
+    def test_a_stray_argument_is_still_refused(self):
+        from pylon.client import _bind_deferred
+        from pylon.exceptions import UnknownParameterError
+
+        compiled = self._make_compiled(['__deferred_ids__', '__deferred_scores__'])
+        injected = {'__deferred_ids__': [], '__deferred_scores__': []}
+
+        with pytest.raises(UnknownParameterError):
+            _bind_deferred(compiled, {'query': 'alice', 'other': 1}, None, injected, self._plan())
+
+    def test_a_literal_query_text_takes_no_argument(self):
+        from pylon.client import _bind_deferred
+        from pylon.exceptions import UnknownParameterError
+
+        compiled = self._make_compiled(['__deferred_ids__', '__deferred_scores__'])
+        injected = {'__deferred_ids__': [], '__deferred_scores__': []}
+        plan = {'kind': 'search', 'query_param_name': '', 'query_literal': 'alice'}
+
+        assert _bind_deferred(compiled, {}, None, injected, plan) == [[], []]
+        with pytest.raises(UnknownParameterError):
+            _bind_deferred(compiled, {'query': 'alice'}, None, injected, plan)
+
+
 class TestMergeArgs:
     def test_no_args_returns_kwargs_unchanged(self):
         from pylon.client import _merge_args

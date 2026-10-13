@@ -968,8 +968,40 @@ async def _compile_and_resolve(
         )
         extra = {'__deferred_vec__': vector}
 
-    params = [extra[name] for name in compiled.param_names]
-    return compiled, params
+    return compiled, _bind_deferred(compiled, kwargs, globals_, extra, plan)
+
+
+def _bind_deferred(
+    compiled: CompiledQuery,
+    kwargs: dict[str, Any],
+    globals_: dict[str, Any] | None,
+    injected: dict[str, Any],
+    plan: dict,
+) -> list[Any]:
+    """Positional params for an inference-plan query.
+
+    Two of its parameters are not ordinary ones. The ids/scores (or the
+    embedded vector) were resolved above and are not the caller's to pass,
+    while the query text *is* the caller's but is consumed before the SQL
+    runs and so never appears in ``param_names``. Everything else — the
+    filter that narrows the candidate set, a page size, a session global —
+    binds exactly as it does for a plain statement, which is why this cannot
+    simply read ``injected``: a query carrying one used to fail with a bare
+    ``KeyError`` on its own parameter's name.
+    """
+    declared = _declared_params(compiled) - set(injected)
+    if query_param := plan['query_param_name']:
+        declared.add(query_param)
+    _check_arguments(declared, kwargs)
+    _check_array_elements(kwargs)
+    return [
+        injected[name]
+        if name in injected
+        else (globals_ or {}).get(name[len('__global__') :])
+        if name.startswith('__global__')
+        else kwargs[name]
+        for name in compiled.param_names
+    ]
 
 
 def _resolve_query_text(plan: dict, kwargs: dict) -> str | None:
