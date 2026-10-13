@@ -18236,6 +18236,17 @@ impl<'a> Compiler<'a> {
 
     // ── vector::search ────────────────────────────────────────────────────────────
 
+    /// The expression a chain of casts wraps. The query text of a deferred
+    /// `vector::search`/`fts::search` is read off the AST rather than compiled, so a
+    /// written-out cast has to be seen through to find the parameter inside it.
+    fn strip_casts(expr: &ast::Expr) -> &ast::Expr {
+        let mut current = expr;
+        while let ast::Expr::TypeCast(cast) = current {
+            current = &cast.expr;
+        }
+        current
+    }
+
     /// Try to compile `vector::search` from a function-call AST node.
     ///
     /// Two overloads are supported:
@@ -18357,7 +18368,7 @@ impl<'a> Compiler<'a> {
                 pg_type: "vector".to_string(),
                 tuple_shape: None,
             }));
-            let query_arg = text_query_arg.unwrap();
+            let query_arg = Self::strip_casts(text_query_arg.unwrap());
             inference_query_param_name = Some(match query_arg {
                 ast::Expr::Parameter(name) => name.clone(),
                 _ => String::new(),
@@ -18588,11 +18599,15 @@ impl<'a> Compiler<'a> {
             let scores_idx = self.param_index("__deferred_scores__");
             deferred_ids_param = Some(ids_idx);
             deferred_scores_param = Some(scores_idx);
-            deferred_query_param_name = match &fc.args[1] {
+            // Through any cast: `<str>$query` says the same thing as `$query` here, and
+            // reading only the bare form left the plan with no parameter to resolve — the
+            // search then ran for the empty string instead of reporting anything.
+            let query_arg = Self::strip_casts(&fc.args[1]);
+            deferred_query_param_name = match query_arg {
                 ast::Expr::Parameter(name) => Some(name.clone()),
                 _ => None,
             };
-            deferred_query_literal = match &fc.args[1] {
+            deferred_query_literal = match query_arg {
                 ast::Expr::Literal(ast::Literal::Str(s)) => Some(s.clone()),
                 _ => None,
             };
