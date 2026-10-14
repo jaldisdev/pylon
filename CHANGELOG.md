@@ -4,7 +4,37 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
-## 0.6.0
+## 0.6.0 — 2026-10-14
+
+### Full-text search
+
+`fts::search` could only ever search a whole type, and several things a query
+routinely carries — a cast around the query text, a page, a parameter of its
+own — did not survive the trip through a deferred (OpenSearch/Meilisearch)
+backend.
+
+* `fts::search` now takes a filtered subquery as its first argument — `select
+  fts::search((select Product filter .seller = <uuid>$seller), $query)` — the
+  second form `vector::search` already accepted, and the way a search is
+  narrowed to the rows its caller may see.
+* `limit` and `offset` now also apply in SQL for a deferred backend. The
+  filter runs after the backend's window, so only SQL can trim the survivors
+  to the page, and a parameterised limit reached the backend as nothing at
+  all. The window itself is still sized by a literal `limit`, else 100, so a
+  narrow filter over a large index can return fewer rows than asked for.
+* A written-out cast around the query text — `<str>$query`, which says what
+  `$query` says — left the plan with no parameter to resolve, and the search
+  ran for the empty string.
+* A deferred search carrying any parameter of its own failed with a bare
+  `KeyError` on that parameter's name. Only the injected ids/scores and the
+  query text are special now; a filter's parameters, a page size and a session
+  global bind the way they do for a plain statement.
+* Searching an index nothing has been written to yet raised. The backend
+  creates the index with the first document pushed to it, so a surface kept
+  failing until something happened to be indexed; no documents is no hits.
+* `backend` and `api_key`/`api_key_env` under `[search]` in `pylon.toml` were
+  read as names of connections and then dropped, so `backend = "meilisearch"`
+  silently stayed on the OpenSearch default it was overriding.
 
 ### Search and vector indexes
 
