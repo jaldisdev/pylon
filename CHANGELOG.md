@@ -45,6 +45,13 @@ engine reads introspected state and Postgres exposes none of them:
   left its column behind on the type — and a generated one was still
   recomputed on every write. Both are now dropped.
 
+### CLI
+
+* Declining a confirmation prompt — or pressing Ctrl-C at one — printed a bare
+  `error:` with nothing after it, since `click.Abort` carries no message. It
+  now reports `Aborted.`, without the error prefix: saying no is a decision,
+  not a failure.
+
 ### Python
 
 * Python 3.15 is tested and released against. The extension is not abi3, so

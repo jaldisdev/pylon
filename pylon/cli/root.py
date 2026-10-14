@@ -54,6 +54,13 @@ def main() -> None:
     except click.ClickException as e:
         e.show()
         sys.exit(e.exit_code)
+    except click.Abort:
+        # Answering "no" to a confirmation, or Ctrl-C at a prompt. Not a
+        # failure, so it gets neither the red `error:` prefix nor the
+        # exception's text — `Abort` carries none, which is what printed a
+        # bare `error:` with nothing after it.
+        click.echo('Aborted.', err=True)
+        sys.exit(1)
     except Exception as e:
         click.echo(f'{_BOLD_RED}error:{_RESET} {e}', err=True)
         sys.exit(1)
