@@ -45,6 +45,16 @@ from the same version number.
 * Nested DML that cannot be hoisted where a multi-link value is read —
   including a filter or a page written over it — is refused at compile time
   now, rather than quietly read as a plain select over the whole table.
+* Nested DML in a pointer's value inside a `for` loop reached Postgres as a
+  value naming an iterator its CTE had no `FROM` entry for — `for d in … union
+  (insert Doc { owner := (select (insert Tag { label := d }) { id }) })` failed
+  with `missing FROM-clause entry`, in every spelling and for a link and a
+  multi-link alike. A hoisted statement that reads the loop variable now
+  stages its rows under the iteration that wrote them, and whatever reads it
+  pairs on that key, so each row gets the row its own iteration wrote rather
+  than every iteration's. Reading a loop variable from *outside* the loop the
+  value sits in is refused — one key is carried, so there is nothing to pair a
+  second one on; it used to reach an `unreachable!` and surface as a panic.
 
 ## 0.6.0 — 2026-10-14
 

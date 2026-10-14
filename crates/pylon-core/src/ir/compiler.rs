@@ -17018,13 +17018,39 @@ impl<'a> Compiler<'a> {
 
     fn hoist_nested_dml(&mut self, stmt: &Stmt) -> Result<String, PyQLError> {
         let type_name = self.dml_subject_type(stmt)?;
-        let inner = self.compile_stmt(stmt)?;
+        // A CTE is evaluated once for the whole statement, so one that reads
+        // the loop variable has to be keyed by the iteration it was evaluated
+        // for -- the same correlation `hoist_dml_as_cte` records for a hoisted
+        // loop. Without it the rows of every iteration pair with the rows of
+        // every other, and the value expression reads an iterator the CTE has
+        // no FROM entry for.
+        let before = std::mem::take(&mut self.for_vars_read);
+        let inner = self.compile_stmt(stmt);
+        let read = std::mem::replace(&mut self.for_vars_read, before);
+        // The rows carry one key, the loop they were written under, so the
+        // only loop a value can be paired back to is the one it sits in.
+        // Reading any other -- a loop further out, with an inner one between --
+        // would need a second key to pair on.
+        let innermost = self.for_scope.last();
+        let enclosing: Vec<&String> = self.for_scope.iter().filter(|slot| read.contains(*slot)).collect();
+        if enclosing.iter().any(|slot| Some(*slot) != innermost) {
+            return Err(self.type_err(
+                "nested DML in a value may read the loop variable it is written under, not one further out; \
+                 bind the statement with `with` and read that name instead",
+            ));
+        }
+        let correlated_to = enclosing.first().map(|slot| format!("_for_{slot}"));
+        self.for_vars_read.extend(read);
+        let inner = inner?;
         let cte_name = self.fresh_nested_cte_name();
+        if let Some(slot) = correlated_to.as_deref().and_then(|i| i.strip_prefix("_for_")) {
+            self.correlated_bindings.insert(cte_name.clone(), slot.to_string());
+        }
         self.pending_nested_ctes.push(IrCteDef {
             name: cte_name.clone(),
             stmt: inner,
             type_name,
-            correlated_to: None,
+            correlated_to,
         });
         Ok(cte_name)
     }

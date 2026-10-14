@@ -695,6 +695,28 @@ fn nested_cte_from(ctes: &[IrCteDef], reading: &str, lead: &str) -> String {
     format!("{lead}FROM {}", joined.join(", "))
 }
 
+/// `nested_cte_from` for an insert already driven from an iterator: the CTEs
+/// its values read are added to that FROM rather than replacing it. One that
+/// wrote a row per iteration (`correlated_to`) is paired on the carried key —
+/// cross-joining it would give every row of every iteration to every other.
+fn nested_cte_join(ctes: &[IrCteDef], reading: &str) -> String {
+    ctes.iter()
+        .filter(|c| reading.contains(&format!("{}.", qi(&c.name))))
+        .map(|c| match &c.correlated_to {
+            Some(iterator) => format!(
+                "\nJOIN {} ON {}.{} = {}.{}",
+                qi(&c.name),
+                qi(&c.name),
+                qi(OUTER_KEY),
+                qi(iterator),
+                qi("v"),
+            ),
+            None => format!(", {}", qi(&c.name)),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 /// Each operand's rows read through the bare `v` every scalar statement
 /// exposes as a CTE source, so operands of different kinds line up.
 fn emit_scalar_union(branches: &[IrStmt]) -> String {
@@ -1316,11 +1338,12 @@ fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) ->
                 correlated_append_indices(&ins.multi_link_appends, &[&f.body_ctes, &ins.nested_ctes]);
             if correlated_targets.is_empty() {
                 let mut sql = format!(
-                    "INSERT INTO {} ({})\nSELECT {} FROM {}",
+                    "INSERT INTO {} ({})\nSELECT {} FROM {}{}",
                     target_ref(&ins.target),
                     cols.join(", "),
                     values.join(", "),
                     qi(&iter_alias),
+                    nested_cte_join(&ins.nested_ctes, &values.join(",")),
                 );
                 append_insert_guard(&mut sql, ins);
                 if let Some(conflict) = &ins.unless_conflict {
@@ -1580,6 +1603,27 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             && matches!(f.body.as_ref(), IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::For(_))
         {
             parts.extend(emit_for_dml_ctes_within(f, &c.name, c.correlated_to.as_deref()));
+            continue;
+        }
+        // An insert that reads the loop variable writes one row per iteration
+        // and has to say which iteration wrote which: its ids are generated in
+        // a staging CTE carrying the key, the same shape a hoisted loop's body
+        // takes, so whatever reads this binding can pair on it.
+        if let IrStmt::Insert(ins) = &c.stmt
+            && let Some(iterator) = &c.correlated_to
+        {
+            let rows_name = format!("{}__rows", c.name);
+            let ids_name = format!("{}__ids", c.name);
+            parts.extend(emit_user_cte_parts(&ins.nested_ctes));
+            parts.push(emit_iteration_rows_cte(
+                ins,
+                &rows_name,
+                iterator,
+                &format!("{}.{}", qi(iterator), qi("v")),
+            ));
+            parts.push(emit_insert_from_rows_cte(ins, &ids_name, &rows_name));
+            parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", c.name, rows_name));
+            parts.extend(binding_enqueue_ctes(&c.stmt, &c.name));
             continue;
         }
         let body = emit_dml_as_cte_source(&c.stmt);
@@ -3951,26 +3995,56 @@ fn emit_iteration_rows_cte(ins: &IrInsert, cte_name: &str, iter_alias: &str, out
         ),
         format!("{} AS {}", outer_source, qi(OUTER_KEY)),
     ];
+    let value = |e: &IrExpr| carried_loop_vars(&emit_expr(e), iter_alias, outer_source);
     selected.extend(
         ins.assignments
             .iter()
             .filter(|(c, _)| !rewrite_cols.contains(c.as_str()))
-            .map(|(c, e)| format!("{} AS {}", emit_expr(e), qi(c)))
+            .map(|(c, e)| format!("{} AS {}", value(e), qi(c)))
             .chain(
                 ins.rewrites
                     .iter()
-                    .map(|r| format!("{} AS {}", emit_expr(&r.expr), qi(&r.column))),
+                    .map(|r| format!("{} AS {}", value(&r.expr), qi(&r.column))),
             ),
     );
     let mut sql = format!(
-        "\"{}\" AS (\nSELECT {}\nFROM {}",
+        "\"{}\" AS (\nSELECT {}\nFROM {}{}",
         cte_name,
         selected.join(", "),
         qi(iter_alias),
+        // A value of this row may itself come from hoisted DML — the staging
+        // rows read it beside the iterator, paired on the key when that CTE
+        // wrote a row per iteration too.
+        nested_cte_join(&ins.nested_ctes, &selected.join(",")),
     );
     append_insert_guard(&mut sql, ins);
     sql.push_str("\n)");
     sql
+}
+
+/// Rewrite an enclosing loop variable's reference to the key the driving rows
+/// carry. These rows are driven from one iterator (`iter_alias`), so a value
+/// that reads a loop further out names a relation this CTE has no FROM entry
+/// for -- and `outer_source` is by construction that loop's value for the row
+/// at hand. The compiler refuses more than one enclosing variable (see
+/// `hoist_nested_dml`), so one substitution covers every reference.
+fn carried_loop_vars(sql: &str, iter_alias: &str, outer_source: &str) -> String {
+    let own = format!("{}.{}", qi(iter_alias), qi("v"));
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find("\"_for_") {
+        let (before, from_marker) = rest.split_at(at);
+        out.push_str(before);
+        let Some(end) = from_marker.find(".\"v\"") else {
+            out.push_str(from_marker);
+            return out;
+        };
+        let (reference, tail) = from_marker.split_at(end + ".\"v\"".len());
+        out.push_str(if reference == own { reference } else { outer_source });
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The insert that reads its rows back out of the staging CTE above.
@@ -4116,11 +4190,12 @@ fn emit_for_insert(
     let correlated_targets = correlated_append_indices(&ins.multi_link_appends, &[body_ctes, &ins.nested_ctes]);
 
     let mut insert_sql = format!(
-        "INSERT INTO {} ({})\nSELECT {} FROM {}",
+        "INSERT INTO {} ({})\nSELECT {} FROM {}{}",
         target_ref(&ins.target),
         cols.join(", "),
         sel_exprs.join(", "),
         qi(iter_alias),
+        nested_cte_join(&ins.nested_ctes, &sel_exprs.join(",")),
     );
     append_insert_guard(&mut insert_sql, ins);
     if let Some(conflict) = &ins.unless_conflict {
@@ -6858,8 +6933,20 @@ mod tests {
             .unwrap_or_else(|| panic!("no Company insert in:\n{}", out.sql));
         let tail = &out.sql[at..];
         let stmt_end = tail.find("RETURNING").unwrap_or(tail.len());
+        let insert = &tail[..stmt_end];
+        let guard = "NOT EXISTS(SELECT 1 FROM \"existing\")";
+        // The condition sits on the insert itself, or on the staging rows it
+        // reads: a binding that writes per iteration generates its ids one CTE
+        // earlier (see `emit_iteration_rows_cte`). Either way a false condition
+        // leaves the insert with nothing to write.
+        let staged_rows = out
+            .sql
+            .split_once("\"extra__rows\" AS (")
+            .and_then(|(_, rest)| rest.split_once("\n)"))
+            .map(|(body, _)| body)
+            .unwrap_or("");
         assert!(
-            tail[..stmt_end].contains("NOT EXISTS(SELECT 1 FROM \"existing\")"),
+            insert.contains(guard) || (insert.contains("FROM \"extra__rows\"") && staged_rows.contains(guard)),
             "a binding inside the loop must carry the condition too, got:\n{}",
             out.sql
         );
@@ -13117,6 +13204,86 @@ select owner { posts := (select owner.posts.title) };",
             "must not link every existing Post, got:\n{}",
             out.sql
         );
+    }
+
+    #[test]
+    fn test_a_nested_insert_reading_the_loop_variable_pairs_per_iteration() {
+        // A CTE is evaluated once for the whole statement, so an insert that
+        // reads the loop variable has to stage its ids under the iteration
+        // that wrote them — else its rows cross-join with every other
+        // iteration's, and the value reads an iterator the CTE cannot see.
+        let out = compile_and_emit(
+            "FOR n IN {'Alice', 'Bob'} UNION ( \
+             INSERT Person { name := n, company := (select (insert Company { name := n }) { id }) })",
+        );
+        assert!(
+            out.sql.contains("\"_nested_dml_0__rows\" AS ("),
+            "expected the nested insert to stage its rows, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql
+                .contains("JOIN \"_nested_dml_0\" ON \"_nested_dml_0\".\"_outer\" = \"_for_n\".\"v\""),
+            "expected the outer insert to pair on the iteration key, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_nested_insert_in_a_loop_reads_the_key_its_rows_carry() {
+        // The staging rows are driven from one iterator, so a value reading a
+        // loop further out has to come from the key they carry.
+        let out = compile_and_emit(
+            "FOR n IN {'Alice'} UNION ( \
+             INSERT Person { name := n, \
+               posts := (FOR t IN {'p'} UNION (INSERT Post { title := n })) })",
+        );
+        assert!(
+            out.sql.contains("\"_for_t\".\"_outer\" AS \"title\""),
+            "expected the outer loop variable to read the carried key, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("\"_for_n\".\"v\" AS \"title\""),
+            "the staging rows have no FROM entry for the outer iterator, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_staged_loop_rows_read_the_nested_dml_their_values_come_from() {
+        // With a junction to write, the row's own ids are generated in a
+        // staging CTE — which still has to read whatever hoisted DML its
+        // values come from, paired on the same key.
+        let out = compile_and_emit(
+            "FOR n IN {'Alice'} UNION ( \
+             INSERT Person { name := n, \
+               company := (select (insert Company { name := n }) { id }), \
+               posts := (INSERT Post { title := n }) })",
+        );
+        let rows = out
+            .sql
+            .split_once("\"_for_dml__rows\" AS (")
+            .and_then(|(_, rest)| rest.split_once("\n)"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("no staging CTE in:\n{}", out.sql));
+        assert!(
+            rows.contains("JOIN") && rows.contains("\"_outer\" = \"_for_n\".\"v\""),
+            "expected the staging rows to pair with the hoisted insert, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_nested_dml_reading_an_outer_loop_variable_is_refused() {
+        // One key is carried, so a value cannot pair back to a loop with
+        // another one between. Used to reach an `unreachable!` in the
+        // emitter, which surfaced as a panic rather than as an error.
+        let err = compile_err(
+            "FOR a IN {'x'} UNION (FOR b IN {'y'} UNION ( \
+             INSERT Person { name := b, company := (select (insert Company { name := a }) { id }) }))",
+        );
+        assert!(err.contains("not one further out"), "got: {err}");
     }
 
     #[test]

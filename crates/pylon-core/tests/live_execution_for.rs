@@ -901,3 +901,64 @@ async fn a_loop_updating_its_variable_reads_back_through_a_shape_on_the_select()
         "only the iterated rows should change"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn for_loop_nested_insert_in_a_value_pairs_with_the_iteration_that_wrote_it() {
+    // A hoisted nested insert is one CTE, evaluated once for the whole
+    // statement, so a loop writing N rows through it has to say which
+    // iteration wrote which. Uncorrelated, this reached Postgres as a value
+    // expression naming an iterator the CTE has no FROM entry for; paired by
+    // a plain cross join it would give every row every other row's.
+    let module = unique_module("live_for_nested_value");
+    let mut doc = ty("Doc", &module, vec![id_prop(), text_prop("title")]);
+    let tag = ty("Tag", &module, vec![id_prop(), text_prop("label")]);
+    doc.links = vec![link("owner", &format!("{module}::Tag"))];
+    doc.multilinks = vec![multilink("tags", &format!("{module}::Tag"))];
+    let sd = SchemaDescriptor {
+        types: vec![doc, tag],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "for d in {{'a', 'b'}} union ( \
+             insert {module}::Doc {{ \
+               title := d, \
+               owner := (select (insert {module}::Tag {{ label := d }}) {{ id }}), \
+               tags := (insert {module}::Tag {{ label := d }}) \
+             }})"
+        ),
+    )
+    .await;
+
+    let rows = rows_of(
+        &pool,
+        &sd,
+        &format!("select {module}::Doc {{ title, owner: {{ label }}, tags: {{ label }} }} order by .title"),
+    )
+    .await;
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let title = as_str(field(row, 2)).to_string();
+        let owner = as_str(field(field(row, 3), 2)).to_string();
+        let tags: HashSet<String> = match field(row, 4) {
+            DecodedValue::Array(items) => items.iter().map(|t| as_str(field(t, 2)).to_string()).collect(),
+            other => panic!("expected an array of tags, got {other:?}"),
+        };
+        assert_eq!(owner, title, "each row owns the row its own iteration wrote");
+        assert_eq!(
+            tags,
+            HashSet::from([title.clone()]),
+            "and links only that iteration's, not every iteration's"
+        );
+    }
+
+    // Four rows written, one per value per iteration -- not one shared row.
+    let tags = rows_of(&pool, &sd, &format!("select {module}::Tag {{ label }}")).await;
+    assert_eq!(tags.len(), 4);
+}
