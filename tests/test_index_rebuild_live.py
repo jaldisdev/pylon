@@ -485,3 +485,45 @@ def test_a_bulk_insert_in_a_loop_enqueues_a_job_for_every_row(live_pool, unique_
         )
 
     asyncio.run(run())
+
+
+def test_a_write_bound_to_a_name_enqueues_its_own_job(live_pool, unique_module):
+    """A `with` binding's DML is emitted as a CTE of its own, and nothing hung
+    an enqueue off those — the row was written and never indexed. Live because
+    the enqueue is a second data-modifying CTE beside the binding, reading the
+    rows it returned."""
+    from pylon._core import compile as pycompile
+    from pylon._core import export_schema
+
+    module = unique_module('live_idx_bound_write')
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Doc')
+        class Doc:
+            title: str
+            pylon.SearchIndex(
+                backend=pylon.SearchBackend.Meilisearch,
+                pointers=[pylon.SearchPointer('Doc.title')],
+            )
+
+        schema = _build_schema()
+        await live_pool.batch_execute(export_schema(schema))
+
+        compiled = pycompile(
+            f"with d := (insert {module}::Doc {{ title := 'alpha' }}) select d {{ id, title }}",
+            schema,
+        )
+        rows = await live_pool.query_compiled(compiled, [], None)
+        assert len(rows) == 1, rows
+
+        jobs = await _outbox_rows(live_pool, f'{module}::Doc')
+        assert len(jobs) == 1, jobs
+        assert jobs[0]['operation'] == 'index', jobs
+
+        # The row the binding read back is the row the job names.
+        written = await live_pool.query_named(f'SELECT id::text AS id FROM "{module}"."Doc"', [])
+        assert [j['object_id'] for j in jobs] == [r['id'] for r in written]
+
+    asyncio.run(run())

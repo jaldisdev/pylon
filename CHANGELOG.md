@@ -28,6 +28,10 @@ from the same version number.
   no vector search could ever match. A loop that updates had the same hole.
   Both now enqueue one job per row written, off the rows the loop itself
   wrote.
+* A write bound to a name — `with d := (insert …)`, or a statement hoisted out
+  of a link's value — enqueued no index jobs either, for the same reason: a
+  binding's DML is emitted as a CTE of its own and nothing hung an enqueue off
+  those. Each binding now carries its own jobs, named after the binding.
 
 ## 0.6.0 — 2026-10-14
 

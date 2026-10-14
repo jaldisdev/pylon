@@ -1287,6 +1287,7 @@ fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) ->
         parts.push(emit_iteration_rows_cte(ins, &rows_name, &iter_alias, &outer_source));
         parts.push(emit_insert_from_rows_cte(ins, &ids_name, &rows_name));
         parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, rows_name));
+        parts.extend(binding_enqueue_ctes(f.body.as_ref(), name));
         return parts;
     }
 
@@ -1517,6 +1518,7 @@ fn emit_for_dml_ctes_within(f: &IrFor, name: &str, outer_alias: Option<&str>) ->
     }
 
     parts.push(format!("\"{}\" AS (\n    SELECT * FROM \"{}\"\n)", name, ids_name));
+    parts.extend(binding_enqueue_ctes(f.body.as_ref(), name));
     parts
 }
 
@@ -1557,6 +1559,7 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             }
             if update_has_any_multilink(upd) {
                 parts.extend(emit_update_multilink_ctes(upd, &c.name));
+                parts.extend(binding_enqueue_ctes(&c.stmt, &c.name));
                 continue;
             }
         }
@@ -1564,6 +1567,7 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             && insert_has_any_multilink(ins)
         {
             parts.extend(emit_insert_multilink_ctes(ins, &c.name));
+            parts.extend(binding_enqueue_ctes(&c.stmt, &c.name));
             continue;
         }
         if let IrStmt::Delete(del) = &c.stmt
@@ -1592,6 +1596,7 @@ fn emit_user_cte_parts(ctes: &[IrCteDef]) -> Vec<String> {
             ),
             None => format!("\"{}\" AS (\n{}\n)", c.name, body),
         });
+        parts.extend(binding_enqueue_ctes(&c.stmt, &c.name));
     }
     parts
 }
@@ -4263,6 +4268,35 @@ fn enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], source_cte: &str, offset: 
         .enumerate()
         .map(|(i, eq)| enqueue_search_cte_sql(eq, source_cte, &format!("_es{}", offset + i)))
         .collect()
+}
+
+/// The index jobs a statement bound to a name owes for the rows it writes.
+/// A binding's DML is emitted as a CTE of its own, so its enqueues read that
+/// CTE and are named after it -- two bindings in one statement, or a binding
+/// beside the statement's own enqueues, would otherwise collide on `_es0`.
+/// Returns nothing for a statement whose own fan-out already enqueued per
+/// implementor, and for a kind that has nothing to enqueue.
+fn binding_enqueue_ctes(stmt: &IrStmt, source_cte: &str) -> Vec<String> {
+    let (vector, search): (&[VectorEnqueueInfo], &[SearchEnqueueInfo]) = match stmt {
+        IrStmt::Insert(ins) => (&ins.enqueue_vector, &ins.enqueue_search),
+        IrStmt::Update(upd) if upd.poly_implementors.is_empty() => (&upd.enqueue_vector, &upd.enqueue_search),
+        IrStmt::Delete(del) if del.poly_implementors.is_empty() => (&[], &del.enqueue_search),
+        // A loop owes what its body writes, however many loops down.
+        IrStmt::For(f) => return binding_enqueue_ctes(f.body.as_ref(), source_cte),
+        _ => (&[], &[]),
+    };
+    let mut parts: Vec<String> = vector
+        .iter()
+        .enumerate()
+        .map(|(i, eq)| enqueue_cte_sql(eq, source_cte, &format!("{source_cte}_eq{i}")))
+        .collect();
+    parts.extend(
+        search
+            .iter()
+            .enumerate()
+            .map(|(i, eq)| enqueue_search_cte_sql(eq, source_cte, &format!("{source_cte}_es{i}"))),
+    );
+    parts
 }
 
 /// One implementor's share of an interface/supertype fan-out's enqueues.
@@ -17056,6 +17090,109 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             !out.sql.contains("FROM \"_dml\"\n    ON CONFLICT"),
             "an enqueue off the implementor union would index every sibling for every id, got:\n{}",
+            out.sql
+        );
+    }
+
+    // ── bound-write enqueue tests ─────────────────────────────────────────────
+    //
+    // DML bound to a name — a `with` binding, or a statement hoisted out of a
+    // link's value — is emitted as a CTE of its own, and nothing hung an
+    // enqueue off those: the rows were written and never indexed.
+
+    #[test]
+    fn test_a_bound_insert_enqueues_its_own_index_job() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "WITH d := (INSERT Person { name := 'Alice' }) SELECT d { name }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains(
+                "    SELECT \"id\", 'default::Person', 'Meilisearch'::_pylon.\"IndexKind\", NULL, 'index'\n    FROM \"d\""
+            ),
+            "expected the binding's own enqueue, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_bound_delete_enqueues_its_own_delete_job() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "WITH d := (DELETE Person FILTER .name = 'Alice') SELECT d { name }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains(
+                "    SELECT \"id\", 'default::Person', 'Meilisearch'::_pylon.\"IndexKind\", NULL, 'delete'\n    FROM \"d\""
+            ),
+            "expected the binding's own delete job, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_bound_for_loop_insert_enqueues_the_rows_it_writes() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "WITH d := (FOR n IN {'Alice', 'Bob'} UNION (INSERT Person { name := n })) SELECT d { name }",
+            &schema,
+        );
+        assert!(
+            out.sql.contains("\"d_es0\" AS ("),
+            "expected an enqueue CTE, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("    FROM \"d\""),
+            "expected it to read the binding, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_each_bound_write_gets_an_enqueue_cte_of_its_own() {
+        // Named after the binding: `_es0` twice in one statement would be a
+        // duplicate CTE name, which Postgres refuses outright.
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "WITH a := (INSERT Person { name := 'Alice' }), b := (INSERT Person { name := 'Bob' }) \
+             SELECT b { name }",
+            &schema,
+        );
+        assert!(out.sql.contains("\"a_es0\" AS ("), "got:\n{}", out.sql);
+        assert!(out.sql.contains("\"b_es0\" AS ("), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_nested_insert_hoisted_from_a_link_value_enqueues_its_own_job() {
+        // The hoisted statement is a binding like any other, and its row needs
+        // indexing as much as the row that links it.
+        use crate::schema::{SearchIndexDescriptor, SearchPointerDescriptor, SearchWeight};
+        let mut schema = make_schema();
+        schema
+            .types
+            .iter_mut()
+            .find(|t| t.name == "Company")
+            .expect("Company")
+            .search_indexes
+            .push(SearchIndexDescriptor {
+                index_name: None,
+                backend: crate::schema::SearchBackend::Meilisearch,
+                pointers: vec![SearchPointerDescriptor {
+                    name: "name".into(),
+                    weight: SearchWeight::A,
+                }],
+            });
+        let out = compile_and_emit_with(
+            "INSERT Person { name := 'Alice', company := (select (insert Company { name := 'Acme' }) { id }) }",
+            &schema,
+        );
+        assert!(
+            out.sql
+                .contains("'default::Company', 'Meilisearch'::_pylon.\"IndexKind\""),
+            "expected the nested insert's own job, got:\n{}",
             out.sql
         );
     }
