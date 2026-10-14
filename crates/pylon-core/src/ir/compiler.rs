@@ -9942,6 +9942,31 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        // `emails := (select (insert Email { … }) { id })` — the nested insert
+        // below, wrapped in the select a single link's value is written with.
+        // Read as a plain select the wrapper drops the insert and links every
+        // existing row of the target type instead, which is the mistake
+        // `compile_link_subquery` documents for links.
+        if let Expr::SubQuery(outer) = expr
+            && let Stmt::Select(sel) = outer.as_ref()
+            && let Some(inner) = wrapped_nested_dml(&sel.result)
+        {
+            // Narrowing rows the statement is itself creating says nothing
+            // the insert doesn't already decide, and dropping the clause
+            // silently is how this bug read in the first place.
+            if sel.filter.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() || sel.limit.is_some() {
+                return Err(self.type_err(
+                    "a filter or a page over nested DML is not a multilink value; \
+                     bind the statement with `with` and narrow that instead",
+                ));
+            }
+            let cte_name = self.hoist_nested_dml(inner)?;
+            return Ok(IrMultiLinkValues {
+                source: IrMultiLinkValueSource::CteRef(cte_name),
+                link_props: vec![],
+            });
+        }
+
         // `emails := (insert Email { … })` — a nested insert whose rows become
         // the link's targets, read back from the CTE it is hoisted into.
         if let Expr::SubQuery(inner) = expr
@@ -9985,6 +10010,15 @@ impl<'a> Compiler<'a> {
         // Parenthesised subquery
         if let Expr::SubQuery(inner) = expr {
             return match self.compile_stmt(inner)? {
+                // Nothing reads a `dml_source` from here: the value is emitted
+                // inside the junction insert's own SELECT, and Postgres runs a
+                // data-modifying statement only at the top level of a `WITH`.
+                // Hoisting is handled above for the shapes that can be; any
+                // other is refused rather than quietly read as a plain select.
+                IrStmt::Select(s) if s.dml_source.is_some() => Err(self.type_err(
+                    "nested DML cannot be read as a multilink value here; \
+                     bind the statement with `with` and use that name",
+                )),
                 IrStmt::Select(s) if matches!(s.rows.as_slice(), [IrRowSource::Bound { .. }]) => {
                     Ok(IrMultiLinkValues {
                         source: IrMultiLinkValueSource::Select(Box::new(s)),
@@ -17039,21 +17073,7 @@ impl<'a> Compiler<'a> {
         // without error but silently emitted a subquery that dropped the
         // nested INSERT and selected an unrelated, arbitrary pre-existing
         // row instead — do not repeat that approach.
-        let nested_dml = match &sel.result {
-            Expr::SubQuery(inner) if matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) => {
-                Some(inner.as_ref())
-            }
-            Expr::Shape(s) => match s.expr.as_ref() {
-                Some(Expr::SubQuery(inner))
-                    if matches!(inner.as_ref(), Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)) =>
-                {
-                    Some(inner.as_ref())
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(inner_stmt) = nested_dml {
+        if let Some(inner_stmt) = wrapped_nested_dml(&sel.result) {
             let cte_name = self.hoist_nested_dml(inner_stmt)?;
             return Ok(IrExpr::ColumnRef {
                 alias: cte_name,
@@ -19615,6 +19635,23 @@ fn datetime_arithmetic_compatible(op: &ast::BinOpKind, a: &str, b: &str) -> bool
             | ("time", "interval")
             | ("interval", "time")
     )
+}
+
+/// The DML statement a `select (insert …) { … }` wraps, when that is what a
+/// value expression is. A link and a multi-link take the same route: Postgres
+/// runs nested DML only as a top-level CTE, so the wrapper is peeled and the
+/// statement inside it hoisted. The shape is the caller's business -- either
+/// kind of link only ever wants the ids.
+fn wrapped_nested_dml(result: &Expr) -> Option<&Stmt> {
+    let inner = match result {
+        Expr::SubQuery(inner) => inner.as_ref(),
+        Expr::Shape(shaped) => match shaped.expr.as_ref() {
+            Some(Expr::SubQuery(inner)) => inner.as_ref(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    matches!(inner, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)).then_some(inner)
 }
 
 /// Collect `SearchEnqueueInfo` for every OpenSearch- or Meilisearch-backed

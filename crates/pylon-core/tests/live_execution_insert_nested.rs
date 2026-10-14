@@ -255,3 +255,55 @@ async fn insert_assigns_a_multilink_directly_not_via_append() {
     let names: HashSet<String> = members.iter().map(|m| as_str(field(m, 2)).to_string()).collect();
     assert_eq!(names, HashSet::from(["Alice".to_string(), "Bob".to_string()]));
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn insert_multilink_value_from_a_nested_insert_links_only_the_row_it_wrote() {
+    // The same wrapper as the link-value case above, on a multi-link. Read as
+    // a plain select it dropped the insert and linked every existing row of
+    // the target type instead -- silently, so only the junction rows a real
+    // database ends up holding show it.
+    let module = unique_module("live_insert_multilink_nested");
+    let person = ty("Person", &module, vec![id_prop(), text_prop("name")]);
+    let mut team = ty("Team", &module, vec![id_prop(), text_prop("name")]);
+    team.multilinks = vec![multilink("members", &format!("{module}::Person"))];
+    let sd = SchemaDescriptor {
+        types: vec![person, team],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    // A bystander the statement knows nothing about: it must not be linked.
+    exec(
+        &pool,
+        &sd,
+        &format!("insert {module}::Person {{ name := 'Bystander' }}"),
+    )
+    .await;
+
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Team {{ \
+             name := 'Alpha', \
+             members := (select (insert {module}::Person {{ name := 'Alice' }}) {{ id }}) \
+         }}"
+        ),
+    )
+    .await;
+
+    let people = rows_of(&pool, &sd, &format!("select {module}::Person {{ name }}")).await;
+    assert_eq!(people.len(), 2, "the nested insert has to have run");
+
+    let teams = rows_of(&pool, &sd, &format!("select {module}::Team {{ members: {{ name }} }}")).await;
+    assert_eq!(teams.len(), 1);
+    let members = as_array(field(&teams[0], 2));
+    let names: HashSet<String> = members.iter().map(|m| as_str(field(m, 2)).to_string()).collect();
+    assert_eq!(
+        names,
+        HashSet::from(["Alice".to_string()]),
+        "only the row the statement wrote may be linked"
+    );
+}

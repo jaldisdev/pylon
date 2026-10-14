@@ -33,6 +33,19 @@ from the same version number.
   binding's DML is emitted as a CTE of its own and nothing hung an enqueue off
   those. Each binding now carries its own jobs, named after the binding.
 
+### Links
+
+* A nested insert used as a **multi-link**'s value through the wrapped
+  spelling — `tags := (select (insert Tag { … }) { id })`, the one a single
+  link takes — was dropped on the way to SQL, and every existing row of the
+  target type was linked in its place. No error, no warning; only the junction
+  rows showed it. The statement is now hoisted into its own CTE exactly as the
+  single-link form is, so what gets linked is what it wrote. The bare `tags :=
+  (insert Tag { … })` and `with`-bound spellings were never affected.
+* Nested DML that cannot be hoisted where a multi-link value is read —
+  including a filter or a page written over it — is refused at compile time
+  now, rather than quietly read as a plain select over the whole table.
+
 ## 0.6.0 — 2026-10-14
 
 ### Full-text search

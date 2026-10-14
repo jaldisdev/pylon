@@ -13077,6 +13077,68 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_insert_multilink_value_from_nested_insert_hoists_a_with_cte() {
+        // The multi-link counterpart of the hoist above, and the same
+        // regression it documents: read as a plain select, the wrapper
+        // dropped the insert and linked every existing row of the target
+        // type instead -- no error, no warning, wrong junction rows.
+        let out = compile_and_emit(
+            "INSERT Person { name := 'Alice', posts := (select (insert Post { title := 'p' }) { id }) }",
+        );
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Post\""),
+            "expected the nested insert to be its own CTE, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("FROM \"public\".\"Post\" AS"),
+            "must not link every existing Post, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Person.posts\""),
+            "expected the junction rows, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_update_multilink_append_from_nested_insert_hoists_a_with_cte() {
+        let out = compile_and_emit(
+            "UPDATE Person FILTER .id = $id SET { posts += (select (insert Post { title := 'p' }) { id }) }",
+        );
+        assert!(
+            out.sql.contains("INSERT INTO \"public\".\"Post\""),
+            "expected the nested insert to be its own CTE, got:\n{}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("FROM \"public\".\"Post\" AS"),
+            "must not link every existing Post, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_filter_over_nested_dml_as_a_multilink_value_is_refused() {
+        let err = compile_err(
+            "INSERT Person { name := 'Alice', \
+             posts := (select (insert Post { title := 'p' }) { id } filter .title = 'q') }",
+        );
+        assert!(err.contains("not a multilink value"), "got: {err}");
+    }
+
+    #[test]
+    fn test_nested_dml_a_multilink_value_cannot_hoist_is_refused() {
+        // The fallback this lands in reads a select for its rows alone, which
+        // is what linked the whole table; refusing it keeps that from being
+        // reachable by any other spelling.
+        let err =
+            compile_err("INSERT Person { name := 'Alice', posts := (select (select (insert Post { title := 'p' }))) }");
+        assert!(err.contains("nested DML"), "got: {err}");
+    }
+
+    #[test]
     fn test_update_link_value_from_nested_insert_hoists_a_with_cte_and_adds_from_clause() {
         let out = compile_and_emit(
             "UPDATE Person FILTER .id = $id SET { company := (select (insert Company { name := 'Acme' }) { id }) }",
