@@ -9954,7 +9954,7 @@ impl<'a> Compiler<'a> {
             // Narrowing rows the statement is itself creating says nothing
             // the insert doesn't already decide, and dropping the clause
             // silently is how this bug read in the first place.
-            if sel.filter.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() || sel.limit.is_some() {
+            if narrows_nested_dml(sel) {
                 return Err(self.type_err(
                     "a filter or a page over nested DML is not a multilink value; \
                      bind the statement with `with` and narrow that instead",
@@ -17100,6 +17100,12 @@ impl<'a> Compiler<'a> {
         // nested INSERT and selected an unrelated, arbitrary pre-existing
         // row instead — do not repeat that approach.
         if let Some(inner_stmt) = wrapped_nested_dml(&sel.result) {
+            if narrows_nested_dml(sel) {
+                return Err(self.type_err(
+                    "a filter or a page over nested DML is not a link value; \
+                     bind the statement with `with` and narrow that instead",
+                ));
+            }
             let cte_name = self.hoist_nested_dml(inner_stmt)?;
             return Ok(IrExpr::ColumnRef {
                 alias: cte_name,
@@ -19678,6 +19684,14 @@ fn wrapped_nested_dml(result: &Expr) -> Option<&Stmt> {
         _ => return None,
     };
     matches!(inner, Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)).then_some(inner)
+}
+
+/// Whether a select wrapping nested DML also narrows it. Such a clause asks
+/// to pick among rows the statement is itself creating -- it says nothing the
+/// statement has not already decided, and dropping it silently is how a
+/// wrapped nested insert came to read as a plain select over the whole table.
+fn narrows_nested_dml(sel: &ast::SelectStmt) -> bool {
+    sel.filter.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() || sel.limit.is_some()
 }
 
 /// Collect `SearchEnqueueInfo` for every OpenSearch- or Meilisearch-backed

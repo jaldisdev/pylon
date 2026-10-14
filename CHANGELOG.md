@@ -45,6 +45,9 @@ from the same version number.
 * Nested DML that cannot be hoisted where a multi-link value is read —
   including a filter or a page written over it — is refused at compile time
   now, rather than quietly read as a plain select over the whole table.
+* A filter or a page over nested DML written as a **single** link's value was
+  dropped on the way to SQL rather than refused, the same silence a multi-link
+  value is now held to. Both say the same thing now.
 * Nested DML in a pointer's value inside a `for` loop reached Postgres as a
   value naming an iterator its CTE had no `FROM` entry for — `for d in … union
   (insert Doc { owner := (select (insert Tag { label := d }) { id }) })` failed

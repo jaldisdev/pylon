@@ -13207,6 +13207,17 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_a_filter_over_nested_dml_as_a_link_value_is_refused() {
+        // The link path used to drop the clause and hoist anyway, which is the
+        // same silence the multi-link path was fixed out of.
+        let err = compile_err(
+            "INSERT Person { name := 'Alice', \
+             company := (select (insert Company { name := 'Acme' }) { id } limit 1) }",
+        );
+        assert!(err.contains("not a link value"), "got: {err}");
+    }
+
+    #[test]
     fn test_a_nested_insert_reading_the_loop_variable_pairs_per_iteration() {
         // A CTE is evaluated once for the whole statement, so an insert that
         // reads the loop variable has to stage its ids under the iteration
