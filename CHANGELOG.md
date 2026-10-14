@@ -4,6 +4,20 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.7.0
+
+### Full-text search
+
+* A delete written against an interface or a supertype left its rows'
+  documents in a deferred (OpenSearch/Meilisearch) index forever. A search
+  index is declared on the concrete type that holds the rows, so the
+  statement's own type carried none and the delete enqueued nothing at all;
+  the fan-out it already does for the rows themselves now enqueues one
+  delete job per implementor, carrying that implementor's own type name.
+* An update written against an interface or a supertype did not re-index the
+  rows it changed either, for the same reason — their documents kept the
+  values the update replaced.
+
 ## 0.6.0 — 2026-10-14
 
 ### Full-text search

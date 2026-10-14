@@ -9447,7 +9447,11 @@ impl<'a> Compiler<'a> {
                 index_name: vi.index_name.clone(),
             })
             .collect();
-        let enqueue_search = collect_search_enqueue(td, &type_name, "index");
+        let enqueue_search = if poly_implementors.is_empty() {
+            collect_search_enqueue(td, &type_name, "index")
+        } else {
+            collect_poly_search_enqueue(self.schema, &poly_implementors, "index")
+        };
         // Nested-DML CTEs (see IrUpdate::nested_ctes) compose with every
         // other UPDATE shape — multi-link mutation, interface-type fan-out,
         // and vector/search enqueue each have their own emitter branch
@@ -10111,7 +10115,11 @@ impl<'a> Compiler<'a> {
             (vec![], vec![])
         };
         let qname = format!("{}::{}", td.module, td.name);
-        let enqueue_search = collect_search_enqueue(td, &qname, "delete");
+        let enqueue_search = if poly_implementors.is_empty() {
+            collect_search_enqueue(td, &qname, "delete")
+        } else {
+            collect_poly_search_enqueue(self.schema, &poly_implementors, "delete")
+        };
 
         Ok(IrDelete {
             target,
@@ -19623,6 +19631,30 @@ fn collect_search_enqueue(td: &TypeDescriptor, type_name: &str, operation: &'sta
             operation,
             backend: si.backend.clone(),
         })
+        .collect()
+}
+
+/// `collect_search_enqueue` for DML written against a type that has
+/// implementors — an interface, or a concrete supertype with subtypes. An
+/// index is declared on the concrete type that holds the rows, so each
+/// implementor contributes its own jobs carrying its own `type_name`: that
+/// is what the worker turns into an index name. A supertype that declares
+/// an index of its own is one of its own implementors, so it is covered
+/// here too.
+fn collect_poly_search_enqueue(
+    schema: &SchemaDescriptor,
+    implementors: &[IrPolyImplementor],
+    operation: &'static str,
+) -> Vec<SearchEnqueueInfo> {
+    implementors
+        .iter()
+        .filter_map(|imp| {
+            schema
+                .types
+                .iter()
+                .find(|t| format!("{}::{}", t.module, t.name) == imp.type_name)
+        })
+        .flat_map(|td| collect_search_enqueue(td, &format!("{}::{}", td.module, td.name), operation))
         .collect()
 }
 

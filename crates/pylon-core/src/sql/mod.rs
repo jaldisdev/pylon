@@ -576,6 +576,10 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
 
     // SELECT-over-DML: wrap inner statement in a CTE, select from it.
     let from_clause = if let Some(dml) = &sel.dml_source {
+        // Set by the two fan-out branches below, which enqueue per implementor
+        // themselves: `_dml` is the union of every implementor's ids, so an
+        // enqueue reading it would index every sibling for every id.
+        let mut fanned_out = false;
         let mut cte_parts = match dml.as_ref() {
             IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, DML_CTE),
             IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, DML_CTE),
@@ -591,17 +595,34 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
                 parts.push(format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml)));
                 parts
             }
-            IrStmt::Update(upd) if !upd.poly_implementors.is_empty() => emit_poly_update_dml_ctes(upd, "_dml"),
-            IrStmt::Delete(del) if !del.poly_implementors.is_empty() => emit_poly_delete_dml_ctes(del, "_dml"),
+            IrStmt::Update(upd) if !upd.poly_implementors.is_empty() => {
+                fanned_out = true;
+                emit_poly_update_dml_ctes(upd, "_dml")
+            }
+            IrStmt::Delete(del) if !del.poly_implementors.is_empty() => {
+                fanned_out = true;
+                emit_poly_delete_dml_ctes(del, "_dml")
+            }
             _ => vec![format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml))],
         };
-        let (enqueue_v, enqueue_s) = match dml.as_ref() {
-            IrStmt::Insert(ins) => (ins.enqueue_vector.as_slice(), ins.enqueue_search.as_slice()),
-            IrStmt::Update(upd) => (upd.enqueue_vector.as_slice(), upd.enqueue_search.as_slice()),
-            _ => (&[][..], &[][..]),
+        let (enqueue_v, enqueue_s): (&[VectorEnqueueInfo], Vec<SearchEnqueueInfo>) = match dml.as_ref() {
+            IrStmt::Insert(ins) => (ins.enqueue_vector.as_slice(), ins.enqueue_search.clone()),
+            IrStmt::Update(upd) if fanned_out => (upd.enqueue_vector.as_slice(), vec![]),
+            // Without a fan-out `_dml` holds the target type's own rows, which
+            // an implementor's job has nothing to read from. Filters nothing
+            // out for a plain type: its only enqueues are its own.
+            IrStmt::Update(upd) => (
+                upd.enqueue_vector.as_slice(),
+                upd.enqueue_search
+                    .iter()
+                    .filter(|eq| eq.type_name == upd.target.type_name)
+                    .cloned()
+                    .collect(),
+            ),
+            _ => (&[][..], vec![]),
         };
         cte_parts.extend(enqueue_ctes(enqueue_v, "_dml"));
-        cte_parts.extend(enqueue_search_ctes(enqueue_s, "_dml", enqueue_v.len()));
+        cte_parts.extend(enqueue_search_ctes(&enqueue_s, "_dml", enqueue_v.len()));
         format!(
             "WITH\n{}\nSELECT {}(\n    {}\n) AS result\nFROM \"_dml\" AS {}",
             cte_parts.join(",\n"),
@@ -953,6 +974,7 @@ fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str(&format!("\nRETURNING {}", col_list));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+        cte_parts.extend(poly_enqueue_search_ctes(&upd.enqueue_search, imp, &cte_name));
 
         union_parts.push(format!(
             "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
@@ -1010,6 +1032,7 @@ fn emit_poly_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
             &cte_name,
             false,
         ));
+        cte_parts.extend(poly_enqueue_search_ctes(&upd.enqueue_search, imp, &cte_name));
         union_parts.push(format!(
             "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
             sql_str(&imp.type_name),
@@ -1033,6 +1056,7 @@ fn emit_poly_delete_dml_ctes(del: &IrDelete, name: &str) -> Vec<String> {
         append_filter(&mut del_sql, &del.filter);
         del_sql.push_str(&format!("\nRETURNING {}", col_list));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, del_sql));
+        cte_parts.extend(poly_enqueue_search_ctes(&del.enqueue_search, imp, &cte_name));
 
         union_parts.push(format!(
             "SELECT {}::text AS \"__type__\", {} FROM \"{}\"",
@@ -4203,6 +4227,19 @@ fn enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], source_cte: &str, offset: 
         .collect()
 }
 
+/// One implementor's share of an interface/supertype fan-out's enqueues.
+/// Each implementor's rows live in its own table, so its jobs read that
+/// implementor's own DML CTE rather than the union of all of them — the
+/// union would enqueue every sibling's index for every id.
+fn poly_enqueue_search_ctes(enqueue: &[SearchEnqueueInfo], imp: &IrPolyImplementor, source_cte: &str) -> Vec<String> {
+    enqueue
+        .iter()
+        .filter(|eq| eq.type_name == imp.type_name)
+        .enumerate()
+        .map(|(i, eq)| enqueue_search_cte_sql(eq, source_cte, &format!("{source_cte}_es{i}")))
+        .collect()
+}
+
 /// Build `SELECT (...) AS result FROM "cte_name"` plus its ShapeDescriptor,
 /// mirroring `emit_returning_shape` but for the CTE-wrapper SELECT path.
 fn shape_select_from_cte(
@@ -4406,6 +4443,7 @@ fn emit_poly_update_stmt(upd: &IrUpdate, user_ctes: &[IrCteDef]) -> SqlOutput {
             upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
             cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
         }
+        cte_parts.extend(poly_enqueue_search_ctes(&upd.enqueue_search, imp, &cte_name));
 
         let r_alias = format!("_r{}", i);
         union_parts.push(format!(
@@ -4666,6 +4704,7 @@ fn emit_poly_delete_stmt(del: &IrDelete) -> SqlOutput {
         append_filter(&mut del_sql, &del.filter);
         del_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, del_sql));
+        cte_parts.extend(poly_enqueue_search_ctes(&del.enqueue_search, imp, &cte_name));
 
         let r_alias = format!("_r{}", i);
         union_parts.push(format!(
@@ -16798,6 +16837,174 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("'delete'"),
             "expected the delete operation literal, got:\n{}",
+            out.sql
+        );
+    }
+
+    /// A supertype with two implementors, each declaring its own deferred
+    /// SearchIndex — the only place an index is ever populated from, since
+    /// insert and update collect from the concrete type being written.
+    /// `interface`: the supertype is abstract and holds no rows of its own;
+    /// otherwise it is a concrete type with subtypes, which carries rows and
+    /// an index of its own too.
+    fn make_schema_with_subtype_search_indexes(
+        backend: crate::schema::SearchBackend,
+        interface: bool,
+    ) -> SchemaDescriptor {
+        use crate::schema::{SearchIndexDescriptor, SearchPointerDescriptor, SearchWeight};
+        fn prop(name: &str, pk: bool) -> PropertyDescriptor {
+            PropertyDescriptor {
+                name: name.into(),
+                pg_type: if pk { "uuid".into() } else { "text".into() },
+                nullable: false,
+                default_sql: if pk { Some("uuidv7()".into()) } else { None },
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: pk,
+                is_pk: pk,
+                is_readonly: pk,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
+            }
+        }
+        let object = |name: &str, parent: Option<&str>, indexed: bool| TypeDescriptor {
+            name: name.into(),
+            module: "default".into(),
+            table: name.into(),
+            abstract_: parent.is_none() && interface,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: match parent {
+                Some(p) if interface => vec![p.into()],
+                _ => vec![],
+            },
+            bases: match parent {
+                Some(p) if !interface => vec![p.into()],
+                _ => vec![],
+            },
+            properties: vec![prop("id", true), prop("name", false)],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: if indexed {
+                vec![SearchIndexDescriptor {
+                    index_name: None,
+                    backend: backend.clone(),
+                    pointers: vec![SearchPointerDescriptor {
+                        name: "name".into(),
+                        weight: SearchWeight::A,
+                    }],
+                }]
+            } else {
+                vec![]
+            },
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        };
+        SchemaDescriptor {
+            types: vec![
+                object("Contact", None, !interface),
+                object("Individual", Some("default::Contact"), true),
+                object("Business", Some("default::Contact"), true),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// `(outbox type_name, source CTE)` pairs that have to appear together in
+    /// one enqueue CTE: a fan-out writes each implementor's rows to its own
+    /// table, so reading the union would enqueue every sibling's index for
+    /// every id.
+    fn assert_enqueued_per_implementor(sql: &str, operation: &str, pairs: &[(&str, &str)]) {
+        for (type_name, source_cte) in pairs {
+            let fragment = format!(
+                "    SELECT \"id\", '{type_name}', 'Meilisearch'::_pylon.\"IndexKind\", NULL, '{operation}'\n    FROM \"{source_cte}\"",
+            );
+            assert!(
+                sql.contains(&fragment),
+                "expected an outbox enqueue for {type_name} off \"{source_cte}\", got:\n{sql}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_through_an_interface_enqueues_one_delete_job_per_implementor() {
+        let schema = make_schema_with_subtype_search_indexes(crate::schema::SearchBackend::Meilisearch, true);
+        let out = compile_and_emit_with("DELETE Contact FILTER .name = 'Alice'", &schema);
+        assert_enqueued_per_implementor(
+            &out.sql,
+            "delete",
+            &[("default::Individual", "_d0"), ("default::Business", "_d1")],
+        );
+        assert!(
+            !out.sql.contains("'default::Contact'"),
+            "the interface declares no index and is indexed under no name of its own, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_delete_through_a_concrete_supertype_enqueues_the_supertype_and_its_subtypes() {
+        // A supertype with subtypes holds rows of its own, so the fan-out is
+        // keyed on having implementors rather than on being an interface.
+        let schema = make_schema_with_subtype_search_indexes(crate::schema::SearchBackend::Meilisearch, false);
+        let out = compile_and_emit_with("DELETE Contact FILTER .name = 'Alice'", &schema);
+        assert_enqueued_per_implementor(
+            &out.sql,
+            "delete",
+            &[
+                ("default::Contact", "_d0"),
+                ("default::Individual", "_d1"),
+                ("default::Business", "_d2"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_update_through_an_interface_enqueues_one_index_job_per_implementor() {
+        let schema = make_schema_with_subtype_search_indexes(crate::schema::SearchBackend::Meilisearch, true);
+        let out = compile_and_emit_with("UPDATE Contact FILTER .name = 'Alice' SET { name := 'Bob' }", &schema);
+        assert_enqueued_per_implementor(
+            &out.sql,
+            "index",
+            &[("default::Individual", "_u0"), ("default::Business", "_u1")],
+        );
+    }
+
+    #[test]
+    fn test_select_over_a_delete_through_an_interface_enqueues_per_implementor() {
+        let schema = make_schema_with_subtype_search_indexes(crate::schema::SearchBackend::Meilisearch, true);
+        let out = compile_and_emit_with("SELECT (DELETE Contact FILTER .name = 'Alice') { id }", &schema);
+        assert_enqueued_per_implementor(
+            &out.sql,
+            "delete",
+            &[("default::Individual", "_dml__d0"), ("default::Business", "_dml__d1")],
+        );
+    }
+
+    #[test]
+    fn test_select_over_an_update_through_an_interface_enqueues_per_implementor_only() {
+        let schema = make_schema_with_subtype_search_indexes(crate::schema::SearchBackend::Meilisearch, true);
+        let out = compile_and_emit_with(
+            "SELECT (UPDATE Contact FILTER .name = 'Alice' SET { name := 'Bob' }) { id }",
+            &schema,
+        );
+        assert_enqueued_per_implementor(
+            &out.sql,
+            "index",
+            &[("default::Individual", "_dml__u0"), ("default::Business", "_dml__u1")],
+        );
+        assert!(
+            !out.sql.contains("FROM \"_dml\"\n    ON CONFLICT"),
+            "an enqueue off the implementor union would index every sibling for every id, got:\n{}",
             out.sql
         );
     }

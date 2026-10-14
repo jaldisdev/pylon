@@ -379,3 +379,66 @@ def test_removing_a_postgres_search_index_drops_its_generated_column(live_pool, 
         assert rows[0]['n'] == 0, 'a generated column nothing declares is still recomputed on every write'
 
     asyncio.run(run())
+
+
+def test_deleting_through_an_interface_enqueues_a_job_per_implementor(live_pool, unique_module):
+    """The orphan this closes: a search index is declared on the concrete type
+    that holds the rows, so a delete written against the interface enqueued
+    nothing and the documents outlived their rows. Live because the fan-out
+    emits an outbox CTE beside each implementor's delete, reading that
+    delete's own returned ids — only Postgres can confirm that runs."""
+    from pylon._core import compile as pycompile
+    from pylon._core import export_schema
+
+    module = unique_module('live_idx_poly_del')
+
+    async def run():
+        clear_registry()
+
+        @pylon.interface(module=module, name='Contact')
+        class Contact:
+            name: str
+
+        @pylon.type(module=module, name='Individual')
+        class Individual(Contact):
+            name: str
+            pylon.SearchIndex(
+                backend=pylon.SearchBackend.Meilisearch,
+                pointers=[pylon.SearchPointer('Individual.name')],
+            )
+
+        @pylon.type(module=module, name='Business')
+        class Business(Contact):
+            name: str
+            pylon.SearchIndex(
+                backend=pylon.SearchBackend.Meilisearch,
+                pointers=[pylon.SearchPointer('Business.name')],
+            )
+
+        schema = _build_schema()
+        await live_pool.batch_execute(export_schema(schema))
+        await live_pool.execute(f'INSERT INTO "{module}"."Individual" (name) VALUES ($1)', ['alpha'])
+        await live_pool.execute(f'INSERT INTO "{module}"."Business" (name) VALUES ($1)', ['beta'])
+        # The inserts enqueue index jobs of their own; this is about the delete.
+        await live_pool.batch_execute('DELETE FROM _pylon."IndexOutbox"')
+
+        await live_pool.batch_execute(pycompile(f'delete {module}::Contact', schema).sql)
+
+        for type_name in (f'{module}::Individual', f'{module}::Business'):
+            rows = await _outbox_rows(live_pool, type_name)
+            assert len(rows) == 1, (type_name, rows)
+            assert rows[0]['operation'] == 'delete', rows
+            assert rows[0]['index_kind'] == 'Meilisearch', rows
+        assert await _outbox_rows(live_pool, f'{module}::Contact') == [], (
+            'the interface declares no index and is indexed under no name of its own'
+        )
+
+        counts = await live_pool.query_named(
+            f'SELECT (SELECT count(*) FROM "{module}"."Individual")::int8 AS individuals, '
+            f'(SELECT count(*) FROM "{module}"."Business")::int8 AS businesses',
+            [],
+        )
+        assert counts[0]['individuals'] == 0, 'the rows themselves still have to go'
+        assert counts[0]['businesses'] == 0
+
+    asyncio.run(run())
