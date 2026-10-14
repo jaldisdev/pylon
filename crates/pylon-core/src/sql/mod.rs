@@ -3825,6 +3825,12 @@ fn emit_for_update(
                 )),
             }
         }
+        cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, ids_name));
+        cte_parts.extend(enqueue_search_ctes(
+            &upd.enqueue_search,
+            ids_name,
+            upd.enqueue_vector.len(),
+        ));
         let (pointer_exprs, shape_nodes) = build_shape(&upd.returning, ids_name);
         let mut parts = vec![type_disc(&upd.target.type_name)];
         parts.extend(pointer_exprs);
@@ -3862,19 +3868,40 @@ fn emit_for_update(
     if !upd.poly_implementors.is_empty() {
         return emit_for_poly_update(upd, iter_alias, &sets, cte_parts);
     }
-    let mut sql = format!(
-        "WITH {}\nUPDATE {} AS {}\nSET {}\nFROM {}",
-        cte_parts.join(",\n"),
+    // An enqueue reads the rows the update wrote, so with one the update
+    // becomes a CTE and the result is projected off it -- the shape is the
+    // same tuple either way, read through the CTE's name instead of the
+    // target's alias.
+    const WROTE: &str = "_w";
+    let has_enqueue = !upd.enqueue_vector.is_empty() || !upd.enqueue_search.is_empty();
+    let mut parts = vec![type_disc(&upd.target.type_name)];
+    let (pointer_exprs, shape_nodes) = build_shape(&upd.returning, if has_enqueue { WROTE } else { alias });
+    parts.extend(pointer_exprs);
+    let result = format!("(\n    {}\n) AS result", parts.join(",\n    "));
+
+    let mut upd_sql = format!(
+        "UPDATE {} AS {}\nSET {}\nFROM {}",
         target_ref(&upd.target),
         qi(alias),
         sets.join(", "),
         qi(iter_alias),
     );
-    append_filter(&mut sql, &upd.filter);
-    let mut parts = vec![type_disc(&upd.target.type_name)];
-    let (pointer_exprs, shape_nodes) = build_shape(&upd.returning, alias);
-    parts.extend(pointer_exprs);
-    sql.push_str(&format!("\nRETURNING (\n    {}\n) AS result", parts.join(",\n    ")));
+    append_filter(&mut upd_sql, &upd.filter);
+    let sql = if has_enqueue {
+        // Past a FROM, a bare `*` would carry the iteration's columns into
+        // the CTE beside the target's.
+        upd_sql.push_str(&format!("\nRETURNING {}.*", qi(alias)));
+        cte_parts.push(format!("\"{}\" AS (\n{}\n)", WROTE, upd_sql));
+        cte_parts.extend(enqueue_ctes(&upd.enqueue_vector, WROTE));
+        cte_parts.extend(enqueue_search_ctes(
+            &upd.enqueue_search,
+            WROTE,
+            upd.enqueue_vector.len(),
+        ));
+        format!("WITH {}\nSELECT {}\nFROM \"{}\"", cte_parts.join(",\n"), result, WROTE)
+    } else {
+        format!("WITH {}\n{}\nRETURNING {}", cte_parts.join(",\n"), upd_sql, result)
+    };
     SqlOutput {
         sql,
         shape: crate::query::ShapeDescriptor {
@@ -4028,6 +4055,7 @@ fn emit_for_poly_update(upd: &IrUpdate, iter_alias: &str, sets: &[String], mut c
         append_filter(&mut upd_sql, &upd.filter);
         upd_sql.push_str(&format!("\nRETURNING {}.\"id\"", qi(alias)));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
+        cte_parts.extend(poly_enqueue_search_ctes(&upd.enqueue_search, imp, &cte_name));
 
         let r_alias = format!("_r{}", i);
         union_parts.push(format!(
@@ -4095,7 +4123,10 @@ fn emit_for_insert(
     }
     let (shape, returning_sql) = emit_returning_shape(&ins.target, &ins.returning, false);
 
-    if ins.multi_link_appends.is_empty() {
+    // An enqueue reads the rows the insert wrote, which only the CTE form
+    // below exposes -- a bare `INSERT ... RETURNING` is the statement itself.
+    let has_enqueue = !ins.enqueue_vector.is_empty() || !ins.enqueue_search.is_empty();
+    if ins.multi_link_appends.is_empty() && !has_enqueue {
         let mut sql = format!("WITH {}\n{}", cte_parts.join(",\n"), insert_sql);
         if let Some(r) = returning_sql {
             sql.push_str(&r);
@@ -4130,6 +4161,11 @@ fn emit_for_insert(
             cte_parts.push(emit_ml_append_cte(append, IDS, &ins.target.alias, &cte_name));
         }
     }
+
+    // Every iteration's row is written through this one CTE, so one enqueue
+    // over it covers the whole loop.
+    cte_parts.extend(enqueue_ctes(&ins.enqueue_vector, IDS));
+    cte_parts.extend(enqueue_search_ctes(&ins.enqueue_search, IDS, ins.enqueue_vector.len()));
 
     let projection = match &returning_sql {
         // `emit_returning_shape` spells the projection as a RETURNING clause;
@@ -17022,6 +17058,105 @@ select owner { posts := (select owner.posts.title) };",
             "an enqueue off the implementor union would index every sibling for every id, got:\n{}",
             out.sql
         );
+    }
+
+    // ── for-loop write enqueue tests ──────────────────────────────────────────
+    //
+    // A `for` loop over DML is the bulk-write idiom, and nothing it wrote was
+    // ever indexed: the enqueue CTEs only ever hung off the single-statement
+    // emitters, so a loop's rows reached the table and no index at all.
+
+    #[test]
+    fn test_a_for_loop_insert_enqueues_an_index_job_for_the_rows_it_writes() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with("FOR n IN {'Alice', 'Bob'} UNION (INSERT Person { name := n })", &schema);
+        assert!(
+            out.sql.contains(
+                "    SELECT \"id\", 'default::Person', 'Meilisearch'::_pylon.\"IndexKind\", NULL, 'index'\n    FROM \"_for_dml__ids\""
+            ),
+            "expected one enqueue over the rows the loop wrote, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_for_loop_insert_enqueues_an_embedding_for_the_rows_it_writes() {
+        // A vector index is as deferred as a search one: without a job the
+        // rows keep a NULL embedding and no search ever finds them.
+        let out = compile_and_emit_with(
+            "FOR n IN {'Alice', 'Bob'} UNION (INSERT Person { name := n })",
+            &make_schema_with_vector(),
+        );
+        assert!(
+            out.sql.contains(
+                "    SELECT \"id\", 'default::Person', 'Vector'::_pylon.\"IndexKind\", NULL\n    FROM \"_for_dml__ids\""
+            ),
+            "expected an embedding job over the rows the loop wrote, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_for_loop_insert_writing_a_junction_enqueues_once_over_its_rows() {
+        // The junction form already wrapped the insert in a CTE — the enqueue
+        // reads those same rows rather than inserting a second copy of them.
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "FOR n IN {'Alice'} UNION (INSERT Person { name := n, posts := (SELECT Post) })",
+            &schema,
+        );
+        assert_eq!(
+            out.sql.matches("INSERT INTO _pylon.\"IndexOutbox\"").count(),
+            1,
+            "got:\n{}",
+            out.sql
+        );
+        assert!(out.sql.contains("FROM \"_for_dml__ids\""), "got:\n{}", out.sql);
+    }
+
+    #[test]
+    fn test_a_for_loop_update_enqueues_an_index_job_for_the_rows_it_writes() {
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with(
+            "FOR n IN {'Alice', 'Bob'} UNION (UPDATE Person FILTER .name = n SET { age := 31 })",
+            &schema,
+        );
+        assert!(
+            out.sql.contains(
+                "    SELECT \"id\", 'default::Person', 'Meilisearch'::_pylon.\"IndexKind\", NULL, 'index'\n    FROM \"_w\""
+            ),
+            "expected an enqueue over the rows the loop updated, got:\n{}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("RETURNING \"t0\".*"),
+            "the iteration's own columns must stay out of the CTE, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_a_for_loop_write_keeps_its_result_shape_when_an_index_is_declared() {
+        // Enqueueing turns the statement into a CTE plus a projection; what
+        // the caller decodes must not move with it.
+        let indexed = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        for query in [
+            "FOR n IN {'Alice'} UNION (INSERT Person { name := n })",
+            "FOR n IN {'Alice'} UNION (UPDATE Person FILTER .name = n SET { age := 31 })",
+        ] {
+            let plain = compile_and_emit_with(query, &make_schema());
+            let with_index = compile_and_emit_with(query, &indexed);
+            assert_eq!(
+                format!("{:?}", plain.shape.root),
+                format!("{:?}", with_index.shape.root),
+                "shape moved for: {query}",
+            );
+            assert!(
+                !plain.sql.contains("_pylon.\"IndexOutbox\""),
+                "nothing to enqueue without an index, got:\n{}",
+                plain.sql
+            );
+        }
     }
 
     // ── fts::search candidate-set tests ───────────────────────────────────────

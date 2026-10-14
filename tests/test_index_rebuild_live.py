@@ -442,3 +442,46 @@ def test_deleting_through_an_interface_enqueues_a_job_per_implementor(live_pool,
         assert counts[0]['businesses'] == 0
 
     asyncio.run(run())
+
+
+def test_a_bulk_insert_in_a_loop_enqueues_a_job_for_every_row(live_pool, unique_module):
+    """`for … union (insert …)` is the bulk-write idiom and enqueued nothing at
+    all, so a loop's rows reached the table and no index. Live because the fix
+    turns the statement into a CTE plus a projection: Postgres has to accept
+    the enqueue beside the insert, and the rows still have to come back."""
+    from pylon._core import compile as pycompile
+    from pylon._core import export_schema
+
+    module = unique_module('live_idx_for_insert')
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Doc')
+        class Doc:
+            title: str
+            pylon.SearchIndex(
+                backend=pylon.SearchBackend.Meilisearch,
+                pointers=[pylon.SearchPointer('Doc.title')],
+            )
+
+        schema = _build_schema()
+        await live_pool.batch_execute(export_schema(schema))
+
+        compiled = pycompile(
+            f"for t in {{'alpha', 'beta', 'gamma'}} union (insert {module}::Doc {{ title := t }})",
+            schema,
+        )
+        written = await live_pool.query_compiled(compiled, [], None)
+        assert len(written) == 3, written
+
+        rows = await _outbox_rows(live_pool, f'{module}::Doc')
+        assert len(rows) == 3, rows
+        assert {r['operation'] for r in rows} == {'index'}
+        assert {r['status'] for r in rows} == {'Pending'}
+        written_ids = await live_pool.query_named(f'SELECT id::text AS id FROM "{module}"."Doc"', [])
+        assert {r['object_id'] for r in rows} == {r['id'] for r in written_ids}, (
+            'every job has to name a row the loop actually wrote'
+        )
+
+    asyncio.run(run())

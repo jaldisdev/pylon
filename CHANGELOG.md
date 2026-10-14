@@ -20,6 +20,15 @@ from the same version number.
 * A delete read for its rows — `select (delete Product filter …) { id }` —
   left their documents behind too, whatever the type.
 
+### Search and vector indexes
+
+* `for … union (insert …)` — the bulk-write idiom — enqueued no index jobs at
+  all, so the rows a loop wrote reached the table and neither a deferred
+  search index nor a `VectorIndex`: no documents, and a NULL embedding that
+  no vector search could ever match. A loop that updates had the same hole.
+  Both now enqueue one job per row written, off the rows the loop itself
+  wrote.
+
 ## 0.6.0 — 2026-10-14
 
 ### Full-text search
