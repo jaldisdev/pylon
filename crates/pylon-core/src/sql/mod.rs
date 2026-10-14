@@ -619,6 +619,8 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
                     .cloned()
                     .collect(),
             ),
+            // A delete read for its rows still has to clear their documents.
+            IrStmt::Delete(del) if !fanned_out => (&[][..], del.enqueue_search.clone()),
             _ => (&[][..], vec![]),
         };
         cte_parts.extend(enqueue_ctes(enqueue_v, "_dml"));
@@ -16837,6 +16839,19 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             out.sql.contains("'delete'"),
             "expected the delete operation literal, got:\n{}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn test_select_over_a_delete_enqueues_the_delete_job() {
+        // A delete reached for its rows is still a delete: its documents go
+        // the same way as a bare `delete`'s.
+        let schema = make_schema_with_search_index(crate::schema::SearchBackend::Meilisearch);
+        let out = compile_and_emit_with("SELECT (DELETE Person FILTER .name = 'Alice') { id }", &schema);
+        assert!(
+            out.sql.contains("    SELECT \"id\", 'default::Person', 'Meilisearch'::_pylon.\"IndexKind\", NULL, 'delete'\n    FROM \"_dml\""),
+            "expected a delete enqueue off the statement's rows, got:\n{}",
             out.sql
         );
     }

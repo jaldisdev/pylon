@@ -17,6 +17,8 @@ from the same version number.
 * An update written against an interface or a supertype did not re-index the
   rows it changed either, for the same reason — their documents kept the
   values the update replaced.
+* A delete read for its rows — `select (delete Product filter …) { id }` —
+  left their documents behind too, whatever the type.
 
 ## 0.6.0 — 2026-10-14
 
