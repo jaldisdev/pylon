@@ -2399,6 +2399,115 @@ fn schema_content_changed(target: &SchemaDescriptor, previous: Option<&SchemaDes
     core::diff::schema_content_changed(&target.inner, previous.map(|p| &p.inner))
 }
 
+/// DDL repairing a search/vector index whose Postgres footprint no longer
+/// matches its declaration — a `Postgres`-backed search index's tsvector
+/// expression, a vector index's column width or hnsw operator class, and the
+/// leftover column of an index that was removed or moved to another backend.
+/// None of these are visible to `DbState` introspection, so this diffs
+/// against `previous` (the applied tip's `schema_state`) instead; see
+/// `core::diff::indexes`. Meant to be appended to an assembled
+/// migration/`watch` sync unconditionally, like `missing_extension_ddl`.
+/// Returns list of (sql, non_transactional).
+#[pyfunction]
+fn index_amendment_ops(
+    target: &SchemaDescriptor,
+    previous: Option<&SchemaDescriptor>,
+    for_migration: bool,
+) -> Vec<(String, bool)> {
+    core::diff::index_amendment_ops(&target.inner, previous.map(|p| &p.inner), for_migration)
+        .into_iter()
+        .map(|op| (op.sql, op.non_transactional))
+        .collect()
+}
+
+/// One worker-driven ("deferred") search or vector index, plus the outbox
+/// enqueue that rebuilds it from the table it indexes — see
+/// `pylon_core::diff::indexes::DeferredIndex`.
+#[pyclass(module = "pylon._core", frozen)]
+pub struct DeferredIndex {
+    pub(crate) inner: core::diff::DeferredIndex,
+}
+
+#[pymethods]
+impl DeferredIndex {
+    /// Qualified object type name, e.g. `"default::Product"` — also what
+    /// `_pylon."IndexOutbox".type_name` stores.
+    #[getter]
+    fn type_name(&self) -> &str {
+        &self.inner.type_name
+    }
+
+    /// The `_pylon."IndexKind"` label: `"Vector"`, `"OpenSearch"`, or
+    /// `"Meilisearch"`.
+    #[getter]
+    fn index_kind(&self) -> &str {
+        &self.inner.index_kind
+    }
+
+    /// `None` for a type's default (unnamed) index.
+    #[getter]
+    fn index_name(&self) -> Option<&str> {
+        self.inner.index_name.as_deref()
+    }
+
+    /// The indexed type's Postgres table, schema-qualified and quoted —
+    /// enough to count the objects a rebuild would enqueue.
+    #[getter]
+    fn table(&self) -> String {
+        let schema = if self.inner.module == "default" {
+            "public"
+        } else {
+            &self.inner.module
+        };
+        format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            self.inner.table.replace('"', "\"\"")
+        )
+    }
+
+    /// The `INSERT INTO _pylon."IndexOutbox" … SELECT` that enqueues one
+    /// job per existing object of this type for this index.
+    #[getter]
+    fn backfill_sql(&self) -> String {
+        core::diff::index_backfill_sql(&self.inner)
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.inner.index_name {
+            None => format!("<DeferredIndex {} {}>", self.inner.type_name, self.inner.index_kind),
+            Some(n) => format!(
+                "<DeferredIndex {} {} {:?}>",
+                self.inner.type_name, self.inner.index_kind, n
+            ),
+        }
+    }
+}
+
+fn wrap_deferred(indexes: Vec<core::diff::DeferredIndex>) -> Vec<DeferredIndex> {
+    indexes.into_iter().map(|inner| DeferredIndex { inner }).collect()
+}
+
+/// Every deferred index that is new in `target` or whose definition changed
+/// since `previous` — what makes adding a search or vector index to a
+/// populated type index the rows that were already there, instead of only
+/// the ones written after the migration.
+#[pyfunction]
+fn changed_index_backfills(target: &SchemaDescriptor, previous: Option<&SchemaDescriptor>) -> Vec<DeferredIndex> {
+    wrap_deferred(core::diff::changed_deferred_indexes(
+        &target.inner,
+        previous.map(|p| &p.inner),
+    ))
+}
+
+/// *Every* deferred index `schema` declares, changed or not — the forced
+/// `pylon index rebuild` set, for rebuilding after a search engine was wiped
+/// or replaced.
+#[pyfunction]
+fn deferred_index_backfills(schema: &SchemaDescriptor) -> Vec<DeferredIndex> {
+    wrap_deferred(core::diff::deferred_indexes(&schema.inner))
+}
+
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
 /// Returns a `DbState` object usable as a diff baseline for `diff_schema`, the
 /// `diff_schema_*_with_renames_and_fills` pair, and `diff_states`.
@@ -2772,6 +2881,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DbState>()?;
     m.add_class::<Guidance>()?;
     m.add_class::<MigrationStep>()?;
+    m.add_class::<DeferredIndex>()?;
     m.add_function(wrap_pyfunction!(diff_schema, m)?)?;
     m.add_function(wrap_pyfunction!(diff_states, m)?)?;
     m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
@@ -2784,6 +2894,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(missing_extension_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(db_state_from_json, m)?)?;
     m.add_function(wrap_pyfunction!(schema_content_changed, m)?)?;
+    m.add_function(wrap_pyfunction!(index_amendment_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(changed_index_backfills, m)?)?;
+    m.add_function(wrap_pyfunction!(deferred_index_backfills, m)?)?;
     m.add_function(wrap_pyfunction!(clear_query_cache, m)?)?;
 
     // Cache

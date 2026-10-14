@@ -458,7 +458,13 @@ async def _sync_once(config) -> None:
         pgcon_connect,
     )
     from pylon._core import (
+        changed_index_backfills as _core_changed_index_backfills,
+    )
+    from pylon._core import (
         diff_schema as _diff_schema,
+    )
+    from pylon._core import (
+        index_amendment_ops as _core_index_amendment_ops,
     )
     from pylon._core import (
         missing_extension_ddl as _core_missing_extension_ddl,
@@ -492,6 +498,19 @@ async def _sync_once(config) -> None:
     previous = SchemaDescriptor.from_json(previous_json) if previous_json is not None else None
     content_changed = _core_schema_content_changed(schema, previous)
 
+    # Search/vector index changes `_diff_schema` can't see either, for the
+    # same reason — but these do have something to run, so they're diffed
+    # against the snapshot and appended. `for_migration=False`: everything
+    # below goes through one `batch_execute`, and CONCURRENTLY cannot run
+    # inside a transaction block.
+    ops += [sql for sql, _non_tx in _core_index_amendment_ops(schema, previous, False)]
+    backfills = _core_changed_index_backfills(schema, previous)
+    if backfills:
+        click.echo(f'Queueing a rebuild of {len(backfills)} search/vector index(es) over existing objects:')
+        for idx in backfills:
+            click.echo(f'  {_index_label(idx)}')
+        ops += [idx.backfill_sql for idx in backfills]
+
     if not ops and not content_changed:
         click.echo('Schema up to date.')
         return
@@ -502,7 +521,7 @@ async def _sync_once(config) -> None:
         # as the old explicit `async with conn.transaction():`.
         await pool.batch_execute('\n'.join(ops))
 
-        click.echo(f'Applied {len(ops)} DDL statement(s):')
+        click.echo(f'Applied {len(ops)} statement(s):')
         for sql in ops:
             # Print first line of each statement as a brief summary
             first_line = sql.splitlines()[0]
@@ -610,6 +629,13 @@ def _reload_schema(config):
     default=False,
     help="Terser prompts: hide DDL/schema previews by default (press 'l' to reveal).",
 )
+@click.option(
+    '--no-index-backfill',
+    'no_index_backfill',
+    is_flag=True,
+    default=False,
+    help="Omit the outbox backfill for added/amended search and vector indexes; run 'pylon index rebuild' instead.",
+)
 @requires_config
 @click.pass_context
 def create(
@@ -619,6 +645,7 @@ def create(
     dry_run: bool,
     non_interactive: bool,
     expert: bool,
+    no_index_backfill: bool,
 ) -> None:
     """Generate a new migration file.
 
@@ -629,7 +656,7 @@ def create(
     if blank:
         _create_blank(ctx, name, dry_run)
     else:
-        asyncio.run(_create_from_diff(ctx, name, dry_run, non_interactive, expert))
+        asyncio.run(_create_from_diff(ctx, name, dry_run, non_interactive, expert, no_index_backfill))
 
 
 def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
@@ -1031,12 +1058,23 @@ def _fill_prompt_loop(
     return fills
 
 
+def _index_label(idx) -> str:
+    """How one `DeferredIndex` is named in CLI output.
+
+    A type's default index has no name of its own — it is the unnamed one —
+    so it reads as the backend alone rather than as an empty quoted name.
+    """
+    suffix = '' if idx.index_name is None else f' {idx.index_name!r}'
+    return f'{idx.type_name} {idx.index_kind}{suffix}'
+
+
 async def _create_from_diff(
     ctx: click.Context,
     name: str | None,
     dry_run: bool,
     non_interactive: bool,
     expert: bool,
+    no_index_backfill: bool = False,
 ) -> None:
     import sys
 
@@ -1052,10 +1090,16 @@ async def _create_from_diff(
         render_migration_file,
     )
     from pylon._core import (
+        changed_index_backfills as _core_changed_index_backfills,
+    )
+    from pylon._core import (
         detect_fill_required as _core_detect_fill_required,
     )
     from pylon._core import (
         diff_schema_steps_with_renames_and_fills as _core_diff_schema_steps_with_renames_and_fills,
+    )
+    from pylon._core import (
+        index_amendment_ops as _core_index_amendment_ops,
     )
     from pylon._core import (
         missing_extension_ddl as _core_missing_extension_ddl,
@@ -1172,6 +1216,32 @@ async def _create_from_diff(
     ext_ddl = _core_missing_extension_ddl(schema, db_state)
     if ext_ddl:
         ops = [(sql, False) for sql in ext_ddl] + ops
+
+    # Search/vector index changes the DDL diff above structurally cannot see
+    # — a deferred (Meilisearch/OpenSearch) index has no Postgres footprint
+    # to introspect at all, and a Postgres-backed one's tsvector expression
+    # and a vector index's width/operator class aren't introspected either.
+    # These diff against the tip row's `schema_state` instead. Appended, not
+    # prepended: they repair or refill a footprint the steps above may only
+    # just have created.
+    ops += _core_index_amendment_ops(schema, previous_schema, True)
+
+    # Without this an index added to a populated type only ever holds the
+    # objects written after the migration, and someone has to remember to go
+    # rebuild it by hand. Same reasoning as ext_ddl for not routing it
+    # through the per-step confirmation flow: it isn't a design decision,
+    # it's what makes the index the operator just declared actually true.
+    backfills = _core_changed_index_backfills(schema, previous_schema)
+    if backfills and no_index_backfill:
+        click.echo(f'\nSkipping backfill for {len(backfills)} search/vector index(es) (--no-index-backfill):')
+        for idx in backfills:
+            click.echo(f'  {_index_label(idx)}')
+        click.echo("Run 'pylon index rebuild' once the migration is applied, or they cover no existing object.")
+    elif backfills:
+        click.echo(f'\nQueueing a rebuild of {len(backfills)} search/vector index(es) over existing objects:')
+        for idx in backfills:
+            click.echo(f'  {_index_label(idx)}')
+        ops += [(idx.backfill_sql, False) for idx in backfills]
 
     if not ops:
         if content_changed:

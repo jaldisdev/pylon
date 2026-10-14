@@ -28,6 +28,7 @@ from .banner import _BOLD_RED, _RESET
 from .commands.cache import cache
 from .commands.completion import completion_cmd
 from .commands.database import database
+from .commands.index import index
 from .commands.info import info_cmd
 from .commands.migrations import migration
 from .commands.query import query_cmd, repl
@@ -109,6 +110,7 @@ def cli(ctx: click.Context, db_name: str | None) -> None:
 
 cli.add_command(cache)
 cli.add_command(database)
+cli.add_command(index)
 cli.add_command(migration)
 cli.add_command(worker)
 

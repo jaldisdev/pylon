@@ -6,6 +6,45 @@ from the same version number.
 
 ## 0.6.0
 
+### Search and vector indexes
+
+Adding a search or vector index to a type that already held objects indexed
+nothing: only writes enqueue indexing jobs, so the index covered the objects
+written after the migration and no others. Keeping an index whole was an
+operator's job, and nothing told them it had become one.
+
+* `pylon migration create` now detects a deferred (OpenSearch/Meilisearch)
+  search index or a `VectorIndex` that is new, or whose definition changed,
+  and writes the outbox backfill for it into the migration file. Every
+  database the migration reaches rebuilds the same way, and the backfill is
+  visible in review. `pylon migration watch` does the same against a dev
+  database.
+* Changing a `VectorIndex`'s `metric` deliberately does not re-embed — it
+  changes the hnsw operator class built over the vectors, not the vectors —
+  so it rebuilds the index alone. Every other change to an index (pointers,
+  model, dimensions, backend) counts as invalidating.
+* `pylon migration create --no-index-backfill` leaves the backfill out, for
+  running it at a controlled time instead.
+* New `pylon index list` and `pylon index rebuild`, for what a migration
+  cannot know about: a search engine wiped, moved, or replaced out from under
+  the database. `rebuild` takes `--type`, `--index`, and `--kind`, reads the
+  schema as actually applied, and reports how many objects each index covers
+  before asking.
+
+Three index changes also had no effect on the database at all, since the diff
+engine reads introspected state and Postgres exposes none of them:
+
+* Changing the pointers or weights of a `Postgres`-backed `SearchIndex` left
+  the generated `tsvector` column with its original expression forever. The
+  column is now dropped and re-added — which recomputes it for every object
+  the type already holds — and its GIN index rebuilt.
+* Changing a `VectorIndex`'s `dimensions` left the column at its original
+  `vector(n)` width, so every subsequent write failed on a dimension
+  mismatch. The column is now rebuilt at the new width and re-embedded.
+* Removing an index, or moving a `SearchIndex` off the `Postgres` backend,
+  left its column behind on the type — and a generated one was still
+  recomputed on every write. Both are now dropped.
+
 ### Python
 
 * Python 3.15 is tested and released against. The extension is not abi3, so

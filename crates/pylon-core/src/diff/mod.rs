@@ -30,6 +30,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
 
+pub mod indexes;
+
+pub use indexes::{
+    DeferredIndex, changed_deferred_indexes, changed_index_backfill_ops, deferred_indexes, index_amendment_ops,
+    index_backfill_sql,
+};
+use indexes::{search_index_name, tsvector_expr, vector_index_name};
+
 // ── Live database state ────────────────────────────────────────────────────────
 
 /// Snapshot of the live PostgreSQL database, built by Python from pg_catalog queries.
@@ -487,10 +495,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         }
         // Vector HNSW indexes
         for vi in &td.vector_indexes {
-            let idx_name = match &vi.index_name {
-                None => format!("{}__vector__", td.table),
-                Some(n) => format!("{}__vector_{}__", td.table, n),
-            };
+            let idx_name = vector_index_name(&td.table, vi.index_name.as_deref());
             indexes.push(DbIndex {
                 name: idx_name,
                 is_unique: false,
@@ -505,10 +510,7 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
             if si.backend != SearchBackend::Postgres {
                 continue;
             }
-            let idx_name = match &si.index_name {
-                None => format!("{}__search__", td.table),
-                Some(n) => format!("{}__search_{}__", td.table, n),
-            };
+            let idx_name = search_index_name(&td.table, si.index_name.as_deref());
             indexes.push(DbIndex {
                 name: idx_name,
                 is_unique: false,
@@ -2682,10 +2684,7 @@ fn diff_inner(
                     vi.dimensions
                 ),
             );
-            let idx_name = match &vi.index_name {
-                None => format!("{}__vector__", td.table),
-                Some(n) => format!("{}__vector_{}__", td.table, n),
-            };
+            let idx_name = vector_index_name(&td.table, vi.index_name.as_deref());
             // Pre-existing tables: CONCURRENTLY (non-transactional step in migration).
             // New tables: plain CREATE INDEX (no rows, no locking concern).
             let use_concurrently = for_migration && !table_is_new;
@@ -2738,22 +2737,7 @@ fn diff_inner(
                 continue;
             }
             let mut local: Vec<DiffOp> = Vec::new();
-            let parts: Vec<String> = si
-                .pointers
-                .iter()
-                .map(|sf| {
-                    format!(
-                        "setweight(to_tsvector('english', coalesce({}, '')), '{}')",
-                        qi(&sf.name),
-                        sf.weight.as_str()
-                    )
-                })
-                .collect();
-            let expr = if parts.len() == 1 {
-                parts.into_iter().next().unwrap()
-            } else {
-                parts.join(" || ")
-            };
+            let expr = tsvector_expr(si);
             push_tx(
                 &mut local,
                 format!(
@@ -2763,10 +2747,7 @@ fn diff_inner(
                     expr
                 ),
             );
-            let idx_name = match &si.index_name {
-                None => format!("{}__search__", td.table),
-                Some(n) => format!("{}__search_{}__", td.table, n),
-            };
+            let idx_name = search_index_name(&td.table, si.index_name.as_deref());
             let use_concurrently = for_migration && !table_is_new;
             let idx_sql = if use_concurrently {
                 format!(

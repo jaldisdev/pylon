@@ -59,6 +59,7 @@ Diffs the compiled schema against the live database (or writes a blank stub) and
 | `--dry-run` | Print the file content instead of writing it. |
 | `--non-interactive` | Skip the confirmation prompts; auto-accepts every step (also the default automatically when stdout isn't a TTY). Any column that needs an explicit fill expression and has no schema-declared default fails the command instead of prompting. |
 | `--expert` | Terser prompts — hides the DDL/Python-declaration preview by default; press `l` during a prompt to reveal it anyway. |
+| `--no-index-backfill` | Leave out the outbox backfill for added/amended deferred search and vector indexes. They then cover only objects written after the migration until you run `pylon index rebuild`. |
 
 When interactive (a TTY, and `--non-interactive` not given), each detected change is confirmed one at a time. Rename detection runs first (object-type renames, then property renames) since it's the one place the diff is genuinely ambiguous — everything else is presented as an accept/reject step. At every prompt:
 
@@ -73,6 +74,8 @@ When interactive (a TTY, and `--non-interactive` not given), each detected chang
 | `q` / `quit` | Abort without writing anything. |
 
 A column being made `NOT NULL` that has no schema-declared default and no existing rows already satisfying it prompts for a one-off PyQL fill expression (e.g. `'unknown'`, `0`, `.other_field`) to backfill existing rows.
+
+Two kinds of change are detected against the *schema snapshot* recorded on the applied migration tip rather than against introspected database state, because they have no Postgres footprint to introspect: a deferred (OpenSearch/Meilisearch) search index, which exists only in the search engine, and the parts of a `VectorIndex`/Postgres-backed `SearchIndex` that Postgres doesn't expose — a generated `tsvector` column's expression, a vector column's width, an hnsw operator class. These are appended to the migration unconditionally rather than offered as confirmable steps, the same way a required `CREATE EXTENSION` is: see [Rebuilding after a schema change](schema/indexes.md#rebuilding-after-a-schema-change).
 
 ### `pylon migration apply`
 
@@ -190,6 +193,37 @@ Evicts every entry.
 | Flag | Description |
 |---|---|
 | `--yes` | Skip the confirmation prompt. |
+
+## `pylon index`
+
+Deferred search and vector indexes — the ones a background worker fills. A `Postgres`-backed `SearchIndex` is a generated column Postgres keeps current itself, so it never appears here.
+
+### `pylon index list`
+
+```bash
+pylon index list
+```
+
+Every deferred index in the applied schema, with the number of indexing jobs currently queued for it.
+
+### `pylon index rebuild`
+
+```bash
+pylon index rebuild --type Product --kind search
+```
+
+Enqueues one indexing job per existing object, per matching index. `pylon migration create` already writes this backfill into a migration for an index it sees added or amended, so this command is for what a migration cannot know about: a search engine wiped, moved, or replaced out from under the database, jobs dropped by hand, or a migration created with `--no-index-backfill`.
+
+Reads the schema as actually applied to the database (from `_pylon."Schema"`), not the schema files — those may declare an index no migration has created yet.
+
+| Flag | Description |
+|---|---|
+| `--type NAME` | Only this object type, qualified or bare (`catalog::Product` or `Product`). |
+| `--index NAME` | Only this named index. Pass `default` for a type's unnamed one. |
+| `--kind {vector,search}` | Only vector (embedding) indexes, or only full-text search ones. |
+| `--yes` | Skip the confirmation prompt, and the per-index object counts it needs. |
+
+Rebuilding a vector index re-embeds every matching object, which bills the embedding provider for all of them. The prompt says so, and reports the object count per index before asking.
 
 ## `pylon worker`
 
