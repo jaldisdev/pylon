@@ -59,6 +59,25 @@ from the same version number.
   value sits in is refused — one key is carried, so there is nothing to pair a
   second one on; it used to reach an `unreachable!` and surface as a panic.
 
+### Rust client
+
+A `decimal` round-tripped through the Rust client as a `String` and nothing
+else — the last scalar family with no native Rust type on either side of a
+query, where the Python binding has surfaced one as a real `decimal.Decimal`
+in both directions all along.
+
+* `bigdecimal::BigDecimal` now binds as a `<decimal>$x` argument and decodes
+  out of a result, including into a `#[derive(Queryable)]` field. Both decimal
+  paths reach it: a `numeric` column, and a member a jsonb tuple's declaration
+  says is a decimal rather than the float its digits would otherwise parse as.
+  `bigdecimal` rather than `rust_decimal` because `numeric` is unbounded and
+  the wire carries it losslessly — a fixed 96-bit, 28-digit carrier would have
+  narrowed that silently at the one type where silence is least affordable.
+  Reading a decimal as a `String` still works exactly as before.
+* `numeric`'s `NaN` and infinities have no `BigDecimal` counterpart, so they
+  are a decode error naming the value rather than some finite number that
+  isn't it. A `String` still reads them.
+
 ## 0.6.0 — 2026-10-14
 
 ### Full-text search

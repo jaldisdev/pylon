@@ -1026,4 +1026,64 @@ mod tests {
         assert_eq!(range.upper, Some(Value::Int64(10)));
         assert!(range.inc_lower && !range.inc_upper && !range.empty);
     }
+
+    /// jsonb has one number type, so a declared-decimal member is the only
+    /// reason these digits are a decimal rather than the float they would
+    /// otherwise parse as.
+    #[test]
+    fn a_declared_decimal_member_of_a_jsonb_tuple_decodes_as_a_decimal() {
+        use pylon_core::query::{JsonMember, JsonMemberKind};
+
+        let exact = "0.00000039999999999999998189924473035450347424557548947632312774658203125";
+        let value = comp(vec![
+            DecodedValue::Str("default::Line".into()),
+            DecodedValue::Object(vec![
+                ("amount".into(), DecodedValue::JsonNumber(exact.into())),
+                ("rate".into(), DecodedValue::JsonNumber("0.5".into())),
+            ]),
+        ]);
+        let shape = ShapeNode::Object {
+            name: String::new(),
+            type_name: Some("default::Line".into()),
+            position: 0,
+            cardinality: Cardinality::Required,
+            pointers: vec![
+                ShapeNode::Scalar {
+                    name: "__type__".into(),
+                    position: 0,
+                },
+                ShapeNode::NamedTuple {
+                    name: "price".into(),
+                    position: 1,
+                    type_name: Some("default::Price".into()),
+                    members: Some(vec![
+                        JsonMember {
+                            key: Some("amount".into()),
+                            kind: JsonMemberKind::Decimal,
+                        },
+                        JsonMember {
+                            key: Some("rate".into()),
+                            kind: JsonMemberKind::Scalar,
+                        },
+                    ]),
+                    is_free_object: false,
+                },
+            ],
+            has_implicit_id: false,
+        };
+
+        let Value::Object(row) = decode(&shape, &value) else {
+            panic!("expected an object")
+        };
+        let Some(Value::Object(price)) = row.get("price") else {
+            panic!("expected a named tuple")
+        };
+        assert_eq!(price.get("amount"), Some(&Value::Decimal(exact.into())));
+        // The float member beside it is still a float.
+        assert_eq!(price.get("rate"), Some(&Value::Float64(0.5)));
+        assert_eq!(
+            <bigdecimal::BigDecimal as crate::Queryable>::decode(price.get("amount").unwrap()).unwrap(),
+            exact.parse::<bigdecimal::BigDecimal>().unwrap()
+        );
+    }
 }

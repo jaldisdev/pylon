@@ -688,3 +688,70 @@ async fn listen_raises_on_a_malformed_payload() {
         .expect_err("expected a malformed-payload error");
     assert!(matches!(err, pylon_client::Error::MalformedPayload(_)), "got: {err:?}");
 }
+
+fn decimal_prop(name: &str) -> PropertyDescriptor {
+    PropertyDescriptor {
+        pg_type: "numeric".into(),
+        ..text_prop(name)
+    }
+}
+
+/// Every value here is one a fixed 96-bit/28-place decimal carrier either
+/// cannot hold or cannot hold at the scale it was written in, which is what
+/// the native type being `BigDecimal` buys: `numeric` is unbounded and so is
+/// this round trip.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn decimals_round_trip_through_a_numeric_column() {
+    #[derive(Debug, pylon_client::Queryable)]
+    struct Line {
+        name: String,
+        amount: bigdecimal::BigDecimal,
+    }
+
+    /// The pre-existing stringly-typed path, which call sites written before
+    /// there was a decimal type still depend on.
+    #[derive(Debug, pylon_client::Queryable)]
+    struct TextLine {
+        amount: String,
+    }
+
+    let module = unique_module("live_client_decimal");
+    let mut schema = person_schema(&module);
+    schema.types[0].properties.push(decimal_prop("amount"));
+    let client = setup(&schema).await;
+
+    for text in [
+        "0.0000004",
+        "-9999.001",
+        "-12345",
+        "0.1",
+        "12.3400",
+        // Wider than `rust_decimal` in both directions at once.
+        "123456789012345678901234567890.123456789012345678901234567890",
+    ] {
+        let amount: bigdecimal::BigDecimal = text.parse().unwrap();
+        client
+            .execute(
+                &format!("insert {module}::Person {{ name := <str>$name, amount := <decimal>$amount }}"),
+                &[
+                    ("name", DecodedValue::Str(text.into())),
+                    ("amount", pylon_client::QueryArg::to_decoded(&amount)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let shape = format!("select {module}::Person {{ name, amount }} filter .name = <str>$name");
+        let args = [("name", DecodedValue::Str(text.into()))];
+
+        let line: Line = client.query_required_single(&shape, &args).await.unwrap();
+        assert_eq!(line.name, text);
+        assert_eq!(line.amount, amount, "{text}");
+        // The scale is part of the value: `12.3400` is not `12.34`.
+        assert_eq!(line.amount.to_plain_string(), text, "{text}");
+
+        let as_text: TextLine = client.query_required_single(&shape, &args).await.unwrap();
+        assert_eq!(as_text.amount, text);
+    }
+}

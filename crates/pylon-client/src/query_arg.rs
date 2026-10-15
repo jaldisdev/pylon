@@ -113,7 +113,25 @@ macro_rules! query_arg_array {
     };
 }
 
-query_arg_array!(bool, i16, i32, i64, f32, f64, String, uuid::Uuid);
+query_arg_array!(
+    bool,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    String,
+    uuid::Uuid,
+    bigdecimal::BigDecimal
+);
+
+/// `std::decimal`. `to_plain_string` rather than `Display`, which switches to
+/// exponent form past a few leading zeros and would lose the declared scale.
+impl QueryArg for bigdecimal::BigDecimal {
+    fn to_decoded(&self) -> DecodedValue {
+        DecodedValue::Decimal(self.to_plain_string())
+    }
+}
 
 /// `std::datetime`. Pylon stores a timestamp as microseconds from the
 /// PostgreSQL epoch (2000-01-01), not the Unix epoch.

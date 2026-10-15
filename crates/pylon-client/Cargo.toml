@@ -30,6 +30,9 @@ uuid = "1"
 # and converts those same integers to and from `chrono` types for
 # `Queryable`/`QueryArg`.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `std::decimal`. Unbounded, unlike `rust_decimal` — `numeric` has no
+# precision ceiling, so a 96-bit carrier would narrow the wire silently.
+bigdecimal = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }

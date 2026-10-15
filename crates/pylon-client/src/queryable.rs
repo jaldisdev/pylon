@@ -310,6 +310,24 @@ impl Queryable for f32 {
     }
 }
 
+/// `std::decimal`, from either decimal path — a `numeric` column and a
+/// declared-decimal jsonb member both reach [`Value::Decimal`]. `numeric`'s
+/// NaN and infinities have no `BigDecimal` counterpart, so they fail here
+/// rather than arrive as some finite number.
+impl Queryable for bigdecimal::BigDecimal {
+    fn decode(value: &Value) -> Result<Self, DecodeError> {
+        match value {
+            Value::Decimal(digits) => digits
+                .parse()
+                .map_err(|_| DecodeError::new(DecodeErrorKind::Invalid(format!("{digits:?} is not a finite decimal")))),
+            // Exact, and `select 1` in a decimal slot is as routine as it is
+            // in the float one above.
+            Value::Int64(n) => Ok(Self::from(*n)),
+            other => Err(DecodeError::wrong_type("a decimal", other)),
+        }
+    }
+}
+
 impl Queryable for chrono::DateTime<chrono::Utc> {
     fn decode(value: &Value) -> Result<Self, DecodeError> {
         match value {
@@ -719,6 +737,55 @@ mod tests {
             pylon_value::DecodedValue::Array(vec![pylon_value::DecodedValue::Str("a".into())])
         );
         assert_eq!(params["id"], pylon_value::DecodedValue::Uuid([0; 16]));
+    }
+
+    /// Every value here is outside `rust_decimal`'s 96-bit/28-place range or
+    /// depends on a scale it would drop, which is why the native type is
+    /// `BigDecimal`.
+    #[test]
+    fn decimals_round_trip_through_their_canonical_text() {
+        use bigdecimal::BigDecimal;
+
+        for text in [
+            "0.0000004",
+            "-9999.001",
+            "-12345",
+            "0.1",
+            "12.3400",
+            "123456789012345678901234567890.123456789012345678901234567890",
+        ] {
+            let decimal: BigDecimal = text.parse().unwrap();
+            let bound = crate::QueryArg::to_decoded(&decimal);
+            assert_eq!(bound, pylon_value::DecodedValue::Decimal(text.to_string()), "{text}");
+            assert_eq!(BigDecimal::decode(&Value::Decimal(text.to_string())).unwrap(), decimal);
+        }
+
+        // `BigDecimal`'s own equality ignores scale, so only the text proves
+        // `12.3400` did not come back as `12.34`.
+        let scaled: BigDecimal = "12.3400".parse().unwrap();
+        assert_eq!(scaled.to_plain_string(), "12.3400");
+
+        let args = named_args! { "amount" => scaled.clone(), "tiers" => vec![scaled] };
+        let params: std::collections::HashMap<_, _> = args.to_params().into_iter().collect();
+        assert_eq!(params["amount"], pylon_value::DecodedValue::Decimal("12.3400".into()));
+        assert_eq!(
+            params["tiers"],
+            pylon_value::DecodedValue::Array(vec![pylon_value::DecodedValue::Decimal("12.3400".into())])
+        );
+    }
+
+    #[test]
+    fn a_non_finite_decimal_is_an_error_not_a_number() {
+        let error = bigdecimal::BigDecimal::decode(&Value::Decimal("NaN".into())).unwrap_err();
+        assert!(
+            matches!(error.kind(), DecodeErrorKind::Invalid(message) if message.contains("NaN")),
+            "{error}"
+        );
+        assert_eq!(
+            bigdecimal::BigDecimal::decode(&Value::Int64(7)).unwrap(),
+            bigdecimal::BigDecimal::from(7)
+        );
+        assert!(bigdecimal::BigDecimal::decode(&Value::Str("12".into())).is_err());
     }
 
     /// A datetime argument and a datetime result have to agree about the
