@@ -462,3 +462,47 @@ async fn a_removed_plain_index_is_dropped_from_the_database() {
         .await
         .unwrap();
 }
+
+/// `export_schema`'s DDL dump left a plain index unnamed, so a database built
+/// from it carried Postgres's own auto-name (`Widget_name_idx`) where the diff
+/// expects the name it generates (`Widget__name_idx`) — and because the diff
+/// settles an index with a key by name, the first `migration create` against
+/// such a database proposed a *second* index over the same column. Both sides
+/// read the one naming helper now.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_export_installed_plain_index_needs_no_further_migration() {
+    let module = unique_module("live_migdiff_exportidx");
+    let schema = indexed_schema(&module, true);
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    assert!(
+        widget_index_names(&pool, &module)
+            .await
+            .contains(&"Widget__name_idx".to_string()),
+        "the dump should name it the way the diff does, got {:?}",
+        widget_index_names(&pool, &module).await
+    );
+
+    // A full-database diff, so only this fixture's own module is inspected —
+    // every other live suite's leftover schema is in there too.
+    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    let proposed: Vec<String> = diff_schema_steps(&schema, &live, &HashMap::new())
+        .unwrap()
+        .iter()
+        .flat_map(|step| step.resolved_ddl(&HashMap::new()))
+        .map(|op| op.sql)
+        .filter(|sql| sql.contains("INDEX") && sql.contains(&module))
+        .collect();
+    assert!(
+        proposed.is_empty(),
+        "the index is already there; nothing to propose, got {proposed:?}"
+    );
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}

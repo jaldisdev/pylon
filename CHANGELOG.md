@@ -69,6 +69,14 @@ an expression`, the moment the set holds two.
 * An `Index` whose key, uniqueness or `unless` predicate changed under an
   unchanged name was read as already present and left as it was. It is now
   replaced by what the declaration says.
+* `pylon.schema.export()`'s DDL dump left a plain `Index` unnamed, so Postgres
+  auto-named it `Event_occurred_at_idx` where the migration diff names it
+  `Event__occurred_at_idx`. Since an index with a key is settled by name, a
+  database built from that dump had a *second* index proposed over the same
+  column by its first `migration create`. Every path that names an index now
+  reads one helper, so the dump, the create path, the drop path and the diff's
+  baseline cannot disagree. A name past Postgres's 63-byte identifier limit is
+  capped there too, rather than by three paths separately.
 
 ### Links
 

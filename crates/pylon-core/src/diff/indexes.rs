@@ -64,36 +64,43 @@ fn sql_str(s: &str) -> String {
 }
 
 // ── Shared naming and expressions ────────────────────────────────────────────
+//
+// Every index Pylon names, it names here — the create path, the drop path,
+// `schema_to_db_state`'s baseline and `export_schema`'s DDL dump all read one
+// of the three functions below. Two paths naming the same index differently
+// is not a cosmetic problem: the diff settles an index with a key by *name*,
+// so a second opinion reads as a second index and gets created alongside the
+// first. (`export_schema` used to leave plain indexes unnamed, letting
+// Postgres auto-name them `t_col_idx` — so the first `migration create`
+// against an exported-and-applied database proposed `t__col_idx` on top.)
+//
+// Each returns the *final* name, capped: Postgres truncates an identifier
+// past 63 bytes, which is a third opinion again for a long one.
 
-/// The hnsw index name for one vector index on `table`. Shared with
-/// `diff_inner`'s own vector pass so the two can't drift apart — an
-/// amendment that dropped a differently-named index than the create path
-/// made would leave both behind.
+/// The hnsw index name for one vector index on `table`.
 pub(crate) fn vector_index_name(table: &str, index_name: Option<&str>) -> String {
-    match index_name {
+    super::capped_index_name(match index_name {
         None => format!("{table}__vector__"),
         Some(n) => format!("{table}__vector_{n}__"),
-    }
+    })
 }
 
 /// The GIN index name for one `Postgres`-backed search index on `table`.
 pub(crate) fn search_index_name(table: &str, index_name: Option<&str>) -> String {
-    match index_name {
+    super::capped_index_name(match index_name {
         None => format!("{table}__search__"),
         Some(n) => format!("{table}__search_{n}__"),
-    }
+    })
 }
 
-/// The name of one plain `Index` on `table` — shared with
-/// `schema_to_db_state`, which is what gives the database its name, for the
-/// same reason as the two above. An expression index has no pointer names to
-/// build one from, so its position in the type's declaration list stands in
-/// for them.
+/// The name of one plain `Index` on `table`. An expression index has no
+/// pointer names to build one from, so its position in the type's declaration
+/// list stands in for them.
 pub(crate) fn plain_index_name(table: &str, idx: &IndexDescriptor, position: usize) -> String {
-    match idx.expression {
+    super::capped_index_name(match idx.expression {
         Some(_) => format!("{table}__expr{position}_idx"),
         None => format!("{table}__{}_idx", idx.pointers.join("_")),
-    }
+    })
 }
 
 /// The generation expression of a `Postgres`-backed search index's tsvector
@@ -891,6 +898,28 @@ mod tests {
             unique,
             unless: unless.map(str::to_string),
         }
+    }
+
+    /// Postgres truncates an identifier past 63 bytes, so a name longer than
+    /// that is a *third* opinion about what the index is called, on top of
+    /// whichever path generated it. Every caller gets the capped name.
+    #[test]
+    fn a_long_index_name_is_capped_at_the_source() {
+        let long = "T".repeat(80);
+        let names = [
+            plain_index_name(&long, &plain(&["name"], false, None), 0),
+            vector_index_name(&long, Some("summary")),
+            search_index_name(&long, None),
+        ];
+        for name in names {
+            assert_eq!(name.len(), 63, "{name}");
+        }
+        // And stable: a hashed tail that moved between runs would make every
+        // migration propose the index again.
+        assert_eq!(
+            plain_index_name(&long, &plain(&["name"], false, None), 0),
+            plain_index_name(&long, &plain(&["name"], false, None), 0)
+        );
     }
 
     /// Deleting an `Index` declaration left its index alive in the database

@@ -1630,7 +1630,7 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
         }
         let qname = qn(&t.module, &t.table);
 
-        for idx in &t.indexes {
+        for (i, idx) in t.indexes.iter().enumerate() {
             let unique = if idx.unique { "UNIQUE " } else { "" };
             let Ok((body, where_clause)) = index_body_and_predicate(
                 t,
@@ -1643,9 +1643,19 @@ fn emit_plain_indexes(schema: &SchemaDescriptor, out: &mut String) {
                 // message; a half-built index would be worse than none.
                 continue;
             };
+            // Named, from the one helper the diff names it with. Left to
+            // Postgres to auto-name, a database built from this dump carried
+            // `t_col_idx` where the diff expects `t__col_idx`, so the first
+            // `migration create` against it proposed a duplicate index over
+            // the same column. The vector and search dumps below have always
+            // named theirs for the same reason.
             out.push_str(&format!(
-                "CREATE {}INDEX ON {} {}{};\n",
-                unique, qname, body, where_clause,
+                "CREATE {}INDEX IF NOT EXISTS {} ON {} {}{};\n",
+                unique,
+                qi(&crate::diff::indexes::plain_index_name(&t.table, idx, i)),
+                qname,
+                body,
+                where_clause,
             ));
             emitted = true;
         }
@@ -2681,10 +2691,7 @@ fn emit_vector_indexes(schema: &SchemaDescriptor, out: &mut String) {
             continue;
         }
         for vi in &td.vector_indexes {
-            let index_name = match &vi.index_name {
-                None => format!("{}__vector__", td.table),
-                Some(name) => format!("{}__vector_{}__", td.table, name),
-            };
+            let index_name = crate::diff::indexes::vector_index_name(&td.table, vi.index_name.as_deref());
             out.push_str(&format!(
                 "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} {});\n",
                 qi(&index_name),
@@ -2757,10 +2764,7 @@ fn emit_search_indexes(schema: &SchemaDescriptor, out: &mut String) {
             }
 
             let col = si.column_name();
-            let index_name = match &si.index_name {
-                None => format!("{}__search__", td.table),
-                Some(name) => format!("{}__search_{}__", td.table, name),
-            };
+            let index_name = crate::diff::indexes::search_index_name(&td.table, si.index_name.as_deref());
             out.push_str(&format!(
                 "CREATE INDEX IF NOT EXISTS {} ON {} USING gin ({});\n",
                 qi(&index_name),
@@ -4962,6 +4966,42 @@ mod partition_tests {
             types: vec![td],
             ..Default::default()
         }
+    }
+
+    /// The dump left a plain index unnamed, so Postgres auto-named it
+    /// `Event_occurred_at_idx` while the diff names it
+    /// `Event__occurred_at_idx` — and because the diff settles an index with
+    /// a key by name, a database built from this dump had a second index
+    /// proposed over the same column on its first `migration create`. Both
+    /// read `plain_index_name` now, so the names are equal by construction
+    /// rather than by two matching string literals.
+    #[test]
+    fn an_exported_plain_index_carries_the_name_the_diff_gives_it() {
+        let mut schema = event_schema(None);
+        schema.types[0].partition = None;
+        schema.types[0].indexes = vec![crate::schema::IndexDescriptor {
+            pointers: vec!["occurred_at".into()],
+            expression: None,
+            unique: false,
+            unless: None,
+        }];
+        let ddl = export_schema(&schema).unwrap();
+
+        let expected = crate::diff::indexes::plain_index_name("Event", &schema.types[0].indexes[0], 0);
+        assert!(
+            ddl.contains(&format!(
+                "CREATE INDEX IF NOT EXISTS \"{expected}\" ON \"public\".\"Event\""
+            )),
+            "expected {expected}, got:\n{ddl}"
+        );
+        // The baseline the diff compares against records that same name, so
+        // the index reads as already present rather than as missing.
+        let state = crate::diff::schema_to_db_state(&schema);
+        assert!(
+            state.tables[0].indexes.iter().any(|i| i.name == expected),
+            "got {:?}",
+            state.tables[0].indexes
+        );
     }
 
     #[test]
