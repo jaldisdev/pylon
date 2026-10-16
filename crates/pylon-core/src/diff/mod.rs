@@ -465,13 +465,11 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 });
             }
         }
-        // Plain indexes (Postgres auto-names these too).
+        // Plain indexes. Unlike the exclusives above these do *not* mirror a
+        // Postgres auto-name: the create pass names each one explicitly, so
+        // `plain_index_name` is the name, and the drop pass keys off it.
         for (i, idx) in td.indexes.iter().enumerate() {
-            let name = if idx.expression.is_some() {
-                format!("{}__expr{}_idx", td.table, i)
-            } else {
-                format!("{}__{}_idx", td.table, idx.pointers.join("_"))
-            };
+            let name = indexes::plain_index_name(&td.table, idx, i);
             // The key is built by the same helper the export uses, so a
             // pointer that is a link or a computed lands on the same SQL in
             // both paths rather than only in one.

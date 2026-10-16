@@ -37,6 +37,12 @@
 //!   `dimensions` lives in a `vector(n)` typmod on a column no type-change
 //!   pass looks at (that pass walks `td.properties`, and an index column is
 //!   not a property).
+//! * A plain `Index` *does* have an introspectable footprint, but the main
+//!   diff only ever asks what Postgres is missing — it has no drop pass at
+//!   all, and settles an index with a key by name alone. So a declaration
+//!   that was deleted left its index alive in the database with nothing in
+//!   the schema referring to it, and one whose body changed under an
+//!   unchanged name was read as already there.
 //!
 //! So everything here diffs against the *previous `SchemaDescriptor`* —
 //! `_pylon."Migrations".schema_state` on the applied tip row, the same
@@ -51,7 +57,7 @@
 use serde_json::Value;
 
 use super::{DiffOp, qi, qn};
-use crate::schema::{SchemaDescriptor, SearchBackend, SearchIndexDescriptor, TypeDescriptor};
+use crate::schema::{IndexDescriptor, SchemaDescriptor, SearchBackend, SearchIndexDescriptor, TypeDescriptor};
 
 fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -75,6 +81,18 @@ pub(crate) fn search_index_name(table: &str, index_name: Option<&str>) -> String
     match index_name {
         None => format!("{table}__search__"),
         Some(n) => format!("{table}__search_{n}__"),
+    }
+}
+
+/// The name of one plain `Index` on `table` — shared with
+/// `schema_to_db_state`, which is what gives the database its name, for the
+/// same reason as the two above. An expression index has no pointer names to
+/// build one from, so its position in the type's declaration list stands in
+/// for them.
+pub(crate) fn plain_index_name(table: &str, idx: &IndexDescriptor, position: usize) -> String {
+    match idx.expression {
+        Some(_) => format!("{table}__expr{position}_idx"),
+        None => format!("{table}__{}_idx", idx.pointers.join("_")),
     }
 }
 
@@ -280,6 +298,37 @@ pub fn changed_index_backfill_ops(target: &SchemaDescriptor, previous: Option<&S
 
 // ── Footprint amendments ─────────────────────────────────────────────────────
 
+/// What Postgres ends up holding for one plain `Index`: whether it is
+/// UNIQUE, its key, and its partial predicate.
+type PlainIndexShape = (bool, String, String);
+
+/// One type's plain `Index` declarations as `(name, shape)` — the name the
+/// database holds each under, paired with the shape of the index itself, so
+/// two revisions of a declaration can be compared by what Postgres would
+/// actually have built from each.
+///
+/// `None` for a declaration whose key doesn't compile, matching
+/// `schema_to_db_state`, which skips those: an index the create path never
+/// emitted is not one to drop or amend either.
+fn plain_indexes(schema: &SchemaDescriptor, td: &TypeDescriptor) -> Vec<(String, Option<PlainIndexShape>)> {
+    td.indexes
+        .iter()
+        .enumerate()
+        .map(|(i, idx)| {
+            let shape = crate::export::index_body_and_predicate(
+                td,
+                &idx.pointers,
+                idx.expression.as_deref(),
+                idx.unless.as_deref(),
+                schema,
+            )
+            .ok()
+            .map(|(body, predicate)| (idx.unique, body, predicate));
+            (plain_index_name(&td.table, idx, i), shape)
+        })
+        .collect()
+}
+
 fn tx(sql: String) -> DiffOp {
     DiffOp {
         sql,
@@ -287,11 +336,16 @@ fn tx(sql: String) -> DiffOp {
     }
 }
 
-/// DDL bringing a search/vector index's Postgres footprint back in line with
-/// its declaration, covering the changes the main diff structurally cannot
-/// see (see this module's own header for why it cannot see them).
+/// DDL bringing an index's Postgres footprint back in line with its
+/// declaration, covering the changes the main diff does not see (see this
+/// module's own header for why it does not see them).
 ///
-/// Four cases, all keyed off `previous` rather than `DbState`:
+/// Five cases, all keyed off `previous` rather than `DbState`:
+///
+/// * A plain `Index` that went away, or whose key, uniqueness or predicate
+///   changed under the name the database already holds it under. Dropped,
+///   and re-made from the new declaration in the second case — the create
+///   pass would read the stale index as the declared one.
 ///
 /// * A `Postgres`-backed search index whose pointers or weights changed.
 ///   Its column is `GENERATED ALWAYS AS (…) STORED` and Postgres offers no
@@ -406,6 +460,44 @@ pub fn index_amendment_ops(
             )));
         }
 
+        // ── Plain indexes ────────────────────────────────────────────────
+        // Keyed by the generated name, because that is what the database
+        // carries. A declaration whose name is gone leaves its index behind
+        // forever otherwise: the main diff only ever asks what is *missing*
+        // from Postgres. One whose name survives a changed body is dropped
+        // and re-made here too, since that pass settles an index with a key
+        // by name alone and so reads the stale one as already there.
+        let prev_plain = plain_indexes(previous, prev_td);
+        let now_plain = plain_indexes(target, td);
+        for (name, _) in &prev_plain {
+            if !now_plain.iter().any(|(n, _)| n == name) {
+                ops.push(drop_index(name));
+            }
+        }
+        for (name, now) in &now_plain {
+            let Some((_, before)) = prev_plain.iter().find(|(n, _)| n == name) else {
+                // Nothing of this name before, so no footprint to amend: the
+                // main diff's own pass creates it.
+                continue;
+            };
+            let (Some(now), Some(before)) = (now, before) else {
+                continue;
+            };
+            if before == now {
+                continue;
+            }
+            let (unique, body, predicate) = now;
+            ops.push(drop_index(name));
+            ops.push(DiffOp {
+                sql: format!(
+                    "CREATE {}INDEX {concurrently}IF NOT EXISTS {} ON {table} {body}{predicate};",
+                    if *unique { "UNIQUE " } else { "" },
+                    qi(&super::capped_index_name(name.clone())),
+                ),
+                non_transactional: for_migration,
+            });
+        }
+
         // ── Vector indexes ───────────────────────────────────────────────
         for vi in &td.vector_indexes {
             let Some(prev_vi) = prev_td.vector_indexes.iter().find(|v| v.index_name == vi.index_name) else {
@@ -462,7 +554,8 @@ pub fn index_amendment_ops(
 mod tests {
     use super::*;
     use crate::schema::{
-        SearchIndexDescriptor, SearchPointerDescriptor, SearchWeight, TypeDescriptor, VectorIndexDescriptor,
+        PropertyDescriptor, SearchIndexDescriptor, SearchPointerDescriptor, SearchWeight, TypeDescriptor,
+        VectorIndexDescriptor,
     };
 
     /// A bare concrete type in `default`. No properties: nothing in this
@@ -764,6 +857,177 @@ mod tests {
             sql.contains(r#"DROP COLUMN IF EXISTS "__vector_summary__""#),
             "got: {sql}"
         );
+    }
+
+    /// A property for a plain index to be declared over. `td` carries none,
+    /// because nothing else in this module reads them — an index key does.
+    fn indexed_td(name: &str, props: &[&str]) -> TypeDescriptor {
+        let mut t = td(name);
+        t.properties = props
+            .iter()
+            .map(|p| PropertyDescriptor {
+                name: (*p).into(),
+                pg_type: "text".into(),
+                nullable: true,
+                default_sql: None,
+                default_pyql: None,
+                description: None,
+                check_constraints: vec![],
+                is_exclusive: false,
+                is_pk: false,
+                is_readonly: false,
+                rewrites: vec![],
+                tuple_members: None,
+                column_type: None,
+            })
+            .collect();
+        t
+    }
+
+    fn plain(pointers: &[&str], unique: bool, unless: Option<&str>) -> IndexDescriptor {
+        IndexDescriptor {
+            pointers: pointers.iter().map(|p| p.to_string()).collect(),
+            expression: None,
+            unique,
+            unless: unless.map(str::to_string),
+        }
+    }
+
+    /// Deleting an `Index` declaration left its index alive in the database
+    /// with nothing in the schema referring to it — the main diff only ever
+    /// asks what Postgres is *missing*. Worst case, replacing one with a
+    /// `VectorIndex` on the same pointer kept a B-tree over an unbounded
+    /// text column that nothing would ever use again.
+    #[test]
+    fn a_removed_plain_index_is_dropped() {
+        let mut before_t = indexed_td("Product", &["name", "created_at"]);
+        before_t.indexes = vec![plain(&["name"], false, None), plain(&["created_at"], false, None)];
+        let after_t = indexed_td("Product", &["name", "created_at"]);
+
+        let ops = index_amendment_ops(&schema(vec![after_t]), Some(&schema(vec![before_t])), true);
+        let sql = joined(&ops);
+        assert!(
+            sql.contains(r#"DROP INDEX CONCURRENTLY IF EXISTS "public"."Product__name_idx""#),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains(r#"DROP INDEX CONCURRENTLY IF EXISTS "public"."Product__created_at_idx""#),
+            "got: {sql}"
+        );
+        assert!(
+            ops.iter().all(|op| op.non_transactional),
+            "a concurrent drop cannot run inside a transaction: {ops:?}"
+        );
+    }
+
+    /// Replacing an `Index` with a `VectorIndex` on the same pointer is the
+    /// real-world shape of the above: two separate declarations, so the
+    /// B-tree is removed rather than amended.
+    #[test]
+    fn swapping_a_plain_index_for_a_vector_one_drops_the_btree() {
+        let mut before_t = indexed_td("Product", &["data"]);
+        before_t.indexes = vec![plain(&["data"], false, None)];
+        let mut after_t = indexed_td("Product", &["data"]);
+        after_t.vector_indexes = vec![vector(None, &["data"], 1024, "cosine")];
+
+        let sql = joined(&index_amendment_ops(
+            &schema(vec![after_t]),
+            Some(&schema(vec![before_t])),
+            true,
+        ));
+        assert!(sql.contains(r#"IF EXISTS "public"."Product__data_idx""#), "got: {sql}");
+    }
+
+    /// An index the declaration still names is left alone.
+    #[test]
+    fn an_unchanged_plain_index_is_left_alone() {
+        let mut before_t = indexed_td("Product", &["name"]);
+        before_t.indexes = vec![plain(&["name"], false, None)];
+        let after_t = before_t.clone();
+
+        let sql = joined(&index_amendment_ops(
+            &schema(vec![after_t]),
+            Some(&schema(vec![before_t])),
+            true,
+        ));
+        assert!(sql.is_empty(), "got: {sql}");
+    }
+
+    /// Uniqueness and the partial predicate both live in the index itself,
+    /// under a name that does not change with them — so the create pass
+    /// reads the stale index as the declared one and the amendment has to
+    /// replace it outright.
+    #[test]
+    fn a_plain_index_changed_under_its_own_name_is_replaced() {
+        for (before, after, expected) in [
+            (
+                plain(&["name"], false, None),
+                plain(&["name"], true, None),
+                "UNIQUE INDEX",
+            ),
+            (
+                plain(&["name"], false, None),
+                plain(&["name"], false, Some(".name = 'x'")),
+                "WHERE NOT",
+            ),
+        ] {
+            let mut before_t = indexed_td("Product", &["name"]);
+            before_t.indexes = vec![before];
+            let mut after_t = indexed_td("Product", &["name"]);
+            after_t.indexes = vec![after];
+
+            let sql = joined(&index_amendment_ops(
+                &schema(vec![after_t]),
+                Some(&schema(vec![before_t])),
+                true,
+            ));
+            assert!(
+                sql.contains(r#"DROP INDEX CONCURRENTLY IF EXISTS "public"."Product__name_idx""#),
+                "got: {sql}"
+            );
+            assert!(sql.contains(expected), "expected {expected} in: {sql}");
+        }
+    }
+
+    /// An expression index is named by its position in the declaration list,
+    /// so removing one ahead of it moves the name it answers to. Keying the
+    /// diff on the name rather than on the declaration gets both halves
+    /// right: the vacated name is replaced, the trailing one dropped.
+    #[test]
+    fn removing_one_of_two_expression_indexes_leaves_the_other_in_place() {
+        let mut before_t = indexed_td("Product", &["name", "created_at"]);
+        before_t.indexes = vec![
+            IndexDescriptor {
+                pointers: vec![],
+                expression: Some("str_lower(.name)".into()),
+                unique: false,
+                unless: None,
+            },
+            IndexDescriptor {
+                pointers: vec![],
+                expression: Some("str_lower(.created_at)".into()),
+                unique: false,
+                unless: None,
+            },
+        ];
+        let mut after_t = indexed_td("Product", &["name", "created_at"]);
+        after_t.indexes = vec![before_t.indexes[1].clone()];
+
+        let sql = joined(&index_amendment_ops(
+            &schema(vec![after_t]),
+            Some(&schema(vec![before_t])),
+            true,
+        ));
+        assert!(
+            sql.contains(r#"DROP INDEX CONCURRENTLY IF EXISTS "public"."Product__expr1_idx""#),
+            "the trailing name no declaration answers to: {sql}"
+        );
+        assert!(
+            sql.contains(r#"DROP INDEX CONCURRENTLY IF EXISTS "public"."Product__expr0_idx""#)
+                && sql.contains(r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS "Product__expr0_idx""#),
+            "the surviving index moved into the vacated name: {sql}"
+        );
+        assert!(sql.contains("created_at"), "with its own key: {sql}");
     }
 
     #[test]

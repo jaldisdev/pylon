@@ -57,6 +57,19 @@ an expression`, the moment the set holds two.
   `any()`, the way one over a multi-link already did. The reading is the same
   either way; only the multi-link spelling said so.
 
+### Indexes
+
+* Deleting a `pylon.Index` declaration emitted no `DROP INDEX` and did not
+  change the migration at all — the diff only ever asked what Postgres was
+  *missing*, so the index stayed alive in the database with nothing in the
+  schema referring to it, maintained on every write. Replacing an `Index` with
+  a `VectorIndex` on the same pointer was the shape that showed it: a B-tree
+  over an unbounded text column, orphaned. A removed declaration now drops its
+  index.
+* An `Index` whose key, uniqueness or `unless` predicate changed under an
+  unchanged name was read as already present and left as it was. It is now
+  replaced by what the declaration says.
+
 ### Links
 
 * A nested insert used as a **multi-link**'s value through the wrapped

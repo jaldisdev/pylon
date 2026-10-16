@@ -40,10 +40,12 @@
 mod common;
 
 use common::*;
-use pylon_core::diff::{Verb, diff_schema_steps, diff_schema_steps_with_renames_and_fills, schema_to_db_state};
+use pylon_core::diff::{
+    Verb, diff_schema_steps, diff_schema_steps_with_renames_and_fills, index_amendment_ops, schema_to_db_state,
+};
 use pylon_core::export::export_schema;
 use pylon_core::query;
-use pylon_core::schema::{SchemaDescriptor, SignalEntry, TypeDescriptor};
+use pylon_core::schema::{IndexDescriptor, SchemaDescriptor, SignalEntry, TypeDescriptor};
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
 use std::collections::HashMap;
@@ -336,6 +338,125 @@ async fn property_type_change_casts_existing_data() {
         }
         other => panic!("expected a Composite-shaped row, got {other:?}"),
     }
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}
+
+/// A `Widget { id, name }` with `name` indexed or not — the two revisions a
+/// deleted `pylon.Index` declaration sits between.
+fn indexed_schema(module: &str, indexed: bool) -> SchemaDescriptor {
+    SchemaDescriptor {
+        types: vec![TypeDescriptor {
+            name: "Widget".into(),
+            module: module.into(),
+            table: "Widget".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![id_prop(), text_prop("name")],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: if indexed {
+                vec![IndexDescriptor {
+                    pointers: vec!["name".into()],
+                    expression: None,
+                    unique: false,
+                    unless: None,
+                }]
+            } else {
+                vec![]
+            },
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }],
+        ..Default::default()
+    }
+}
+
+/// Every index Postgres holds on one module's `Widget` table.
+async fn widget_index_names(pool: &pylon_pgcon::PgPool, module: &str) -> Vec<String> {
+    let rows = pool
+        .query_typed(
+            &format!(
+                "SELECT (indexname)::text FROM pg_indexes \
+                 WHERE schemaname = '{module}' AND tablename = 'Widget' ORDER BY indexname"
+            ),
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| match row {
+            DecodedValue::Str(s) => s.clone(),
+            other => panic!("expected an index name, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Deleting an `Index` declaration has to drop the index — and under the
+/// name Postgres actually holds it by, which is the half no SQL-text
+/// assertion can check. Left undropped it was a B-tree nothing in the schema
+/// referred to any more, maintained on every write forever.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_removed_plain_index_is_dropped_from_the_database() {
+    let module = unique_module("live_migdiff_index");
+    let before = indexed_schema(&module, true);
+    let after = indexed_schema(&module, false);
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    // Created through the diff rather than through `export_schema`, because
+    // the name is what this test is about: the create pass names the index
+    // explicitly, and that is the name a migrated database carries.
+    let steps = diff_schema_steps(&before, &pylon_core::diff::DbState::default(), &HashMap::new()).unwrap();
+    for step in &steps {
+        for op in step.resolved_ddl(&HashMap::new()) {
+            pool.batch_execute(&op.sql).await.unwrap();
+        }
+    }
+    assert!(
+        widget_index_names(&pool, &module)
+            .await
+            .contains(&"Widget__name_idx".to_string()),
+        "the declaration's index should exist to begin with, got {:?}",
+        widget_index_names(&pool, &module).await
+    );
+
+    let ops = index_amendment_ops(&after, Some(&before), true);
+    assert!(!ops.is_empty(), "removing the declaration should propose DDL");
+    for op in &ops {
+        pool.batch_execute(&op.sql).await.unwrap();
+    }
+    assert!(
+        !widget_index_names(&pool, &module)
+            .await
+            .contains(&"Widget__name_idx".to_string()),
+        "nothing declares it any more, got {:?}",
+        widget_index_names(&pool, &module).await
+    );
+
+    // And the amendment is settled: with the declaration gone from both
+    // sides there is nothing left to drop. (A full-database `assert_zero_
+    // further_steps` would also see every other live suite's leftover
+    // schema, so the check stays within this fixture.)
+    assert!(
+        index_amendment_ops(&after, Some(&after), true).is_empty(),
+        "a second pass should propose nothing"
+    );
 
     pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
         .await
