@@ -33,6 +33,30 @@ from the same version number.
   binding's DML is emitted as a CTE of its own and nothing hung an enqueue off
   those. Each binding now carries its own jobs, named after the binding.
 
+### Comparing against a set
+
+An equality against a set is true when any pair of elements is equal, which is
+a membership test. Three ways of writing one were read as a comparison against
+a single value instead, and compiled to a scalar subquery over the whole set —
+SQL that can only fail, with `more than one row returned by a subquery used as
+an expression`, the moment the set holds two.
+
+* A **backlink** compared to a binding of more than one row:
+  `filter any(.<versions[is Knowledge] = sources)`. The walk was correctly
+  lifted into an `EXISTS`, but the comparison inside it was built by hand. The
+  same shape over a forward multi-link was already right, which is what it now
+  matches.
+* A walk ending on `.id` — `filter .posts.id = ids` — which reads the
+  junction's target column rather than joining the target table, and built its
+  own comparison for the same reason.
+* A path read *off* such a binding, rather than the binding itself:
+  `filter .name = sources.name`. One answer per row of the binding, however
+  single-valued the walk off it. This one reached plain property comparisons
+  too, not only walks. A binding capped at `limit 1` is still a single value.
+* A set-valued `filter` condition over a backlink now warns and asks for
+  `any()`, the way one over a multi-link already did. The reading is the same
+  either way; only the multi-link spelling said so.
+
 ### Links
 
 * A nested insert used as a **multi-link**'s value through the wrapped

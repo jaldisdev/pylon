@@ -6726,6 +6726,119 @@ mod tests {
         );
     }
 
+    /// The reported query's own shape, end to end: a binding pinned to one
+    /// row, a second binding reading a multi-valued path off it, and a
+    /// backlink in a `filter` compared to that second binding. Each layer
+    /// has to carry "more than one row" through to the comparison.
+    #[test]
+    fn a_backlink_compared_to_a_binding_read_off_another_binding_is_membership() {
+        let out = compile_and_emit(
+            "WITH c := (SELECT Company LIMIT 1), \
+                  ps := (SELECT c.<company[is default::Person] FILTER .age > 1) \
+             SELECT Post FILTER any(.<posts[is Person] = ps)",
+        );
+        assert!(
+            out.sql.contains("\"id\" = ANY((SELECT \"id\" FROM \"ps\"))"),
+            "{}",
+            out.sql
+        );
+    }
+
+    /// A walk that ends on `.id` reads the junction's target column rather
+    /// than joining the target table, and that shortcut built its comparison
+    /// by hand: against a binding of more than one row it became
+    /// `= (SELECT … FROM ids)`, the one value a scalar subquery can return.
+    #[test]
+    fn comparing_a_multilink_walks_id_to_a_multi_row_binding_is_membership() {
+        let out = compile_and_emit("WITH ids := (SELECT Person.id) SELECT Person FILTER .posts.id = ids");
+        assert!(out.sql.contains("\"target\" = ANY((SELECT "), "{}", out.sql);
+    }
+
+    /// A path read *off* a binding of more than one row is a set too — one
+    /// answer per row of the binding, however single-valued the walk off it.
+    /// Only a bare reference to the binding was recognised as one, so
+    /// `.name = ps.name` compared against a scalar subquery over the whole
+    /// binding and aborted the moment it held two rows.
+    #[test]
+    fn comparing_against_a_path_off_a_multi_row_binding_is_membership() {
+        for (subject, condition) in [
+            ("Person", ".name = ps.name"),
+            ("Person", ".posts = ps.posts"),
+            ("Post", "any(.<posts[is Person] = ps.id)"),
+        ] {
+            let out = compile_and_emit(&format!(
+                "WITH ps := (SELECT Person) SELECT {subject} FILTER {condition}"
+            ));
+            assert!(out.sql.contains("= ANY((SELECT "), "{condition}:\n{}", out.sql);
+        }
+    }
+
+    /// A binding capped at one row is one value, and a value misread as a set
+    /// is not harmless: over an empty one `= ANY(…)` is false where a scalar
+    /// read is NULL, which `!=` negates to opposite answers.
+    #[test]
+    fn comparing_against_a_path_off_a_single_row_binding_stays_an_equality() {
+        let out = compile_and_emit("WITH p := (SELECT Person LIMIT 1) SELECT Person FILTER .name != p.name");
+        assert!(!out.sql.contains("ANY("), "{}", out.sql);
+        assert!(out.sql.contains("<> (SELECT"), "{}", out.sql);
+    }
+
+    /// A backlink reaches a set of rows just as a multi-link does, so an
+    /// equality against a binding of more than one row is the same membership
+    /// question. Built as a plain equality it became
+    /// `= (SELECT id FROM ps)` inside the backlink's EXISTS, which Postgres
+    /// aborts on the moment the binding holds two rows.
+    #[test]
+    fn comparing_a_backlink_to_a_multi_row_binding_is_membership() {
+        for condition in [
+            "any(.<company[is default::Person] = ps)",
+            ".<company[is default::Person] = ps",
+        ] {
+            let out = compile_and_emit(&format!("WITH ps := (SELECT Person) SELECT Company FILTER {condition}"));
+            assert!(
+                out.sql.contains("\"id\" = ANY((SELECT \"id\" FROM \"ps\"))"),
+                "{condition}:\n{}",
+                out.sql
+            );
+            assert!(
+                !out.sql.contains("\"id\" = (SELECT \"id\" FROM \"ps\")"),
+                "the binding must not collapse to one value — {condition}:\n{}",
+                out.sql
+            );
+        }
+        let out = compile_and_emit(
+            "WITH ps := (SELECT Person) SELECT Company FILTER any(.<company[is default::Person] != ps)",
+        );
+        assert!(
+            out.sql
+                .contains("NOT (\"t2\".\"id\" = ANY((SELECT \"id\" FROM \"ps\")))"),
+            "{}",
+            out.sql
+        );
+    }
+
+    /// The same reading for a backlink that reads through a multi-link rather
+    /// than an FK — the junction is how the rows are reached, but what is
+    /// compared is still a set of them.
+    #[test]
+    fn comparing_a_multilink_backlink_to_a_multi_row_binding_is_membership() {
+        let out = compile_and_emit("WITH ps := (SELECT Person) SELECT Post FILTER any(.<posts[is Person] = ps)");
+        assert!(
+            out.sql.contains("\"id\" = ANY((SELECT \"id\" FROM \"ps\"))"),
+            "{}",
+            out.sql
+        );
+    }
+
+    /// A binding of one row is still one value, so the comparison stays one.
+    #[test]
+    fn comparing_a_backlink_to_a_single_row_binding_stays_an_equality() {
+        let out = compile_and_emit(
+            "WITH p := (SELECT Person LIMIT 1) SELECT Company FILTER any(.<company[is default::Person] = p)",
+        );
+        assert!(out.sql.contains("\"id\" = (SELECT \"id\" FROM \"p\")"), "{}", out.sql);
+    }
+
     /// A binding of one row is still one value, so the comparison stays one.
     #[test]
     fn comparing_a_multilink_to_a_single_row_binding_stays_an_equality() {
@@ -14186,6 +14299,51 @@ select owner { posts := (select owner.posts.title) };",
         assert!(
             ir.warnings.iter().any(|w| w.contains("FILTER clause")),
             "an unwrapped set-valued comparison still warns: {:?}",
+            ir.warnings
+        );
+    }
+
+    /// A backlink reaches a set of rows just as a multi-link does, so a
+    /// comparison over one is a set of booleans and the FILTER reduces them.
+    /// Only the multi-link spelling warned, which left this one shape of
+    /// set-valued FILTER silent.
+    #[test]
+    fn test_bare_backlink_comparison_warns_like_a_multilink_one() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Company FILTER .<company[is default::Person].name = 'x'").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        assert!(
+            ir.warnings
+                .iter()
+                .any(|w| w.contains("FILTER clause") && w.contains("backlink '.<company")),
+            "an unwrapped set-valued backlink comparison warns: {:?}",
+            ir.warnings
+        );
+    }
+
+    /// `any()` is what the warning asks for, so it silences it.
+    #[test]
+    fn test_any_over_a_backlink_comparison_does_not_warn() {
+        let schema = make_schema();
+        let ast = parse::parse("SELECT Company FILTER any(.<company[is default::Person].name = 'x')").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        assert!(
+            !ir.warnings.iter().any(|w| w.contains("FILTER clause")),
+            "any() states the intent, so nothing should warn: {:?}",
+            ir.warnings
+        );
+    }
+
+    /// An exclusive link pins its backlink to one row, so the comparison is
+    /// one boolean and there is nothing to warn about.
+    #[test]
+    fn test_an_exclusive_backlink_comparison_does_not_warn() {
+        let schema = schema_with_exclusive_posts();
+        let ast = parse::parse("SELECT Post FILTER .<posts[is Person].name = 'x'").unwrap();
+        let ir = ir::compile(&ast, &schema).unwrap();
+        assert!(
+            !ir.warnings.iter().any(|w| w.contains("FILTER clause")),
+            "an exclusive backlink reaches one row: {:?}",
             ir.warnings
         );
     }

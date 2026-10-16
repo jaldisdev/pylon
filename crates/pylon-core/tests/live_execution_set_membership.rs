@@ -456,3 +456,90 @@ async fn comparing_a_multilink_to_a_multi_row_binding_runs() {
     .await;
     assert_eq!(field(&found, 2), vec![DecodedValue::Str("pro".into())]);
 }
+
+/// The same question asked through a *backlink*, which is the shape the
+/// reported query had: the walk reaches a set of rows and is compared to a
+/// binding of more than one. The comparison was built as a plain equality
+/// inside the backlink's EXISTS, so Postgres aborted on
+/// `= (SELECT id FROM licences)` the moment the binding held two rows.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn comparing_a_backlink_to_a_multi_row_binding_runs() {
+    let (module, schema, pool) = setup().await;
+    seed(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "with licences := (select {module}::Licence) \
+             select {module}::Addon {{ name }} \
+             filter any(.<required_addons[is {module}::Licence] = licences) \
+             order by .name"
+        ),
+    )
+    .await;
+    assert_eq!(
+        field(&found, 2),
+        vec![DecodedValue::Str("backup".into()), DecodedValue::Str("sso".into())],
+        "`audit` is required by neither licence"
+    );
+}
+
+/// A walk ending on `.id` reads the junction's target column instead of
+/// joining the target table, and that shortcut built its own comparison —
+/// so it aborted on a multi-row binding the same way.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn comparing_a_multilink_walks_id_to_a_multi_row_binding_runs() {
+    let (module, schema, pool) = setup().await;
+    seed(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "with licensed := (select {module}::Addon filter .name in {{'sso', 'audit'}}) \
+             select {module}::Licence {{ name }} filter any(.required_addons.id = licensed)"
+        ),
+    )
+    .await;
+    assert_eq!(field(&found, 2), vec![DecodedValue::Str("pro".into())]);
+}
+
+/// A path read *off* a binding of more than one row is a set too, however
+/// single-valued the walk off it: one answer per row of the binding. Only a
+/// bare reference to the binding counted as one, so `= licensed.name`
+/// compared against a scalar subquery over the whole binding and Postgres
+/// aborted on it.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn comparing_against_a_path_off_a_multi_row_binding_runs() {
+    let (module, schema, pool) = setup().await;
+    seed(&pool, &schema, &module).await;
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "with licensed := (select {module}::Addon filter .name in {{'sso', 'audit'}}) \
+             select {module}::Addon {{ name }} filter .name = licensed.name order by .name"
+        ),
+    )
+    .await;
+    assert_eq!(
+        field(&found, 2),
+        vec![DecodedValue::Str("audit".into()), DecodedValue::Str("sso".into())]
+    );
+
+    let found = rows(
+        &pool,
+        &schema,
+        &format!(
+            "with licensed := (select {module}::Addon filter .name in {{'sso', 'audit'}}) \
+             select {module}::Licence {{ name }} filter any(.required_addons.id = licensed.id)"
+        ),
+    )
+    .await;
+    assert_eq!(field(&found, 2), vec![DecodedValue::Str("pro".into())]);
+}

@@ -13265,12 +13265,11 @@ impl<'a> Compiler<'a> {
                 // the equality means in PyQL and what `= ANY` says in SQL.
                 if matches!(b.op, ast::BinOpKind::Eq | ast::BinOpKind::Ne) {
                     // A `with` binding of more than one row is the same kind
-                    // of set, reached through its CTE rather than an array.
-                    let is_set = |e: &IrExpr| match e {
-                        IrExpr::ArrayFromSelect(_) => true,
-                        IrExpr::CteRef { name, .. } => self.multi_row_ctes.contains(name),
-                        _ => false,
-                    };
+                    // of set, reached through its CTE rather than an array —
+                    // the reading `is_set_expr` gives one, shared with the
+                    // walk-and-backlink builders so the two cannot disagree
+                    // about what counts as a set.
+                    let is_set = |e: &IrExpr| self.is_set_expr(e);
                     let flipped = is_set(&left) && !is_set(&right) && !is_array_expr(&right);
                     let straight = is_set(&right) && !is_set(&left) && !is_array_expr(&left);
                     if flipped || straight {
@@ -15479,6 +15478,34 @@ impl<'a> Compiler<'a> {
 
     // ── Backlink compilation ─────────────────────────────────────────────────────
 
+    /// A path's steps rendered back the way they were written — a path the
+    /// reader cannot find in their own query is worse than no path at all.
+    fn render_pointer_path(steps: &[ast::PathStep]) -> String {
+        let mut out = String::new();
+        for step in steps {
+            match step {
+                ast::PathStep::Name(n) => {
+                    out.push('.');
+                    out.push_str(n);
+                }
+                ast::PathStep::Backlink(n) => {
+                    out.push_str(".<");
+                    out.push_str(n);
+                }
+                ast::PathStep::LinkProp(n) => {
+                    out.push('@');
+                    out.push_str(n);
+                }
+                ast::PathStep::TypeIntersection(t) => {
+                    out.push_str("[is ");
+                    out.push_str(&t.qualified_name());
+                    out.push(']');
+                }
+            }
+        }
+        out
+    }
+
     /// Detect a backlink path on either side of a BinOp and compile as EXISTS.
     fn try_backlink_exists(
         &mut self,
@@ -15505,6 +15532,18 @@ impl<'a> Compiler<'a> {
         } else {
             return Ok(None);
         };
+        // A backlink that is not pinned by an exclusive link reaches a set of
+        // rows, so a comparison over it is a set of booleans and the EXISTS
+        // below reduces them — the same reading, and the same warning, a
+        // multi-link walk gets in `try_multilink_exists`. Without it this one
+        // shape of set-valued FILTER stayed silent.
+        if self.explicit_set_depth == 0 && self.path_crosses_multi(td, path_steps) {
+            let pointer_path = Self::render_pointer_path(path_steps);
+            self.warnings.push(format!(
+                "possibly more than one element returned by an expression in a FILTER clause \
+                 (backlink '{pointer_path}'); wrap with any() to make intent explicit",
+            ));
+        }
         let value_expr = self.compile_comparison_value(value_ast, &b.op, td, alias)?;
         let current_qname = format!("{}::{}", td.module, td.name);
         let exists = self.compile_backlink_as_exists(
@@ -15955,15 +15994,18 @@ impl<'a> Compiler<'a> {
         // nothing here dropped the comparison, leaving "any account links to
         // this row" in its place.
         if steps.is_empty() {
-            return Ok(comparison.map(|(op, value, flip)| {
-                let key = IrExpr::ColumnRef {
-                    alias: t_alias.to_string(),
-                    column: "id".to_string(),
-                    pg_type: "uuid".to_string(),
-                };
-                let (left, right) = if flip { (value, key) } else { (key, value) };
-                IrExpr::BinOp(Box::new(IrBinOp { left, op, right }))
-            }));
+            let Some(comparison) = comparison else { return Ok(None) };
+            let key = IrExpr::ColumnRef {
+                alias: t_alias.to_string(),
+                column: "id".to_string(),
+                pg_type: "uuid".to_string(),
+            };
+            // Through `apply_comparison` rather than built here, so an
+            // equality against a *set* — a binding of more than one row —
+            // reads as the membership it stands for. Built as a plain
+            // equality it compared against `(SELECT id FROM <binding>)`,
+            // which Postgres aborts on as soon as the binding holds two.
+            return Ok(Some(self.apply_comparison(key, Some(comparison))));
         }
 
         // Chained backlink: recurse (current_qname is now target_qname of the outer backlink)
@@ -16069,14 +16111,30 @@ impl<'a> Compiler<'a> {
     }
 
     /// Whether `e` stands for a *set* rather than one value: a walk gathered
-    /// as an array, or a `with` binding of more than one row, which arrives as
-    /// a reference to its CTE. Reading only the first of those left `filter
-    /// .posts = ps` comparing against `(SELECT id FROM ps)` — one value, and
-    /// an error from Postgres as soon as the binding held two.
+    /// as an array, a `with` binding of more than one row, which arrives as
+    /// a reference to its CTE, or a path *read off* such a binding, which
+    /// arrives as a select over it. Reading any of those as one value left
+    /// `filter .posts = ps` comparing against `(SELECT id FROM ps)` — one
+    /// value, and an error from Postgres as soon as the binding held two.
+    ///
+    /// Deliberately only what is demonstrably a set: over an *empty* one
+    /// `x = ANY(…)` is false where `x = (SELECT …)` is NULL, which `!=`
+    /// negates to opposite answers, so a value misread as a set is not the
+    /// harmless direction the way the reverse is.
     fn is_set_expr(&self, e: &IrExpr) -> bool {
         match e {
             IrExpr::ArrayFromSelect(_) => true,
             IrExpr::CteRef { name, .. } => self.multi_row_ctes.contains(name),
+            // `ps.name` — however single-valued the walk off it, the binding
+            // it starts from still has one row per answer. A `limit 1` of its
+            // own caps that back to one.
+            IrExpr::PathSubquery(ps) | IrExpr::ObjectPathSubquery(ps) => {
+                ps.root
+                    .table
+                    .strip_prefix("@cte:")
+                    .is_some_and(|cte| self.multi_row_ctes.contains(cte))
+                    && !matches!(ps.limit, Some(IrExpr::Literal(IrLiteral::Int(1))))
+            }
             _ => false,
         }
     }
@@ -16332,30 +16390,7 @@ impl<'a> Compiler<'a> {
         // Warn: multi-link traversal in a comparison returns a set, not a single boolean.
         // The query works (compiled as EXISTS), but `any()` makes the intent explicit.
         if self.explicit_set_depth == 0 {
-            // Rendered back the way it was written — a path the reader cannot
-            // find in their own query is worse than no path at all.
-            let mut pointer_path = String::new();
-            for step in path_steps {
-                match step {
-                    ast::PathStep::Name(n) => {
-                        pointer_path.push('.');
-                        pointer_path.push_str(n);
-                    }
-                    ast::PathStep::Backlink(n) => {
-                        pointer_path.push_str(".<");
-                        pointer_path.push_str(n);
-                    }
-                    ast::PathStep::LinkProp(n) => {
-                        pointer_path.push('@');
-                        pointer_path.push_str(n);
-                    }
-                    ast::PathStep::TypeIntersection(t) => {
-                        pointer_path.push_str("[is ");
-                        pointer_path.push_str(&t.qualified_name());
-                        pointer_path.push(']');
-                    }
-                }
-            }
+            let pointer_path = Self::render_pointer_path(path_steps);
             self.warnings.push(format!(
                 "possibly more than one element returned by an expression in a FILTER clause \
                  (multi-link '{pointer_path}'); wrap with any() to make intent explicit",
@@ -16538,18 +16573,17 @@ impl<'a> Compiler<'a> {
         if steps.len() == 1 {
             // Terminal step: must be a scalar property or "id"
             if first_name == "id" {
-                // FK optimisation: compare jt.target directly
+                // FK optimisation: compare jt.target directly. Through
+                // `apply_comparison`, like the no-tail case above, so that an
+                // equality against a binding of more than one row reads as
+                // membership rather than against the one value a scalar
+                // subquery can return.
                 let col_ref = IrExpr::ColumnRef {
                     alias: jt_alias.to_string(),
                     column: jt_tgt_col.to_string(),
                     pg_type: "uuid".to_string(),
                 };
-                let (l, r) = if flip {
-                    (value_expr, col_ref)
-                } else {
-                    (col_ref, value_expr)
-                };
-                return Ok(IrExpr::BinOp(Box::new(IrBinOp { left: l, op, right: r })));
+                return Ok(self.apply_comparison(col_ref, Some((op, value_expr, flip))));
             }
             // Check if it's a link (object) rather than a scalar
             // A single link is compared by the foreign key it stores, the
