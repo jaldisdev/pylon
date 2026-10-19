@@ -643,3 +643,64 @@ def test_baseline_survives_schema_edits_between_create_and_apply(live_pool, tmp_
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_migration_log_marks_a_created_but_unapplied_migration_as_pending(live_pool, tmp_path, unique_module):
+    """`create` records a tracking row before the migration is applied, so
+    `log --from-db` sees one with a NULL `applied_at`. It used to print that
+    straight through as `None`.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_log_pending')
+    (tmp_path / 'migrations').mkdir()
+    (tmp_path / 'log_pending_schema.py').write_text(
+        'import pylon.schema as pylon\n\n'
+        f'@pylon.type(module={module!r}, name="Widget")\n'
+        'class Widget:\n'
+        '    name: pylon.Property[str]\n'
+    )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / 'migrations'
+
+    try:
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(migration.commands['log'], ['--from-db'], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert '(pending)' in result.output, result.output
+        assert 'None' not in result.output, result.output
+
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(migration.commands['log'], ['--from-db'], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert '(pending)' not in result.output, result.output
+        assert 'UTC' in result.output, result.output
+    finally:
+        migration_ids = re.findall(
+            r'^-- migration: (\S+)$',
+            '\n'.join(f.read_text() for f in migrations_dir.glob('*.sql')),
+            re.MULTILINE,
+        )
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())

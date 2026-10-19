@@ -425,7 +425,10 @@ async def _log(
             """,
             [],
         )
-        entries = [{'id': r['id'], 'onto': r['onto'], 'ref': r['applied_at']} for r in rows]
+        # `applied_at` is NULL for the row `migration create` records ahead
+        # of the migration being applied — ORDER BY sorts those last, which
+        # is where a not-yet-applied migration belongs.
+        entries = [{'id': r['id'], 'onto': r['onto'], 'ref': r['applied_at'] or '(pending)'} for r in rows]
 
     if newest_first:
         entries = list(reversed(entries))
