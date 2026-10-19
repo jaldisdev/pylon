@@ -198,14 +198,69 @@ pub async fn check_internal_schema(pool: &PgPool) -> Result<InternalSchemaState>
 /// A bare schema-file edit with neither applied has no effect here, by
 /// design — clients keep seeing the last-applied/synced shape until one of
 /// those two actually run.
-pub async fn write_schema_snapshot(pool: &PgPool, snapshot_json: &str) -> Result<()> {
+pub async fn write_schema_snapshot(
+    pool: &PgPool,
+    snapshot_json: &str,
+    written_by: SchemaWriter,
+    written_onto: Option<&str>,
+) -> Result<()> {
     pool.execute_typed(
-        r#"INSERT INTO _pylon."Schema" (singleton, snapshot, updated_at) VALUES (true, $1::jsonb, now())
-           ON CONFLICT (singleton) DO UPDATE SET snapshot = $1::jsonb, updated_at = now()"#,
-        &[DecodedValue::Str(snapshot_json.to_string())],
+        r#"INSERT INTO _pylon."Schema" (singleton, snapshot, updated_at, written_by, written_onto)
+           VALUES (true, $1::jsonb, now(), $2::_pylon."SchemaWriter", $3)
+           ON CONFLICT (singleton) DO UPDATE
+               SET snapshot = $1::jsonb,
+                   updated_at = now(),
+                   written_by = EXCLUDED.written_by,
+                   written_onto = EXCLUDED.written_onto"#,
+        &[
+            DecodedValue::Str(snapshot_json.to_string()),
+            DecodedValue::Str(written_by.as_str().to_string()),
+            written_onto.map_or(DecodedValue::Null, |s| DecodedValue::Str(s.to_string())),
+        ],
     )
     .await?;
     Ok(())
+}
+
+/// Which command last wrote `_pylon."Schema"` — the `_pylon."SchemaWriter"`
+/// enum, mirrored in Rust.
+///
+/// `Watch` is what makes dev-mode drift legible: `watch` pushes DDL straight
+/// to the database and leaves no other trace, so without this the only way
+/// to tell that it had run was to introspect the whole catalog and diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaWriter {
+    Apply,
+    Watch,
+}
+
+impl SchemaWriter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SchemaWriter::Apply => "Apply",
+            SchemaWriter::Watch => "Watch",
+        }
+    }
+
+    /// `None` for a label this build doesn't know — a row written by a newer
+    /// Pylon that added a variant. Treated as "unknown", never as an error.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Apply" => Some(SchemaWriter::Apply),
+            "Watch" => Some(SchemaWriter::Watch),
+            _ => None,
+        }
+    }
+}
+
+/// Where the current `_pylon."Schema"` row came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaOrigin {
+    /// `None` on a row written before this was tracked, or by a newer Pylon
+    /// using a variant this build doesn't have.
+    pub written_by: Option<SchemaWriter>,
+    /// The applied migration the write sat on top of, if there was one.
+    pub written_onto: Option<String>,
 }
 
 /// Reads the current schema snapshot, or `None` if neither `migration
@@ -222,6 +277,39 @@ pub async fn read_schema_snapshot(pool: &PgPool) -> Result<Option<String>> {
         Some(DecodedValue::Str(s)) => Some(s),
         _ => None,
     })
+}
+
+/// Reads who last wrote the snapshot, or `None` when there is no row at all.
+///
+/// `written_by::text` rather than the enum itself, for the same reason
+/// `read_tracking` renders its jsonb columns as text: the wire decoder would
+/// have to know a custom type's OID, and the label is all any caller wants.
+pub async fn read_schema_origin(pool: &PgPool) -> Result<Option<SchemaOrigin>> {
+    let rows = pool
+        .query_typed(
+            r#"SELECT ((written_by::text), written_onto) AS result FROM _pylon."Schema" WHERE singleton"#,
+            &[],
+            &pool.types(),
+        )
+        .await?;
+    let Some(DecodedValue::Composite(fields)) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    // Same tolerance as `read_tracking`: an unexpected row shape reads as
+    // "nothing recorded" rather than failing a command outright.
+    let Ok([written_by, written_onto]) = <[DecodedValue; 2]>::try_from(fields) else {
+        return Ok(None);
+    };
+    Ok(Some(SchemaOrigin {
+        written_by: match written_by {
+            DecodedValue::Str(s) => SchemaWriter::parse(&s),
+            _ => None,
+        },
+        written_onto: match written_onto {
+            DecodedValue::Str(s) => Some(s),
+            _ => None,
+        },
+    }))
 }
 
 /// One row of `_pylon."Migrations"` — covers both `apply`'s own tracking
@@ -971,25 +1059,95 @@ mod tests {
         let pool = test_pool().await;
         let previous = read_schema_snapshot(&pool).await.unwrap();
 
-        write_schema_snapshot(&pool, r#"{"probe": "schema_snapshot_round_trips"}"#)
-            .await
-            .unwrap();
+        write_schema_snapshot(
+            &pool,
+            r#"{"probe": "schema_snapshot_round_trips"}"#,
+            SchemaWriter::Apply,
+            Some("m2probe"),
+        )
+        .await
+        .unwrap();
         let read_back = read_schema_snapshot(&pool).await.unwrap();
         assert_eq!(
             read_back.as_deref(),
             Some(r#"{"probe": "schema_snapshot_round_trips"}"#)
         );
+        assert_eq!(
+            read_schema_origin(&pool).await.unwrap(),
+            Some(SchemaOrigin {
+                written_by: Some(SchemaWriter::Apply),
+                written_onto: Some("m2probe".to_string()),
+            })
+        );
 
         // Upsert overwrites in place, so a second write must still round-trip
-        // (not silently keep the first value).
-        write_schema_snapshot(&pool, r#"{"probe": "second_write"}"#)
+        // (not silently keep the first value) — origin included, or `apply`
+        // could never clear a `Watch` marker left by a dev-mode sync.
+        write_schema_snapshot(&pool, r#"{"probe": "second_write"}"#, SchemaWriter::Watch, None)
             .await
             .unwrap();
         let read_back_2 = read_schema_snapshot(&pool).await.unwrap();
         assert_eq!(read_back_2.as_deref(), Some(r#"{"probe": "second_write"}"#));
+        assert_eq!(
+            read_schema_origin(&pool).await.unwrap(),
+            Some(SchemaOrigin {
+                written_by: Some(SchemaWriter::Watch),
+                written_onto: None,
+            })
+        );
 
         match previous {
-            Some(prior) => write_schema_snapshot(&pool, &prior).await.unwrap(),
+            Some(prior) => write_schema_snapshot(&pool, &prior, SchemaWriter::Apply, None)
+                .await
+                .unwrap(),
+            None => pool.batch_execute(r#"DELETE FROM _pylon."Schema""#).await.unwrap(),
+        }
+    }
+
+    /// No row at all is distinct from a row whose origin was never recorded.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn schema_origin_is_none_without_a_row() {
+        let pool = test_pool().await;
+        let previous = read_schema_snapshot(&pool).await.unwrap();
+        pool.batch_execute(r#"DELETE FROM _pylon."Schema""#).await.unwrap();
+
+        assert_eq!(read_schema_origin(&pool).await.unwrap(), None);
+
+        if let Some(prior) = previous {
+            write_schema_snapshot(&pool, &prior, SchemaWriter::Apply, None)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A row written before this build tracked the writer reads as unknown,
+    /// not as an error — that is what every pre-upgrade database looks like.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn an_unrecorded_schema_writer_reads_as_unknown() {
+        let pool = test_pool().await;
+        let previous = read_schema_snapshot(&pool).await.unwrap();
+
+        write_schema_snapshot(&pool, "{}", SchemaWriter::Watch, Some("m2gone"))
+            .await
+            .unwrap();
+        pool.batch_execute(r#"UPDATE _pylon."Schema" SET written_by = NULL, written_onto = NULL"#)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_schema_origin(&pool).await.unwrap(),
+            Some(SchemaOrigin {
+                written_by: None,
+                written_onto: None,
+            })
+        );
+
+        match previous {
+            Some(prior) => write_schema_snapshot(&pool, &prior, SchemaWriter::Apply, None)
+                .await
+                .unwrap(),
             None => pool.batch_execute(r#"DELETE FROM _pylon."Schema""#).await.unwrap(),
         }
     }

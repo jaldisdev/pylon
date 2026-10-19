@@ -704,3 +704,70 @@ def test_migration_log_marks_a_created_but_unapplied_migration_as_pending(live_p
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_apply_rebases_onto_watch_drift_without_being_told_to(live_pool, tmp_path, unique_module):
+    """`watch` pushes DDL straight to the database, so an `apply` that re-runs
+    it has to tolerate objects that already exist. That used to depend on the
+    operator remembering `--dev-mode` — without it the first duplicate object
+    aborted the step with a bare Postgres error. `watch` now records itself
+    as the last writer of `_pylon."Schema"`, which `apply` reads.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import _sync_once, migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_watch_drift')
+    (tmp_path / 'migrations').mkdir()
+    (tmp_path / 'watch_drift_schema.py').write_text(
+        'import pylon.schema as pylon\n\n'
+        f'@pylon.type(module={module!r}, name="Widget")\n'
+        'class Widget:\n'
+        '    name: pylon.Property[str]\n'
+    )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / 'migrations'
+
+    try:
+        asyncio.run(_sync_once(config))
+
+        result = runner.invoke(migration.commands['status'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert "'watch' last wrote" in result.output, result.output
+
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        # No --dev-mode: the marker is what has to carry it.
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'rebasing onto it' in result.output, result.output
+
+        # Applying rewrites the marker as its own, or every later apply would
+        # keep rebasing over drift that is long since recorded.
+        result = runner.invoke(migration.commands['status'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert "'watch' last wrote" not in result.output, result.output
+    finally:
+        migration_ids = re.findall(
+            r'^-- migration: (\S+)$',
+            '\n'.join(f.read_text() for f in migrations_dir.glob('*.sql')),
+            re.MULTILINE,
+        )
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())

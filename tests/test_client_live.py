@@ -89,7 +89,7 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
         schema_v1 = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema_v1))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema_v1.to_json())
+        await migration_write_schema_snapshot(live_pool, schema_v1.to_json(), 'Apply')
 
         # A freshly-connected client sees the just-migrated (non-readonly)
         # schema — the update succeeds.
@@ -128,7 +128,7 @@ def test_readonly_change_has_no_effect_until_a_migration_applies_it(live_pool, u
         await client2.aclose()
 
         # Now actually apply the migration: write the v2 snapshot.
-        await migration_write_schema_snapshot(live_pool, schema_v2.to_json())
+        await migration_write_schema_snapshot(live_pool, schema_v2.to_json(), 'Apply')
 
         # A third fresh client now sees the migrated (readonly) schema —
         # the same update must be rejected.
@@ -217,7 +217,7 @@ def test_client_listen_decodes_scalar_channel_payload(live_pool, unique_module):
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -263,7 +263,7 @@ def test_client_listen_decodes_type_channel_payload_as_the_rows_id(live_pool, un
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -319,7 +319,7 @@ def test_client_listen_decodes_object_channel_payload(live_pool, unique_module):
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -365,7 +365,7 @@ def test_client_listen_raises_on_malformed_payload(live_pool, unique_module):
         schema = _build_schema(*snapshot(), channels=channels)
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -416,7 +416,7 @@ def test_rollback_discards_the_transactions_writes(live_pool, unique_module):
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -483,7 +483,7 @@ def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, uni
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -554,7 +554,7 @@ def test_an_array_of_named_tuples_round_trips_as_the_type_it_declares(live_pool,
 
         await live_pool.batch_execute(ddl)
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -629,7 +629,7 @@ def test_a_path_to_an_optional_property_yields_only_the_rows_that_have_one(live_
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -721,7 +721,7 @@ def test_a_set_of_array_valued_properties_reads_back_as_the_arrays_it_holds(live
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -807,7 +807,7 @@ def test_a_decimal_inside_a_tuple_keeps_every_digit(live_pool, unique_module):
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -888,7 +888,7 @@ def test_a_tuple_parameter_takes_the_shapes_a_caller_holds_it_in(live_pool, uniq
         schema = _build_schema(*snapshot(), named_tuples=[Point])
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -1022,7 +1022,7 @@ def test_several_statements_written_together_run_from_every_entry_point(live_poo
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -1090,7 +1090,7 @@ def test_a_string_for_a_non_text_parameter_is_refused_without_losing_the_transac
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -1152,7 +1152,7 @@ def test_a_member_read_out_of_a_stored_tuple_is_the_type_it_declares(live_pool, 
         schema = _build_schema(*snapshot(), named_tuples=[Money])
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()
@@ -1277,7 +1277,7 @@ def test_a_tuple_parameter_carries_every_member_as_the_type_it_is(live_pool, uni
         schema = _build_schema(*snapshot(), named_tuples=[Hard])
         await live_pool.batch_execute(export_schema(schema))
         await migration_ensure_internal_schema(live_pool)
-        await migration_write_schema_snapshot(live_pool, schema.to_json())
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
 
         client = Client(cfg)
         await client.ensure_connected()

@@ -24,6 +24,20 @@ from the same version number.
 * `migration apply --to` no longer writes a baseline derived from the schema
   files when it stops short of the chain tip, and no longer publishes those
   files' shape to `_pylon."Schema"` for clients to read.
+* `migration watch` now records itself as the writer of the schema snapshot,
+  and `migration apply` reads that and rebases onto the DDL watch pushed
+  without being told to. Forgetting `--dev-mode` used to abort a step with a
+  bare Postgres duplicate-object error partway through; the flag is still
+  accepted for databases carrying no marker. Applying rewrites the marker as
+  its own, so the rebase stops once the drift is recorded.
+* `migration status` reports that `watch` was the last writer from the
+  snapshot row itself. `--dev-mode` still adds the introspection diff that
+  says *what* drifted.
+* `migration log --from-db` shows a created-but-unapplied migration as
+  `(pending)` rather than printing `None` for its timestamp.
+* `_pylon."Internal".version` is now 2: `_pylon."Schema"` gained
+  `written_by` (a `_pylon."SchemaWriter"` enum) and `written_onto`. Additive,
+  so the minimum supported version is unchanged.
 
 ## 0.7.0 — 2026-10-16
 

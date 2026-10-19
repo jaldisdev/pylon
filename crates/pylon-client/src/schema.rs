@@ -74,14 +74,21 @@ mod tests {
         let previous = pylon_core::migrate::read_schema_snapshot(&pool).await.unwrap();
 
         let snapshot = serde_json::to_string(&SchemaDescriptor::default()).unwrap();
-        pylon_core::migrate::write_schema_snapshot(&pool, &snapshot)
+        pylon_core::migrate::write_schema_snapshot(&pool, &snapshot, pylon_core::migrate::SchemaWriter::Apply, None)
             .await
             .unwrap();
 
         assert!(fetch(&pool).await.is_ok());
 
         match previous {
-            Some(prior) => pylon_core::migrate::write_schema_snapshot(&pool, &prior).await.unwrap(),
+            Some(prior) => pylon_core::migrate::write_schema_snapshot(
+                &pool,
+                &prior,
+                pylon_core::migrate::SchemaWriter::Apply,
+                None,
+            )
+            .await
+            .unwrap(),
             None => pool.batch_execute(r#"DELETE FROM _pylon."Schema""#).await.unwrap(),
         }
     }
@@ -96,7 +103,9 @@ mod tests {
         assert!(matches!(fetch(&pool).await, Err(Error::NoSchemaSnapshot)));
 
         if let Some(prior) = previous {
-            pylon_core::migrate::write_schema_snapshot(&pool, &prior).await.unwrap();
+            pylon_core::migrate::write_schema_snapshot(&pool, &prior, pylon_core::migrate::SchemaWriter::Apply, None)
+                .await
+                .unwrap();
         }
     }
 }

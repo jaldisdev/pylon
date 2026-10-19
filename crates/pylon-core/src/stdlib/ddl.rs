@@ -348,11 +348,20 @@ pub const MIGRATION_TRACKING_DDL: &str = concat!(
     "    step_index  integer     NOT NULL,\n",
     "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
     ");\n\n",
+    "DO $$ BEGIN\n",
+    "    CREATE TYPE _pylon.\"SchemaWriter\" AS ENUM ('Apply', 'Watch');\n",
+    "EXCEPTION WHEN duplicate_object THEN NULL; END $$;\n\n",
     "CREATE TABLE IF NOT EXISTS _pylon.\"Schema\" (\n",
-    "    singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),\n",
-    "    snapshot    jsonb       NOT NULL,\n",
-    "    updated_at  timestamptz NOT NULL DEFAULT now()\n",
-    ");\n\n",
+    "    singleton    boolean     PRIMARY KEY DEFAULT true CHECK (singleton),\n",
+    "    snapshot     jsonb       NOT NULL,\n",
+    "    updated_at   timestamptz NOT NULL DEFAULT now(),\n",
+    "    written_by   _pylon.\"SchemaWriter\" NULL,\n",
+    "    written_onto text        NULL\n",
+    ");\n",
+    // Bolted on for databases whose `Schema` table predates them; NULL
+    // reads as "written before Pylon tracked this", not as a wrong answer.
+    "ALTER TABLE _pylon.\"Schema\" ADD COLUMN IF NOT EXISTS written_by _pylon.\"SchemaWriter\" NULL;\n",
+    "ALTER TABLE _pylon.\"Schema\" ADD COLUMN IF NOT EXISTS written_onto text NULL;\n\n",
     // See `INTERNAL_SCHEMA_VERSION`.
     "CREATE TABLE IF NOT EXISTS _pylon.\"Internal\" (\n",
     "    singleton   boolean     PRIMARY KEY DEFAULT true CHECK (singleton),\n",
@@ -381,7 +390,7 @@ pub const MIGRATION_TRACKING_DDL: &str = concat!(
 /// Bump this when the internal structures change in a way a future reader
 /// would need to distinguish. Leaving it alone is correct for a purely
 /// idempotent change.
-pub const INTERNAL_SCHEMA_VERSION: i32 = 1;
+pub const INTERNAL_SCHEMA_VERSION: i32 = 2;
 
 /// The oldest internal layout this build can still operate against.
 ///
@@ -409,7 +418,7 @@ pub const MIN_SUPPORTED_INTERNAL_VERSION: i32 = 1;
 /// `internal_schema_version_literal_matches_the_constant` enforces it.
 macro_rules! internal_schema_version_literal {
     () => {
-        "1"
+        "2"
     };
 }
 use internal_schema_version_literal;
@@ -596,8 +605,12 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS _pylon.\"Internal\""));
         // Upsert, not plain insert: an existing database has to have its
         // recorded version moved forward, not left at whatever it was.
+        // Against the constant, not a literal, so a version bump doesn't
+        // need this test edited to stay true.
         assert!(
-            ddl.contains("ON CONFLICT (singleton) DO UPDATE SET version = 1"),
+            ddl.contains(&format!(
+                "ON CONFLICT (singleton) DO UPDATE SET version = {INTERNAL_SCHEMA_VERSION}"
+            )),
             "got:\n{ddl}"
         );
     }

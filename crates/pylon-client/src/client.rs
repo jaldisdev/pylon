@@ -656,9 +656,14 @@ mod tests {
         // One shared row for this whole DSN — put back what was there.
         let previous = pylon_core::migrate::read_schema_snapshot(&setup).await.unwrap();
         let placeholder = serde_json::to_string(&SchemaDescriptor::default()).unwrap();
-        pylon_core::migrate::write_schema_snapshot(&setup, &placeholder)
-            .await
-            .unwrap();
+        pylon_core::migrate::write_schema_snapshot(
+            &setup,
+            &placeholder,
+            pylon_core::migrate::SchemaWriter::Apply,
+            None,
+        )
+        .await
+        .unwrap();
         setup
             .batch_execute("DROP TYPE IF EXISTS pylon_client_reload_enum")
             .await
@@ -699,9 +704,14 @@ mod tests {
 
         setup.batch_execute("DROP TYPE pylon_client_reload_enum").await.unwrap();
         if let Some(previous) = previous {
-            pylon_core::migrate::write_schema_snapshot(&setup, &previous)
-                .await
-                .unwrap();
+            pylon_core::migrate::write_schema_snapshot(
+                &setup,
+                &previous,
+                pylon_core::migrate::SchemaWriter::Apply,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 }

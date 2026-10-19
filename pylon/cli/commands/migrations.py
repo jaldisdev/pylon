@@ -118,7 +118,7 @@ def migration() -> None:
     '--dev-mode',
     is_flag=True,
     default=False,
-    help="Skip DDL already applied via 'watch'; just move the tracking pointer.",
+    help="Skip DDL already applied via 'watch'; detected automatically when 'watch' recorded the sync.",
 )
 @click.option('--no-wait', is_flag=True, default=False, help="Fail immediately if another 'apply' holds the lock.")
 @requires_config
@@ -138,6 +138,7 @@ async def _apply(
         migration_advisory_lock,
         migration_applied_tip,
         migration_ensure_internal_schema,
+        migration_read_schema_origin,
         migration_read_tracking,
         migration_record_applied,
         migration_try_advisory_lock,
@@ -196,6 +197,17 @@ async def _apply(
             click.echo('Already up to date.')
             return
 
+        # `watch` pushes DDL straight to the database and records itself as
+        # the last writer of `_pylon."Schema"`. Without reading that back,
+        # the only way to know is for the operator to remember --dev-mode,
+        # and forgetting it fails the first already-existing object with a
+        # bare Postgres duplicate-object error partway through a step.
+        origin = await migration_read_schema_origin(pool)
+        if not dev_mode and origin is not None and origin[0] == 'Watch':
+            dev_mode = True
+            onto = f' since {origin[1]}' if origin[1] else ''
+            click.echo(f"'watch' has pushed DDL to this database{onto} — rebasing onto it (as --dev-mode).")
+
         # Applied rows only: `migration create` now pre-inserts a row for the
         # migration it writes, and treating one of those as proof that a
         # squash's constituents already ran would skip its DDL entirely.
@@ -252,8 +264,12 @@ async def _apply(
         # from a state the database is actually known to be in — publishing
         # the schema files' shape over an unknown one would advertise
         # pointers that aren't there.
+        # Writing it also clears any 'Watch' marker, which is what stops the
+        # rebase above from triggering on every later apply. When there's no
+        # state to publish the marker deliberately stays — the drift really
+        # is still unaccounted for.
         if schema_json is not None:
-            await migration_write_schema_snapshot(pool, schema_json)
+            await migration_write_schema_snapshot(pool, schema_json, 'Apply', tip.id)
 
     finally:
         await lock.unlock()
@@ -295,6 +311,7 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
         introspect_db_state,
         migration_applied_tip,
         migration_ensure_internal_schema,
+        migration_read_schema_origin,
         migration_read_tracking,
         pgcon_connect,
     )
@@ -313,10 +330,24 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
 
     applied_tip = migration_applied_tip(tracking)
 
+    # That `watch` has run is one row to read. *What* it changed still needs
+    # the full introspection diff below, which is why --dev-mode stays.
+    origin = await migration_read_schema_origin(pool)
+
+    def report_watch_drift(with_hint: bool) -> None:
+        if origin is None or origin[0] != 'Watch':
+            return
+        onto = f' on top of {origin[1]}' if origin[1] else ''
+        click.echo(f"\n⚠  'watch' last wrote this database's schema{onto} — DDL here may not be in any migration.")
+        if with_hint and not dev_mode:
+            click.echo('   Run with --dev-mode to see what drifted.')
+
     if not chain:
         click.echo('No migrations on disk.')
         if tracking:
             click.echo(f'Database tip: {applied_tip} (no files — orphaned?)')
+        # No hint: the drift diff below needs a chain to have got this far.
+        report_watch_drift(with_hint=False)
         return
 
     chain_ids = [m.id for m in chain]
@@ -339,6 +370,8 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
             click.echo(f'  {m.filename}')
     else:
         click.echo('\nDatabase is up to date.')
+
+    report_watch_drift(with_hint=True)
 
     # dev-mode: report whether watch has applied changes beyond the recorded tip.
     if dev_mode and db_state is not None and not pending:
@@ -482,8 +515,10 @@ async def _sync_once(config) -> None:
     from pylon._core import (
         SchemaDescriptor,
         introspect_db_state,
+        migration_applied_tip,
         migration_ensure_internal_schema,
         migration_read_schema_snapshot,
+        migration_read_tracking,
         migration_write_schema_snapshot,
         pgcon_connect,
     )
@@ -562,7 +597,10 @@ async def _sync_once(config) -> None:
     # A dev-mode sync just changed the live database the same way a real
     # migration would — clients should be able to pick that up immediately
     # too, not just once a formal `migration apply` eventually records it.
-    await migration_write_schema_snapshot(pool, schema.to_json())
+    # Marked as ours: it's the only trace a sync leaves, and it's what lets
+    # the next `apply` rebase onto this DDL without being told to.
+    applied_tip = migration_applied_tip(await migration_read_tracking(pool))
+    await migration_write_schema_snapshot(pool, schema.to_json(), 'Watch', applied_tip)
 
 
 def _reload_schema(config):

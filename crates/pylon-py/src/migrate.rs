@@ -218,17 +218,36 @@ fn migration_try_advisory_lock<'py>(py: Python<'py>, pool: &PgconPool) -> PyResu
 /// Upserts the process-wide schema snapshot (`_pylon."Schema"`) every
 /// client fetches at startup instead of `.pylon/schema.json` — called by
 /// `apply` after a migration lands and by `watch` after a dev-mode sync.
+/// `written_by` is a `_pylon."SchemaWriter"` label — `"Apply"` or
+/// `"Watch"`; anything else is a `ValueError`.
 #[pyfunction]
+#[pyo3(signature = (pool, snapshot_json, written_by, written_onto=None))]
 fn migration_write_schema_snapshot<'py>(
     py: Python<'py>,
     pool: &PgconPool,
     snapshot_json: String,
+    written_by: &str,
+    written_onto: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
+    let written_by = core_migrate::SchemaWriter::parse(written_by)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown schema writer {written_by:?}")))?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        core_migrate::write_schema_snapshot(&pool, &snapshot_json)
+        core_migrate::write_schema_snapshot(&pool, &snapshot_json, written_by, written_onto.as_deref())
             .await
             .map_err(migrate_err)
+    })
+}
+
+/// Who last wrote `_pylon."Schema"`, as `(written_by, written_onto)` — or
+/// `None` when no command ever has. `written_by` is `None` on a row written
+/// before Pylon tracked this.
+#[pyfunction]
+fn migration_read_schema_origin<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let origin = core_migrate::read_schema_origin(&pool).await.map_err(migrate_err)?;
+        Ok(origin.map(|o| (o.written_by.map(|w| w.as_str()), o.written_onto)))
     })
 }
 
@@ -258,6 +277,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migration_try_advisory_lock, m)?)?;
     m.add_function(wrap_pyfunction!(migration_write_schema_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_schema_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_read_schema_origin, m)?)?;
     m.add_class::<MigrationLock>()?;
     Ok(())
 }

@@ -78,7 +78,7 @@ A required Postgres extension your schema now depends on (e.g. `pgvector`) is ne
 pylon migration apply
 ```
 
-Runs every pending migration in chain order. `--to ID` stops early; `--dev-mode` treats DDL that `pylon migration watch` already pushed live as already-satisfied, only advancing the tracking pointer rather than re-running it.
+Runs every pending migration in chain order. `--to ID` stops early. `--dev-mode` treats DDL that `pylon migration watch` already pushed live as already-satisfied, skipping the individual statements that fail as "already exists" rather than aborting the step — and you rarely need to pass it, because `watch` records itself as the last writer of the schema snapshot and `apply` turns this on by itself when it sees that. Applying rewrites the marker as its own, so it stops applying once the drift is recorded.
 
 ### Transaction boundaries and `CONCURRENTLY`
 
@@ -101,7 +101,7 @@ pylon migration watch
 
 Watches schema `.py` files for changes and applies the diff to the live database **immediately, with no migration file written** — the fastest inner loop for iterating on a schema locally. Run `pylon migration create` once you're happy with where the schema landed, to capture the accumulated changes as a real, reviewable migration file.
 
-`pylon migration status --dev-mode` reports when the live database has diverged from the last recorded migration this way ("watch drift") — a nudge that you have uncommitted schema changes sitting live in the database, not yet captured as a file.
+`pylon migration status` reports *that* `watch` was the last thing to write this database's schema, from the snapshot row itself. `--dev-mode` adds *what* drifted, which needs a full introspection diff — a nudge that you have uncommitted schema changes sitting live in the database, not yet captured as a file.
 
 ## Hand-editing: `--blank` and `rehash`
 

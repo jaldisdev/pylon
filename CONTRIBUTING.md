@@ -140,9 +140,10 @@ is defined once in `crates/pylon-core/src/stdlib/ddl.rs`.
 `migrate::ensure_internal_schema` replays the whole blob on every migration.
 That is what carries an internal change to databases that already exist: a
 new column arrives as `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, a changed
-function as `CREATE OR REPLACE FUNCTION`. A statement that only works against
-an empty database will appear to work in development and fail for everyone
-who upgrades.
+function as `CREATE OR REPLACE FUNCTION`, and a new enum type as a `DO $$ …
+EXCEPTION WHEN duplicate_object THEN NULL; END $$` block, since `CREATE TYPE`
+has no `IF NOT EXISTS`. A statement that only works against an empty database
+will appear to work in development and fail for everyone who upgrades.
 
 ### Versioning
 

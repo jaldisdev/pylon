@@ -155,9 +155,14 @@ async fn setup(schema: &SchemaDescriptor) -> Client {
     // `live_execution_*.rs` file's `bootstrap()` helper).
     pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
-    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap())
-        .await
-        .unwrap();
+    pylon_core::migrate::write_schema_snapshot(
+        &pool,
+        &serde_json::to_string(schema).unwrap(),
+        pylon_core::migrate::SchemaWriter::Apply,
+        None,
+    )
+    .await
+    .unwrap();
 
     connected(Client::builder(test_dsn()).max_pool_size(5).build().unwrap()).await
 }
@@ -184,9 +189,14 @@ async fn setup_with_cache(schema: &SchemaDescriptor) -> Client {
     pylon_core::migrate::ensure_internal_schema(&pool).await.unwrap();
     pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
     pool.batch_execute(&ddl).await.unwrap();
-    pylon_core::migrate::write_schema_snapshot(&pool, &serde_json::to_string(schema).unwrap())
-        .await
-        .unwrap();
+    pylon_core::migrate::write_schema_snapshot(
+        &pool,
+        &serde_json::to_string(schema).unwrap(),
+        pylon_core::migrate::SchemaWriter::Apply,
+        None,
+    )
+    .await
+    .unwrap();
 
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let cache_dir = std::env::temp_dir().join(format!("pylon-client-live-test-cache-{nanos}"));
