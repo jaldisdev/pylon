@@ -196,7 +196,10 @@ async def _apply(
             click.echo('Already up to date.')
             return
 
-        applied_ids = {id_ for id_, _onto, _db_state, _schema_state, _applied in tracking}
+        # Applied rows only: `migration create` now pre-inserts a row for the
+        # migration it writes, and treating one of those as proof that a
+        # squash's constituents already ran would skip its DDL entirely.
+        applied_ids = {id_ for id_, _onto, _db_state, _schema_state, applied in tracking if applied}
         for m in pending:
             # §12 squash compatibility: if any of this migration's squashed
             # constituent IDs are already in the tracking table, the DB was
@@ -209,24 +212,48 @@ async def _apply(
             await _apply_one(pool, m, dev_mode)
             applied_ids.add(m.id)
 
-        # Store a db_state + schema_state snapshot on the tip row so the next
-        # `migration create` has a correct baseline without needing to apply
-        # pending migrations first. schema_state is the full descriptor
-        # (including schema semantics with zero DDL footprint — readonly,
-        # rewrites, channels, ...) that db_state alone can't represent.
+        # The baseline the next `migration create` diffs against. `create`
+        # records it on the row it writes, and that recording is the truth —
+        # re-deriving one from the schema files here is what used to corrupt
+        # it, since the files have usually moved on by the time a migration
+        # is applied.
         tip = pending[-1]
-        schema = _reload_schema(config)
-        db_state_snapshot = schema_to_db_state_json(schema)
-        await pool.execute(
-            'UPDATE _pylon."Migrations" SET db_state = $1::jsonb, schema_state = $2::jsonb WHERE id = $3',
-            [db_state_snapshot, schema.to_json(), tip.id],
-        )
+        recorded = {id_: (db, sch) for id_, _onto, db, sch, _applied in tracking}
+        schema_json: str | None = None
 
-        # Update the schema snapshot every client fetches at startup — this
-        # migration just changed what the live database actually looks like,
-        # so clients should see it now, not whatever the schema files say
-        # (those have no effect until migrated, by design).
-        await migration_write_schema_snapshot(pool, schema.to_json())
+        if tip.id in recorded:
+            tip_db_state, schema_json = recorded[tip.id]
+            if tip_db_state is None:
+                click.echo(
+                    f'\n{tip.filename} was created with changes left out, so the state it reaches '
+                    'is not the compiled schema and no baseline was recorded for it.'
+                    "\nThe next 'pylon migration create' will diff against the live database instead."
+                )
+        elif tip.id == chain[-1].id:
+            # No recorded baseline (created on another machine, or by a Pylon
+            # that predates this), but the whole on-disk chain is applied — so
+            # the schema files do describe the state just reached.
+            schema = _reload_schema(config)
+            schema_json = schema.to_json()
+            await pool.execute(
+                'UPDATE _pylon."Migrations" SET db_state = $1::jsonb, schema_state = $2::jsonb WHERE id = $3',
+                [schema_to_db_state_json(schema), schema_json, tip.id],
+            )
+        else:
+            # Stopped short of the chain tip with nothing recorded to fall
+            # back on: the files describe the end of the chain, not this
+            # migration. A later full apply fills it in.
+            click.echo(
+                f'\nStopped at {tip.filename}, which carries no recorded baseline — none written. '
+                'Apply the rest of the chain before creating a migration.'
+            )
+
+        # The schema snapshot every client fetches at startup. Only written
+        # from a state the database is actually known to be in — publishing
+        # the schema files' shape over an unknown one would advertise
+        # pointers that aren't there.
+        if schema_json is not None:
+            await migration_write_schema_snapshot(pool, schema_json)
 
     finally:
         await lock.unlock()
@@ -946,10 +973,12 @@ def _reorder_for_presentation(steps: list, schema) -> list[int]:
     return order
 
 
-def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tuple[str, bool]], bool]:
+def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tuple[str, bool]], bool, bool]:
     """Interactively walk each general create/alter/drop step one at a time.
 
-    Returns (confirmed, quit_requested). `confirmed` is a list of
+    Returns (confirmed, quit_requested, complete), where `complete` means
+    every step was accepted — i.e. the migration reaches the compiled schema,
+    which is what makes its baseline recordable. `confirmed` is a list of
     (sql, non_transactional) tuples, in `steps`' original (dependency-safe)
     order — the same shape `_assemble_migration_body` already expects —
     with any `required_input` placeholders already resolved (see
@@ -987,13 +1016,13 @@ def _migration_prompt_loop(steps: list, schema, expert: bool) -> tuple[list[tupl
         elif action == 's':
             break
         elif action == 'q':
-            return [], True
+            return [], True, False
 
     confirmed: list[tuple[str, bool]] = []
     for i in range(len(steps)):
         if decisions[i] == 'y':
             confirmed.extend(resolved[i])
-    return confirmed, False
+    return confirmed, False, all(d == 'y' for d in decisions)
 
 
 def _fill_prompt_loop(
@@ -1080,14 +1109,17 @@ async def _create_from_diff(
 
     from pylon._core import (
         SchemaDescriptor,
+        compute_migration_id,
         compute_migration_short_id,
         db_state_from_json,
         introspect_db_state,
         migration_applied_tip,
         migration_ensure_internal_schema,
         migration_read_tracking,
+        migration_record_baseline,
         pgcon_connect,
         render_migration_file,
+        schema_to_db_state_json,
     )
     from pylon._core import (
         changed_index_backfills as _core_changed_index_backfills,
@@ -1183,11 +1215,16 @@ async def _create_from_diff(
         if quit_requested:
             raise click.ClickException('Aborted.')
 
+    # Whether the migration being written ends at the compiled schema. Only
+    # then is there a state to record as the next create's baseline.
+    reaches_schema = True
+
     if stop_early:
         # "stop" during rename prompts: finalize with only what's been
         # confirmed so far, skipping fill detection and the general diff
         # entirely — same semantics as "stop" anywhere else in the flow.
         ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames)
+        reaches_schema = False
     else:
         # ── Fill expression detection ──────────────────────────────────────
         fill_candidates = _core_detect_fill_required(schema, db_state)
@@ -1198,7 +1235,7 @@ async def _create_from_diff(
         )
 
         if is_interactive:
-            confirmed_ddl, quit_requested = _migration_prompt_loop(steps, schema, expert)
+            confirmed_ddl, quit_requested, reaches_schema = _migration_prompt_loop(steps, schema, expert)
             if quit_requested:
                 raise click.ClickException('Aborted.')
             ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames) + confirmed_ddl
@@ -1303,6 +1340,22 @@ async def _create_from_diff(
 
     (d / filename).write_text(content)
     click.echo(f'\nCreated {filename}')
+
+    # Record what this migration reaches, now, while it is still known.
+    # `apply` consumes this instead of guessing from the schema files.
+    migration_id = compute_migration_id(body, onto)
+    if reaches_schema:
+        await migration_record_baseline(
+            pool, migration_id, onto, stem, schema_to_db_state_json(schema), schema.to_json()
+        )
+    else:
+        await migration_record_baseline(pool, migration_id, onto, stem)
+        click.echo(
+            'Some changes were left out, so this migration does not reach the compiled schema '
+            'and no diff baseline was recorded.'
+            "\nOnce it is applied, the next 'migration create' diffs against the live database, "
+            'which re-proposes unchanged functions and interface types.'
+        )
 
 
 def _non_ddl_change_marker_sql(schema) -> str:

@@ -4,6 +4,27 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.8.0
+
+### Migrations
+
+* `migration create` now records the state a migration reaches on that
+  migration's own tracking row, and `migration apply` reads it rather than
+  deriving one from the schema files. Since `create` refuses to run while
+  anything is pending, editing the schema between creating a migration and
+  applying it is the normal way to work — and every such edit used to be
+  recorded as though it were already live. The next `create` then diffed
+  against a database that never existed: a schema that had grown lost the
+  delta under "No schema changes detected", one that had shrunk re-emitted
+  statements the previous migration already carried.
+* A migration created with changes left out — a rejected step, or stopping
+  the prompt loop early — doesn't reach the compiled schema, so it records
+  no baseline at all and says so. The next `create` falls back to
+  introspecting the live database.
+* `migration apply --to` no longer writes a baseline derived from the schema
+  files when it stops short of the chain tip, and no longer publishes those
+  files' shape to `_pylon."Schema"` for clients to read.
+
 ## 0.7.0 — 2026-10-16
 
 ### Full-text search

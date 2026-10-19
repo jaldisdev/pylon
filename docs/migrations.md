@@ -26,7 +26,7 @@ Postgres itself remembers which migrations have been applied, in `_pylon."Migrat
 1. Takes a session-level Postgres advisory lock, so concurrent `apply` invocations serialize instead of racing (`--no-wait` fails fast instead of blocking if another one already holds it).
 2. Reads the tracking table's recorded tip and compares it against the on-disk chain. If the recorded tip isn't found in the chain at all, that's treated as **diverged history** and refused outright — Pylon won't guess which side is right.
 3. Applies everything between the recorded tip and the chain tip (or `--to ID`), one migration at a time, each in its own transaction (or transaction-per-step, for a file with `-- pylon:step` markers).
-4. Records a schema snapshot on the newly-applied tip row — this is what `pylon migration create`'s next run diffs against as its baseline, not a fresh live-database introspection, so it stays correct even if `watch` has touched the database since.
+4. Stamps the newly-applied tip row as applied. The schema snapshot on that row — what `pylon migration create`'s next run diffs against as its baseline, rather than a fresh live-database introspection, so it stays correct even if `watch` has touched the database since — was already written by `create`, and `apply` leaves it alone. Only `create` knows what state a migration is meant to reach; deriving it here from the schema files would record whatever you happened to have edited since.
 
 ## Creating a migration
 
@@ -35,6 +35,8 @@ pylon migration create
 ```
 
 Every unapplied migration must already be applied before you can create a new one — `create` needs the live database to actually be at the chain tip to diff against, otherwise the diff would be computed against a moving target.
+
+Writing the file also records, on the migration's own tracking row, the state that migration reaches. Editing the schema afterwards (which the rule above makes the normal way to work) therefore can't move the baseline out from under it. A migration created with changes left out — a rejected step, or stopping the prompt loop early — doesn't reach the compiled schema, so no baseline is recorded for it and the next `create` falls back to introspecting the live database, which re-proposes unchanged functions and interface types.
 
 The diff engine compares your compiled schema against the database's introspected structure and produces a sequence of steps: create/alter/drop table, add/drop/alter column, create/drop index, install/replace function, and so on. Two categories need special handling beyond a plain accept/reject:
 

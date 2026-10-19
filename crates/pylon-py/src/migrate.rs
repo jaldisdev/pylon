@@ -122,6 +122,29 @@ fn migration_record_applied<'py>(
     })
 }
 
+/// Records the diff baseline a freshly created migration reaches, on a row
+/// that stays unapplied until `apply` stamps it. Passing neither snapshot
+/// marks the baseline as unknown — see `pylon_core::migrate::record_baseline`.
+#[pyfunction]
+#[pyo3(signature = (pool, id, onto, filename, db_state=None, schema_state=None))]
+fn migration_record_baseline<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    id: String,
+    onto: String,
+    filename: String,
+    db_state: Option<String>,
+    schema_state: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let state = db_state.as_deref().zip(schema_state.as_deref());
+        core_migrate::record_baseline(&pool, &id, &onto, &filename, state)
+            .await
+            .map_err(migrate_err)
+    })
+}
+
 /// Applies one migration's steps in order (resuming from recorded progress,
 /// running dev-mode savepoint retry when `dev_mode` is set) — see
 /// `pylon_core::migrate::apply_one`.
@@ -229,6 +252,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migration_read_tracking, m)?)?;
     m.add_function(wrap_pyfunction!(migration_applied_tip, m)?)?;
     m.add_function(wrap_pyfunction!(migration_record_applied, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_record_baseline, m)?)?;
     m.add_function(wrap_pyfunction!(migration_apply_one, m)?)?;
     m.add_function(wrap_pyfunction!(migration_advisory_lock, m)?)?;
     m.add_function(wrap_pyfunction!(migration_try_advisory_lock, m)?)?;

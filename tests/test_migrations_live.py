@@ -548,3 +548,98 @@ def test_channel_addition_is_captured_by_migration_create(live_pool, tmp_path, u
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+@pytest.mark.parametrize('direction', ['grown', 'shrunk'])
+def test_baseline_survives_schema_edits_between_create_and_apply(live_pool, tmp_path, unique_module, direction):
+    """`create` refuses to run while anything is pending, so editing the
+    schema between creating a migration and applying it is the normal way to
+    work. `apply` used to derive the tip's diff baseline from whatever the
+    schema files said when it ran, so those edits got recorded as already
+    live and the next `create` diffed against a database that never existed:
+    a grown schema lost the delta ("No schema changes detected"), a shrunk
+    one re-emitted statements the previous migration already carried.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module(f'live_baseline_{direction}')
+    (tmp_path / 'migrations').mkdir()
+    schema_file = tmp_path / f'baseline_{direction}_schema.py'
+
+    def write_schema(with_gadget: bool) -> None:
+        gadget = (
+            f'\n@pylon.type(module={module!r}, name="Gadget")\nclass Gadget:\n    label: pylon.Property[str]\n'
+            if with_gadget
+            else ''
+        )
+        schema_file.write_text(
+            'import pylon.schema as pylon\n\n'
+            f'@pylon.type(module={module!r}, name="Widget")\n'
+            'class Widget:\n'
+            '    name: pylon.Property[str]\n' + gadget
+        )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / 'migrations'
+
+    # "grown" creates without Gadget and then adds it; "shrunk" is the mirror.
+    created_with_gadget = direction == 'shrunk'
+
+    try:
+        write_schema(with_gadget=created_with_gadget)
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        first_files = sorted(migrations_dir.glob('*.sql'))
+        assert len(first_files) == 1, result.output
+
+        # The edit `apply` used to mistake for the state it had just reached.
+        write_schema(with_gadget=not created_with_gadget)
+
+        # Creating on top of a pending migration stays refused, as in Gel.
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 1, result.output
+        assert 'unapplied migration(s)' in result.output, result.output
+
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        if direction == 'grown':
+            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            assert result.exit_code == 0, result.output
+            assert 'No schema changes detected' not in result.output, result.output
+            second_files = sorted(migrations_dir.glob('*.sql'))
+            assert len(second_files) == 2, [f.name for f in second_files]
+            new_file = next(f for f in second_files if f not in first_files)
+            assert 'Gadget' in new_file.read_text(), new_file.read_text()
+        else:
+            # Gadget is back in the files and really is in the database, so
+            # there is nothing left to migrate.
+            write_schema(with_gadget=True)
+            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            assert result.exit_code == 0, result.output
+            assert 'No schema changes detected' in result.output, result.output
+            assert sorted(migrations_dir.glob('*.sql')) == first_files, result.output
+    finally:
+        migration_ids = re.findall(
+            r'^-- migration: (\S+)$',
+            '\n'.join(f.read_text() for f in migrations_dir.glob('*.sql')),
+            re.MULTILINE,
+        )
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())

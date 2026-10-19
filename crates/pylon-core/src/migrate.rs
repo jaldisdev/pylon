@@ -434,6 +434,62 @@ async fn record_applied_in_tx(tx: &PgTransaction, id: &str, onto: &str, filename
     Ok(())
 }
 
+/// `WHERE applied_at IS NULL` keeps an applied migration's baseline
+/// immutable — re-running `create` for an already-applied ID must not
+/// overwrite the state it reached with a freshly compiled one.
+const RECORD_BASELINE_SQL: &str = r#"
+    INSERT INTO _pylon."Migrations" (id, onto, filename, db_state, schema_state)
+    VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+    ON CONFLICT (id) DO UPDATE
+        SET onto = EXCLUDED.onto,
+            filename = EXCLUDED.filename,
+            db_state = EXCLUDED.db_state,
+            schema_state = EXCLUDED.schema_state
+        WHERE _pylon."Migrations".applied_at IS NULL
+"#;
+
+/// `DO NOTHING`, so a row that already carries a baseline never has it
+/// cleared.
+const RECORD_BASELINE_UNKNOWN_SQL: &str = r#"
+    INSERT INTO _pylon."Migrations" (id, onto, filename)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (id) DO NOTHING
+"#;
+
+/// Records the diff baseline a freshly created migration reaches, on a row
+/// that stays unapplied until `apply` stamps it.
+///
+/// Only `create` knows this state — it holds the schema it diffed *to*.
+/// `apply` used to re-derive it from the schema files, which match only if
+/// nothing was edited in between; since `create` refuses to run while
+/// anything is pending, editing in between is the normal way to work, and
+/// every such edit got baked into the tip's baseline as though already live.
+///
+/// `state = None` marks the baseline as genuinely unknown — a migration that
+/// doesn't reach the compiled schema because a step was rejected or the
+/// prompt loop stopped early. Distinct from a migration created elsewhere,
+/// which has no row here at all.
+pub async fn record_baseline(
+    pool: &PgPool,
+    id: &str,
+    onto: &str,
+    filename: &str,
+    state: Option<(&str, &str)>,
+) -> Result<()> {
+    check_no_id_collision(pool, id, onto).await?;
+    let mut params = record_applied_params(id, onto, filename);
+    let sql = match state {
+        Some((db_state, schema_state)) => {
+            params.push(DecodedValue::Str(db_state.to_string()));
+            params.push(DecodedValue::Str(schema_state.to_string()));
+            RECORD_BASELINE_SQL
+        }
+        None => RECORD_BASELINE_UNKNOWN_SQL,
+    };
+    pool.execute_typed(sql, &params).await?;
+    Ok(())
+}
+
 async fn read_progress(pool: &PgPool, id: &str) -> Result<Option<i64>> {
     let rows = pool
         .query_typed(
@@ -1043,14 +1099,82 @@ mod tests {
             .expect("tracking row for this migration");
         assert!(row.applied);
         assert_eq!(row.onto, "initial");
-        assert_eq!(
-            row.db_state, None,
-            "db_state is only ever set separately, by `migration create`'s own UPDATE"
-        );
+        assert_eq!(row.db_state, None, "both snapshots come from `record_baseline` alone");
         assert_eq!(
             row.schema_state, None,
-            "schema_state is only ever set separately, by `apply`'s own UPDATE"
+            "both snapshots come from `record_baseline` alone"
         );
+
+        cleanup_migration_row(&pool, &m.id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_recorded_baseline_survives_the_migration_being_applied() {
+        let pool = test_pool().await;
+        let m = make_migration("initial", &body("SELECT 1;"));
+        let db_state = r#"{"schemas":["default"]}"#;
+        let schema_state = r#"{"types":[]}"#;
+
+        record_baseline(&pool, &m.id, &m.onto, &m.filename, Some((db_state, schema_state)))
+            .await
+            .unwrap();
+
+        let tracking = read_tracking(&pool).await.unwrap();
+        let row = tracking.iter().find(|r| r.id == m.id).unwrap();
+        assert!(!row.applied, "create records a row that is not yet applied");
+        assert!(row.db_state.is_some());
+
+        record_applied(&pool, &m.id, &m.onto, &m.filename).await.unwrap();
+
+        let tracking = read_tracking(&pool).await.unwrap();
+        let row = tracking.iter().find(|r| r.id == m.id).unwrap();
+        assert!(row.applied);
+        assert_eq!(row.db_state.as_deref(), Some(r#"{"schemas": ["default"]}"#));
+        assert_eq!(row.schema_state.as_deref(), Some(r#"{"types": []}"#));
+
+        cleanup_migration_row(&pool, &m.id).await;
+    }
+
+    /// Re-running `create` for an ID that is already applied must not
+    /// replace the state that migration reached with a freshly compiled one.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn an_applied_migrations_baseline_is_immutable() {
+        let pool = test_pool().await;
+        let m = make_migration("initial", &body("SELECT 1;"));
+
+        record_baseline(&pool, &m.id, &m.onto, &m.filename, Some((r#"{"schemas":["a"]}"#, "{}")))
+            .await
+            .unwrap();
+        record_applied(&pool, &m.id, &m.onto, &m.filename).await.unwrap();
+        record_baseline(&pool, &m.id, &m.onto, &m.filename, Some((r#"{"schemas":["b"]}"#, "{}")))
+            .await
+            .unwrap();
+
+        let tracking = read_tracking(&pool).await.unwrap();
+        let row = tracking.iter().find(|r| r.id == m.id).unwrap();
+        assert_eq!(row.db_state.as_deref(), Some(r#"{"schemas": ["a"]}"#));
+
+        cleanup_migration_row(&pool, &m.id).await;
+    }
+
+    /// A migration that doesn't reach the compiled schema gets a row with no
+    /// snapshots — "baseline unknown", which `apply` must tell apart from a
+    /// migration created elsewhere that has no row at all.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_baseline_recorded_as_unknown_leaves_both_snapshots_null() {
+        let pool = test_pool().await;
+        let m = make_migration("initial", &body("SELECT 1;"));
+
+        record_baseline(&pool, &m.id, &m.onto, &m.filename, None).await.unwrap();
+
+        let tracking = read_tracking(&pool).await.unwrap();
+        let row = tracking.iter().find(|r| r.id == m.id).expect("row exists");
+        assert!(!row.applied);
+        assert_eq!(row.db_state, None);
+        assert_eq!(row.schema_state, None);
 
         cleanup_migration_row(&pool, &m.id).await;
     }
