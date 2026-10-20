@@ -1138,13 +1138,21 @@ fn verbosename_function(module: &str, name: &str) -> String {
 }
 
 /// Accumulates `DiffOp`s into `MigrationStep`s keyed by `OpKey`, preserving
-/// first-insertion order. A key's verb/description are fixed by whichever
-/// call inserts it first; later calls under the same key just append DDL
-/// (and any required-input entries).
+/// first-insertion order — except that a foreign-key step always renders
+/// after every step that creates a table (see `finish`). A key's
+/// verb/description are fixed by whichever call inserts it first; later
+/// calls under the same key just append DDL (and any required-input
+/// entries).
 #[derive(Default)]
 struct StepBuilder {
     order: Vec<OpKey>,
     drafts: HashMap<OpKey, (Verb, String, Vec<DiffOp>, Vec<RequiredInput>)>,
+    /// Keys whose DDL creates a table, so `finish` knows which steps every
+    /// foreign key has to wait for. Derived from the statements themselves
+    /// rather than flagged at the call site: a new table emitter that
+    /// forgot to flag itself would reintroduce an unapplyable migration,
+    /// and the only way to create one here is to emit a `CREATE TABLE`.
+    creates_table: HashSet<OpKey>,
 }
 
 impl StepBuilder {
@@ -1171,6 +1179,9 @@ impl StepBuilder {
         if ops.is_empty() && inputs.is_empty() {
             return;
         }
+        if ops.iter().any(|op| op.sql.trim_start().starts_with("CREATE TABLE")) {
+            self.creates_table.insert(key.clone());
+        }
         use std::collections::hash_map::Entry;
         match self.drafts.entry(key.clone()) {
             Entry::Occupied(mut e) => {
@@ -1189,9 +1200,49 @@ impl StepBuilder {
         self.order.iter().position(|existing| existing == key)
     }
 
+    /// Insertion order, with every foreign-key step that landed ahead of a
+    /// table-creating one moved to just behind the last of those.
+    ///
+    /// `OpKey::ForeignKey` exists to keep foreign keys out of their own
+    /// table's step precisely so they can render after every table, but
+    /// insertion order alone does not deliver that: a junction table's
+    /// `CREATE TABLE` is folded into its *owner's* `OpKey::Table` step
+    /// (Phase 7), and when that owner's table already exists with no other
+    /// column change, Phase 4/5 contributes nothing, so the owner's step
+    /// does not exist yet when Phase 6b opens the junction's foreign-key
+    /// step. The result was a migration that added a constraint to a table
+    /// three statements before creating it.
+    ///
+    /// Only the steps that have to move do, so every other step keeps the
+    /// position its phase gave it.
+    fn deferred_fk_order(order: Vec<OpKey>, creates_table: &HashSet<OpKey>) -> Vec<OpKey> {
+        let Some(last_create) = order.iter().rposition(|key| creates_table.contains(key)) else {
+            return order;
+        };
+        let mut reordered = Vec::with_capacity(order.len());
+        let mut deferred = Vec::new();
+        for (i, key) in order.into_iter().enumerate() {
+            if i < last_create && matches!(key, OpKey::ForeignKey(..)) {
+                deferred.push(key);
+                continue;
+            }
+            reordered.push(key);
+            // `last_create` names a table-creating step, which a foreign-key
+            // step never is, so this index is always one that was kept.
+            if i == last_create {
+                reordered.append(&mut deferred);
+            }
+        }
+        reordered
+    }
+
     fn finish(self) -> Vec<MigrationStep> {
-        let Self { order, mut drafts } = self;
-        order
+        let Self {
+            order,
+            mut drafts,
+            creates_table,
+        } = self;
+        Self::deferred_fk_order(order, &creates_table)
             .into_iter()
             .map(|key| {
                 let (verb, object_desc, ddl, required_input) = drafts.remove(&key).unwrap();
@@ -4890,6 +4941,94 @@ mod tests {
             joined.contains("ADD CONSTRAINT \"Order_customer_fkey\" FOREIGN KEY (\"customer_id\") REFERENCES \"public\".\"Person\"(id)"),
             "new table's plain link must get its FK constraint in the same diff; got:\n{joined}"
         );
+    }
+
+    #[test]
+    fn test_a_new_junction_table_is_created_before_its_target_fk() {
+        // The emitted migration was unapplyable: Phase 6b's junction target
+        // FK rendered ahead of the `CREATE TABLE` it constrains, so `apply`
+        // died on `relation "perspective"."Report.tags" does not exist`.
+        //
+        // The ordering only broke for an owner whose table already exists
+        // and whose columns are otherwise unchanged — adding a multi-link
+        // to an interface is exactly that shape. Phase 4/5 then contributes
+        // no DDL for the owner, so `StepBuilder` never opens its
+        // `OpKey::Table` step, and Phase 7 opens it (carrying the junction's
+        // `CREATE TABLE`) only *after* Phase 6b has already inserted the
+        // `OpKey::ForeignKey` one. Against an empty database the same schema
+        // ordered fine, which is why both states are checked here.
+        use crate::schema::MultiLinkDescriptor;
+
+        fn tags_multilink() -> MultiLinkDescriptor {
+            MultiLinkDescriptor {
+                name: "tags".into(),
+                target: "resources::Tag".into(),
+                through: None,
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                on_delete: vec![],
+                is_exclusive: false,
+            }
+        }
+
+        let mut perspective = simple_type("perspective", "Perspective", "Perspective");
+        perspective.abstract_ = true;
+        perspective.materialized = true;
+
+        let mut report = simple_type("perspective", "Report", "Report");
+        report.interfaces = vec!["perspective::Perspective".into()];
+        let mut brief = simple_type("perspective", "Brief", "Brief");
+        brief.interfaces = vec!["perspective::Perspective".into()];
+
+        let before = SchemaDescriptor {
+            types: vec![perspective, report, brief, simple_type("resources", "Tag", "Tag")],
+            scalars: vec![],
+            enums: vec![],
+            named_tuples: vec![],
+            globals: vec![],
+            functions: vec![],
+            aliases: vec![],
+            channels: vec![],
+            ..Default::default()
+        };
+
+        let mut after = before.clone();
+        for td in &mut after.types {
+            if td.module == "perspective" {
+                td.multilinks.push(tags_multilink());
+            }
+        }
+
+        for (label, current) in [
+            ("an empty database", empty_state()),
+            (
+                "a database already carrying the owner tables",
+                schema_to_db_state(&before),
+            ),
+        ] {
+            let sql: Vec<String> = diff_schema_ops(&after, &current)
+                .unwrap()
+                .into_iter()
+                .map(|op| op.sql)
+                .collect();
+            let joined = sql.join("\n");
+            for owner in ["Report", "Brief"] {
+                let create = sql
+                    .iter()
+                    .position(|s| s.contains(&format!("CREATE TABLE IF NOT EXISTS \"perspective\".\"{owner}.tags\"")))
+                    .unwrap_or_else(|| panic!("no junction CREATE TABLE for {owner} against {label}; got:\n{joined}"));
+                let add_fk = sql
+                    .iter()
+                    .position(|s| s.contains(&format!("ADD CONSTRAINT \"{owner}_tags_target_fkey\"")))
+                    .unwrap_or_else(|| panic!("no junction target FK for {owner} against {label}; got:\n{joined}"));
+                assert!(
+                    create < add_fk,
+                    "against {label}, \"{owner}.tags\" must be created (op {create}) \
+                     before its target FK is added (op {add_fk}); got:\n{joined}"
+                );
+            }
+        }
     }
 
     #[test]

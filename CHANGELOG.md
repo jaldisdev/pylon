@@ -35,6 +35,13 @@ from the same version number.
   says *what* drifted.
 * `migration log --from-db` shows a created-but-unapplied migration as
   `(pending)` rather than printing `None` for its timestamp.
+* Adding a multi-link to a type whose table already exists produced a
+  migration that could not be applied: the junction table's target foreign
+  key rendered ahead of the `CREATE TABLE` for the junction itself, so
+  `apply` stopped on `relation "…" does not exist` and the file had to be
+  reordered by hand and re-hashed. A foreign-key step now sorts after every
+  step that creates a table. Most visible on an interface, where one
+  multi-link means a junction table per implementor.
 * `_pylon."Internal".version` is now 2: `_pylon."Schema"` gained
   `written_by` (a `_pylon."SchemaWriter"` enum) and `written_onto`. Additive,
   so the minimum supported version is unchanged.

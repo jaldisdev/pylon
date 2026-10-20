@@ -771,3 +771,106 @@ def test_apply_rebases_onto_watch_drift_without_being_told_to(live_pool, tmp_pat
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_multilink_added_to_an_interface_applies_without_hand_reordering(live_pool, tmp_path, unique_module):
+    """Adding a multi-link to an interface with two concrete implementors
+    produced a migration that could not be applied: the junction target
+    foreign keys rendered ahead of the `CREATE TABLE` statements for the
+    junction tables they constrain, so `apply` died on `relation
+    "<module>"."Report.tags" does not exist` and the file had to be
+    hand-reordered and `migration rehash`-ed before it would run.
+
+    Drives the real `create`/`apply` CLI flow, since the ordering bug only
+    showed up in a *second* migration against a database where the
+    implementors' tables already exist — diffing the same schema against an
+    empty database happened to order correctly.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_iface_multilink')
+    # The link target lives in a *different* module on purpose: that is what
+    # makes the junction's target FK cross Postgres schemas, which is why it
+    # can't be folded into the junction's own CREATE TABLE the way the
+    # source-side reference is.
+    target_module = unique_module('live_iface_tags')
+    (tmp_path / 'migrations').mkdir()
+    schema_file = tmp_path / 'perspective_schema.py'
+
+    def write_schema(with_tags: bool) -> None:
+        tags_line = '    tags: pylon.MultiLink[Tag, pylon.OnDelete(pylon.Target, pylon.Allow)]\n' if with_tags else ''
+        schema_file.write_text(
+            'import pylon.schema as pylon\n\n'
+            f"@pylon.type(module={target_module!r}, name='Tag')\n"
+            'class Tag:\n'
+            '    label: str\n\n'
+            f"@pylon.interface(module={module!r}, name='Perspective')\n"
+            'class Perspective:\n'
+            '    title: str\n'
+            f'{tags_line}\n'
+            f"@pylon.type(module={module!r}, name='Report')\n"
+            'class Report(Perspective):\n'
+            '    pages: int\n\n'
+            f"@pylon.type(module={module!r}, name='Brief')\n"
+            'class Brief(Perspective):\n'
+            '    summary: str\n'
+        )
+
+    write_schema(with_tags=False)
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / 'migrations'
+
+    try:
+        # Baseline: the two implementors' tables and the interface's view.
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        first_files = sorted(migrations_dir.glob('*.sql'))
+        assert len(first_files) == 1, result.output
+
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        # The change under test: every implementor gains its own junction
+        # table, and the interface gains a view over them.
+        write_schema(with_tags=True)
+
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        second_files = sorted(migrations_dir.glob('*.sql'))
+        assert len(second_files) == 2, [f.name for f in second_files]
+
+        body = next(f for f in second_files if f not in first_files).read_text()
+        for owner in ('Report', 'Brief'):
+            create_at = body.index(f'CREATE TABLE IF NOT EXISTS "{module}"."{owner}.tags"')
+            fk_at = body.index(f'ADD CONSTRAINT "{owner}_tags_target_fkey"')
+            assert create_at < fk_at, f'{owner}.tags constrained before it is created:\n{body}'
+
+        # The acceptance criterion: no hand-editing, no `migration rehash`.
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+    finally:
+        migration_ids = re.findall(
+            r'^-- migration: (\S+)$',
+            '\n'.join(f.read_text() for f in migrations_dir.glob('*.sql')),
+            re.MULTILINE,
+        )
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{target_module}" CASCADE;')
+
+        asyncio.run(cleanup())
