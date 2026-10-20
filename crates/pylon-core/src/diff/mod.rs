@@ -2195,6 +2195,10 @@ fn diff_inner(
         })
         .collect();
     let polymorphic = crate::export::polymorphic_types(target);
+    // Every view this schema wants, with the implementor relations each one
+    // reads — Phases 10/10.5 create them, Phase 3.9 and the table phases
+    // take the ones in the way down first.
+    let target_generated_views = crate::export::generated_views(target);
 
     // Every kind of top-level declaration can live in a module of its own,
     // including one with no types/scalars/enums at all (see the matching
@@ -2537,8 +2541,42 @@ fn diff_inner(
         }
     }
 
+    // ── Phase 3.9: drop views the schema no longer declares ──────────────────
+    // An interface demoted to a mixin, or one whose junction-backed exclusive
+    // link is gone, leaves a view nothing recreates — the same reasoning
+    // Phase 12 applies to a table the schema stopped declaring.
+    //
+    // Ahead of the table phases rather than after them (where this used to
+    // sit, as Phase 10.6) because such a view is often the very thing
+    // blocking the table work: it still selects columns the implementors are
+    // about to drop, and Postgres refuses to drop a column a view depends
+    // on. Nothing recreates these, so taking them down early costs nothing.
+    let target_views: HashSet<(&str, &str)> = target_generated_views
+        .iter()
+        .map(|v| (v.module.as_str(), v.name.as_str()))
+        .collect();
+    for view in &current.views {
+        if !target_views.contains(&(view.schema.as_str(), view.name.as_str())) {
+            steps.push(
+                OpKey::View(view.schema.clone(), view.name.clone()),
+                Verb::Drop,
+                verbosename_interface(&view.schema, &view.name),
+                DiffOp {
+                    sql: format!("DROP VIEW IF EXISTS {};", qn(&view.schema, &view.name)),
+                    non_transactional: false,
+                },
+            );
+        }
+    }
+
     // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
     let sort_order = topo_sort_types(&target.types, &polymorphic);
+
+    // Interface views taken down by a table phase because they select a
+    // column it drops or retypes. Phases 10/10.5 have to rebuild every one
+    // of these even when its own definition is unchanged — otherwise the
+    // migration leaves the interface without a relation at all.
+    let mut torn_down_views: HashSet<(String, String)> = HashSet::new();
 
     // Track which tables are created in this diff (needed for CONCURRENTLY decision).
     let mut new_tables: HashSet<(String, String)> = HashSet::new();
@@ -2568,7 +2606,21 @@ fn diff_inner(
                     .unwrap_or_default();
                 let mut local: Vec<DiffOp> = Vec::new();
                 let mut inputs: Vec<RequiredInput> = Vec::new();
-                emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target, &mut inputs);
+                let blocks_views =
+                    emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target, &mut inputs);
+                if blocks_views {
+                    let teardown = view_teardown(
+                        &target_generated_views,
+                        &cur_views,
+                        &td.module,
+                        &td.table,
+                        &mut torn_down_views,
+                    );
+                    // At the head of this table's own statements: the
+                    // blocked changes are interleaved with the harmless
+                    // ones, so the teardown has to precede all of them.
+                    local.splice(0..0, teardown);
+                }
                 steps.extend_with_input(
                     OpKey::Table(td.module.clone(), td.table.clone()),
                     Verb::Alter,
@@ -2889,91 +2941,51 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 10: interface views (after all tables exist) ───────────────────
-    // In watch mode always re-emit (CREATE OR REPLACE VIEW is idempotent).
-    // In migration mode only emit new or changed views.
-    for (module, name, ddl) in crate::export::interface_view_ddl_with_names(target) {
-        let emit = if for_migration {
-            let hash = ddl_hash(&ddl);
-            cur_views
-                .get(&(module.as_str(), name.as_str()))
-                .map(|&h| h != hash)
-                .unwrap_or(true)
-        } else {
-            true
-        };
-        if emit {
-            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) {
-                Verb::Alter
+    // ── Phase 10: interface object views (after all tables exist) ────────────
+    // In watch mode always re-emit. In migration mode emit the ones that are
+    // new, whose definition changed, or that a table phase took down to get
+    // at a column underneath them.
+    //
+    // ── Phase 10.5: interface link views ─────────────────────────────────────
+    // Same treatment, one phase later — see `export::generated_views` for why
+    // a multi-link needs a view of its own at all (its values live in each
+    // implementor's separate junction table, never on the owner row). Must
+    // run before Phase 11.5, which queries these views from the
+    // cross-implementor exclusivity triggers it emits.
+    use crate::export::GeneratedViewKind;
+    for kind in [GeneratedViewKind::Object, GeneratedViewKind::Link] {
+        for view in target_generated_views.iter().filter(|v| v.kind == kind) {
+            let key = (view.module.as_str(), view.name.as_str());
+            let exists = cur_views.contains_key(&key);
+            let emit = if for_migration {
+                torn_down_views.contains(&(view.module.clone(), view.name.clone()))
+                    || cur_views.get(&key).map(|&h| h != ddl_hash(&view.ddl)).unwrap_or(true)
             } else {
-                Verb::Create
+                true
             };
-            steps.push(
-                OpKey::View(module.clone(), name.clone()),
-                verb,
-                verbosename_interface(&module, &name),
-                DiffOp {
-                    sql: ddl,
-                    non_transactional: false,
-                },
-            );
-        }
-    }
-
-    // ── Phase 10.5: junction-backed exclusive link cross-implementor views ───
-    // Same add/hash-diff treatment as Phase 10's interface object views —
-    // see `export::interface_junction_view_ddl_with_names`'s own doc comment for
-    // why a junction-backed exclusive link needs its own helper view at
-    // all (its value lives in each implementor's own separate junction
-    // table, never on the owner row). Must run before Phase 11.5, which
-    // queries these views from the trigger functions it emits.
-    for (module, name, ddl) in crate::export::interface_junction_view_ddl_with_names(target) {
-        let emit = if for_migration {
-            let hash = ddl_hash(&ddl);
-            cur_views
-                .get(&(module.as_str(), name.as_str()))
-                .map(|&h| h != hash)
-                .unwrap_or(true)
-        } else {
-            true
-        };
-        if emit {
-            let verb = if cur_views.contains_key(&(module.as_str(), name.as_str())) {
-                Verb::Alter
-            } else {
-                Verb::Create
-            };
-            steps.push(
-                OpKey::View(module.clone(), name.clone()),
-                verb,
-                verbosename_interface(&module, &name),
-                DiffOp {
-                    sql: ddl,
-                    non_transactional: false,
-                },
-            );
-        }
-    }
-
-    // ── Phase 10.6: drop views the schema no longer declares ─────────────────
-    // An interface demoted to a mixin, or one whose junction-backed exclusive
-    // link is gone, leaves a view nothing recreates — the same reasoning
-    // Phase 12 applies to a table the schema stopped declaring.
-    let target_views: HashSet<(String, String)> = crate::export::interface_view_ddl_with_names(target)
-        .into_iter()
-        .chain(crate::export::interface_junction_view_ddl_with_names(target))
-        .map(|(module, name, _)| (module, name))
-        .collect();
-    for view in &current.views {
-        if !target_views.contains(&(view.schema.clone(), view.name.clone())) {
-            steps.push(
-                OpKey::View(view.schema.clone(), view.name.clone()),
-                Verb::Drop,
-                verbosename_interface(&view.schema, &view.name),
-                DiffOp {
-                    sql: format!("DROP VIEW IF EXISTS {};", qn(&view.schema, &view.name)),
-                    non_transactional: false,
-                },
+            if !emit {
+                continue;
+            }
+            // `CREATE VIEW` cannot replace one that is already there, and
+            // `CREATE OR REPLACE VIEW` is no help either — it refuses to
+            // change a view's column list, which is exactly what an
+            // interface gaining or losing a pointer does. So every rebuild
+            // drops first, in this same step: the two statements are one
+            // decision, and a step the interactive flow rejects must not
+            // leave the interface without a relation.
+            let mut ddl = Vec::new();
+            if exists || !for_migration {
+                push_tx(
+                    &mut ddl,
+                    format!("DROP VIEW IF EXISTS {};", qn(&view.module, &view.name)),
+                );
+            }
+            push_tx(&mut ddl, view.ddl.clone());
+            steps.extend(
+                OpKey::View(view.module.clone(), view.name.clone()),
+                if exists { Verb::Alter } else { Verb::Create },
+                verbosename_interface(&view.module, &view.name),
+                ddl,
             );
         }
     }
@@ -3601,6 +3613,47 @@ fn push_tx(ops: &mut Vec<DiffOp>, sql: String) {
     });
 }
 
+/// `DROP VIEW` for every generated interface view that already exists over
+/// `(module, table)`, recording each in `torn_down` so Phases 10/10.5 know
+/// to rebuild it.
+///
+/// Postgres refuses to drop or retype a column a view selects — "cannot
+/// drop column required_components of table ... because other objects
+/// depend on it" — and an interface view selects its pointers straight out
+/// of every implementor's table, so that work cannot start until the view
+/// is gone. Caller-side gating on *which* changes a view blocks (see
+/// `emit_column_diff`'s return value) keeps a migration that only adds
+/// columns or moves defaults around from disturbing any view.
+///
+/// `IF EXISTS` and the repetition across implementors are both deliberate:
+/// one view spans several tables, each of which gets its own step, and a
+/// step may be rejected on its own in the interactive flow — so every step
+/// that needs the view gone says so, and the ones that find it already
+/// gone are no-ops.
+fn view_teardown(
+    target_views: &[crate::export::GeneratedView],
+    existing_views: &HashMap<(&str, &str), &str>,
+    module: &str,
+    table: &str,
+    torn_down: &mut HashSet<(String, String)>,
+) -> Vec<DiffOp> {
+    let mut ops = Vec::new();
+    for view in target_views {
+        if !view.reads.iter().any(|(m, r)| m == module && r == table) {
+            continue;
+        }
+        if !existing_views.contains_key(&(view.module.as_str(), view.name.as_str())) {
+            continue;
+        }
+        torn_down.insert((view.module.clone(), view.name.clone()));
+        push_tx(
+            &mut ops,
+            format!("DROP VIEW IF EXISTS {};", qn(&view.module, &view.name)),
+        );
+    }
+    ops
+}
+
 // ── Default resolution ────────────────────────────────────────────────────────
 
 /// Return the effective SQL DEFAULT for a property, compiling `default_pyql`
@@ -3696,6 +3749,11 @@ fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
 /// `fill_cols`: column names that will be backfilled via a fill expression.
 ///   For migration mode, new NOT NULL columns in this set are added as nullable
 ///   first (the fill + SET NOT NULL comes later); in watch mode fills are unused.
+/// Returns true when it emitted a column drop or a retype — the only two
+/// column changes a dependent view stands in the way of, so the caller
+/// takes the interface views over this table down ahead of `ops` (see
+/// `view_teardown`) and leaves the rest alone.
+#[must_use]
 fn emit_column_diff(
     td: &TypeDescriptor,
     existing: &DbTable,
@@ -3704,8 +3762,9 @@ fn emit_column_diff(
     fill_cols: &HashSet<String>,
     schema: &SchemaDescriptor,
     required_input: &mut Vec<RequiredInput>,
-) {
+) -> bool {
     let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let mut blocks_dependent_views = false;
 
     // ── Add new columns ───────────────────────────────────────────────────────
     for p in &td.properties {
@@ -3776,17 +3835,10 @@ fn emit_column_diff(
         })
         .collect();
     if !type_changes.is_empty() {
-        // A column any interface view selects from can't be retyped directly
-        // — Postgres refuses ALTER COLUMN TYPE while a view depends on it —
-        // so drop those views first and recreate them (identical DDL,
-        // unaffected by a column's own type) right after.
-        let affected_views: Vec<(String, String, String)> = crate::export::interface_view_ddl_with_names(schema)
-            .into_iter()
-            .filter(|(m, n, _)| td.interfaces.contains(&format!("{}::{}", m, n)))
-            .collect();
-        for (m, n, _) in &affected_views {
-            push_tx(ops, format!("DROP VIEW IF EXISTS {};", qn(m, n)));
-        }
+        // Postgres refuses ALTER COLUMN TYPE while a view selects the
+        // column; the caller takes those views down ahead of everything
+        // here and has Phase 10 rebuild them.
+        blocks_dependent_views = true;
         for (col, target_type, has_default, to_tuple) in &type_changes {
             // Postgres checks the *existing* DEFAULT against the new type
             // before any `SET DEFAULT` further down can replace it, and
@@ -3842,9 +3894,6 @@ fn emit_column_diff(
                     placeholder
                 ),
             );
-        }
-        for (_, _, ddl) in &affected_views {
-            push_tx(ops, ddl.clone());
         }
     }
 
@@ -4006,6 +4055,9 @@ fn emit_column_diff(
         if n.starts_with("__") && n.ends_with("__") {
             continue;
         }
+        // Same reason as a retype: a view selecting this column blocks the
+        // drop outright ("because other objects depend on it").
+        blocks_dependent_views = true;
         push_tx(
             ops,
             format!(
@@ -4015,6 +4067,8 @@ fn emit_column_diff(
             ),
         );
     }
+
+    blocks_dependent_views
 }
 
 // ── FK diff for an existing table ─────────────────────────────────────────────
@@ -5032,6 +5086,102 @@ mod tests {
     }
 
     #[test]
+    fn test_a_pointer_changing_kind_brackets_the_implementor_work_with_its_interface_view() {
+        // An interface's property becoming a multi-link drops that column
+        // from every implementor, and the interface's own view selects it
+        // from all of them — so the view has to come down before the first
+        // of those drops and go back up after the last one. The emitted
+        // migration used to do neither, and `apply` died on the very first
+        // statement with "cannot drop column required_components of table
+        // ... because other objects depend on it".
+        use crate::schema::MultiLinkDescriptor;
+
+        let mut iface = simple_type("perspective", "BriefPreset", "BriefPreset");
+        iface.abstract_ = true;
+        iface.materialized = true;
+        iface.properties.push(prop("required_components", "text[]", true));
+
+        let implementors = ["SystemBriefPreset", "CustomBriefPreset"];
+        let mut types = vec![iface];
+        for name in implementors {
+            let mut t = simple_type("perspective", name, name);
+            t.interfaces = vec!["perspective::BriefPreset".into()];
+            t.properties.push(prop("required_components", "text[]", true));
+            types.push(t);
+        }
+        let before = SchemaDescriptor {
+            types,
+            ..SchemaDescriptor::default()
+        };
+
+        let mut after = before.clone();
+        for td in &mut after.types {
+            td.properties.retain(|p| p.name != "required_components");
+            td.multilinks.push(MultiLinkDescriptor {
+                name: "required_components".into(),
+                target: "perspective::Component".into(),
+                through: None,
+                nullable: true,
+                description: None,
+                default_pyql: None,
+                on_delete: vec![],
+                is_exclusive: false,
+            });
+        }
+        after.types.push(simple_type("perspective", "Component", "Component"));
+
+        let sql: Vec<String> = diff_schema_ops(&after, &schema_to_db_state(&before))
+            .unwrap()
+            .into_iter()
+            .map(|op| op.sql)
+            .collect();
+        let joined = sql.join("\n");
+        let position = |needle: &str| {
+            sql.iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("no statement containing {needle:?}; got:\n{joined}"))
+        };
+        let last_position = |needle: &str| {
+            sql.iter()
+                .rposition(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("no statement containing {needle:?}; got:\n{joined}"))
+        };
+
+        let create_view = position("CREATE VIEW \"perspective\".\"BriefPreset\"");
+        assert_eq!(
+            sql.iter()
+                .filter(|s| s.contains("CREATE VIEW \"perspective\".\"BriefPreset\" AS"))
+                .count(),
+            1,
+            "the view is rebuilt exactly once; got:\n{joined}"
+        );
+        for owner in implementors {
+            let drop_column = position(&format!(
+                "ALTER TABLE \"perspective\".\"{owner}\" DROP COLUMN IF EXISTS \"required_components\""
+            ));
+            let drop_view = sql[..drop_column]
+                .iter()
+                .rposition(|s| s.contains("DROP VIEW IF EXISTS \"perspective\".\"BriefPreset\";"))
+                .unwrap_or_else(|| panic!("nothing drops the view before {owner}'s column drop; got:\n{joined}"));
+            assert!(
+                drop_view < drop_column && drop_column < create_view,
+                "{owner}'s column drop (op {drop_column}) must sit between the view's \
+                 teardown (op {drop_view}) and its rebuild (op {create_view}); got:\n{joined}"
+            );
+        }
+
+        // The rebuilt view and its new link view both have to follow every
+        // junction table they read.
+        let create_link_view = position("CREATE VIEW \"perspective\".\"BriefPreset.required_components\"");
+        let last_junction = last_position("CREATE TABLE IF NOT EXISTS \"perspective\".\"");
+        assert!(
+            last_junction < create_link_view,
+            "the link view (op {create_link_view}) must follow every junction table \
+             it unions (last at op {last_junction}); got:\n{joined}"
+        );
+    }
+
+    #[test]
     fn test_an_existing_exclusive_multilink_junction_gains_its_unique_target() {
         use crate::schema::MultiLinkDescriptor;
 
@@ -5917,8 +6067,8 @@ mod tests {
 
         // The view's own SELECT text never mentions column types, so its
         // hash is unaffected by this migration — matching that hash in
-        // `current` confirms Phase 10 doesn't ALSO try to (redundantly,
-        // and invalidly, since it'd already exist) recreate it.
+        // `current` is what makes this the "rebuilt only because a column
+        // underneath it moved" case, which Phase 10 would otherwise skip.
         let view_ddl = crate::export::interface_view_ddl_with_names(&schema)
             .into_iter()
             .find(|(_, n, _)| n == "Account")

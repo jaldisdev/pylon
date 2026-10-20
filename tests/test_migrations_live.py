@@ -874,3 +874,151 @@ def test_multilink_added_to_an_interface_applies_without_hand_reordering(live_po
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{target_module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_interface_pointer_changing_kind_applies_without_hand_reordering(live_pool, tmp_path, unique_module):
+    """Changing a pointer's kind on an interface with two implementors
+    produced a migration that could not be applied.
+
+    An interface is materialised as a view selecting its pointers out of
+    every implementor's table, and `required_components` going from a
+    property to a multi-link drops that column from both of them. The
+    planner emitted the column drops with the view still standing, so
+    `apply` died on the first statement with "cannot drop column
+    required_components of table ... because other objects depend on it",
+    and then went on to re-`CREATE VIEW` a view it had never dropped. The
+    file had to be hand-edited and `migration rehash`-ed to get through.
+
+    Drives the real `create`/`apply` CLI flow and keeps a row in each
+    implementor: the generated statements are each well-formed on their own
+    and only their order is wrong, so a test that merely read the SQL would
+    have passed throughout.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_iface_kindchange')
+    target_module = unique_module('live_iface_components')
+    (tmp_path / 'migrations').mkdir()
+    schema_file = tmp_path / 'preset_schema.py'
+    implementors = ('SystemBriefPreset', 'CustomBriefPreset')
+
+    def write_schema(*, as_multilink: bool) -> None:
+        # Before: a scalar array property, plus a second multi-link that the
+        # change also takes away — so the migration drops one link view
+        # while rebuilding the object view, both against the same tables.
+        if as_multilink:
+            pointers = '    required_components: pylon.MultiLink[Component]\n'
+        else:
+            pointers = (
+                '    required_components: pylon.Array[pylon.Str] | None\n'
+                '    required_addons: pylon.MultiLink[Component]\n'
+            )
+        schema_file.write_text(
+            'import pylon.schema as pylon\n\n'
+            f"@pylon.type(module={target_module!r}, name='Component')\n"
+            'class Component:\n'
+            '    label: str\n\n'
+            f"@pylon.interface(module={module!r}, name='BriefPreset')\n"
+            'class BriefPreset:\n'
+            '    title: str\n'
+            f'{pointers}\n'
+            f"@pylon.type(module={module!r}, name='SystemBriefPreset')\n"
+            'class SystemBriefPreset(BriefPreset):\n'
+            '    builtin: bool\n\n'
+            f"@pylon.type(module={module!r}, name='CustomBriefPreset')\n"
+            'class CustomBriefPreset(BriefPreset):\n'
+            '    owner: str\n'
+        )
+
+    write_schema(as_multilink=False)
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    migrations_dir = tmp_path / 'migrations'
+
+    try:
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        first_files = sorted(migrations_dir.glob('*.sql'))
+        assert len(first_files) == 1, result.output
+
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        async def seed() -> None:
+            await live_pool.execute(
+                f'INSERT INTO "{module}"."SystemBriefPreset" (title, builtin, required_components)'
+                ' VALUES ($1, $2, $3)',
+                ['system', True, ['a']],
+            )
+            await live_pool.execute(
+                f'INSERT INTO "{module}"."CustomBriefPreset" (title, owner, required_components)'
+                ' VALUES ($1, $2, $3)',
+                ['custom', 'someone', ['b']],
+            )
+
+        asyncio.run(seed())
+
+        write_schema(as_multilink=True)
+
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        second_files = sorted(migrations_dir.glob('*.sql'))
+        assert len(second_files) == 2, [f.name for f in second_files]
+
+        body = next(f for f in second_files if f not in first_files).read_text()
+        rebuild_at = body.index(f'CREATE VIEW "{module}"."BriefPreset"')
+        for owner in implementors:
+            drop_column_at = body.index(f'ALTER TABLE "{module}"."{owner}" DROP COLUMN IF EXISTS')
+            teardown_at = body.rindex(f'DROP VIEW IF EXISTS "{module}"."BriefPreset";', 0, drop_column_at)
+            assert teardown_at < drop_column_at < rebuild_at, (
+                f"{owner}'s column drop must sit between the view's teardown and its rebuild:\n{body}"
+            )
+
+        # The acceptance criterion: no hand-editing, no `migration rehash`.
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+
+        async def check() -> None:
+            # The interface is queryable again, over both implementors, and
+            # its rows survived the rebuild.
+            titles = await live_pool.query_named(f'SELECT title FROM "{module}"."BriefPreset" ORDER BY title', [])
+            assert [r['title'] for r in titles] == ['custom', 'system']
+            # The pointer really is a multi-link now, with the interface's
+            # own link view standing over both implementors' junctions.
+            rows = await live_pool.query_named(
+                f'SELECT source, target FROM "{module}"."BriefPreset.required_components"', []
+            )
+            assert rows == []
+            gone = await live_pool.query_named(
+                'SELECT table_name FROM information_schema.views'
+                ' WHERE table_schema = $1 AND table_name = $2',
+                [module, 'BriefPreset.required_addons'],
+            )
+            assert gone == [], 'the dropped multi-link left its link view behind'
+
+        asyncio.run(check())
+    finally:
+        migration_ids = re.findall(
+            r'^-- migration: (\S+)$',
+            '\n'.join(f.read_text() for f in migrations_dir.glob('*.sql')),
+            re.MULTILINE,
+        )
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{target_module}" CASCADE;')
+
+        asyncio.run(cleanup())

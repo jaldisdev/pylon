@@ -42,6 +42,21 @@ from the same version number.
   reordered by hand and re-hashed. A foreign-key step now sorts after every
   step that creates a table. Most visible on an interface, where one
   multi-link means a junction table per implementor.
+* Changing a pointer on an interface type produced a migration that could
+  not be applied. An interface is materialised as a view selecting its
+  pointers out of every implementor's table, and dropping or retyping one of
+  those columns meant `apply` stopped on `cannot drop column "…" because
+  other objects depend on it`. A table step that drops or retypes a column
+  now takes the interface views over that table down first, and the views
+  are rebuilt once every table has been altered. Column changes a view does
+  not stand in the way of — added columns, moved defaults, nullability —
+  leave the views alone as before.
+* Every interface view is now rebuilt with a `DROP VIEW` of its own ahead of
+  the `CREATE VIEW`. A view whose definition changed — an interface gaining
+  or losing a pointer or an implementor — used to be re-created over the one
+  already there, so `apply` stopped on `relation "…" already exists`.
+* A view the schema no longer declares is dropped before the table work
+  rather than after it, since it is often the only thing blocking that work.
 * `_pylon."Internal".version` is now 2: `_pylon."Schema"` gained
   `written_by` (a `_pylon."SchemaWriter"` enum) and `written_onto`. Additive,
   so the minimum supported version is unchanged.

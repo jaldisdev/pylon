@@ -1969,7 +1969,7 @@ pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigg
     Ok(result)
 }
 
-/// Return `CREATE OR REPLACE VIEW` DDL for every interface type in `schema`.
+/// Return `CREATE VIEW` DDL for every interface type in `schema`.
 pub fn interface_view_ddl(schema: &SchemaDescriptor) -> Vec<String> {
     interface_view_ddl_with_names(schema)
         .into_iter()
@@ -1979,14 +1979,57 @@ pub fn interface_view_ddl(schema: &SchemaDescriptor) -> Vec<String> {
 
 /// Like `interface_view_ddl` but also returns the module and view name for each entry.
 pub fn interface_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
-    let mut implementors: HashMap<String, Vec<&TypeDescriptor>> = HashMap::new();
-    for t in &schema.types {
-        if !t.abstract_ {
-            for iface in &t.interfaces {
-                implementors.entry(iface.clone()).or_default().push(t);
-            }
-        }
-    }
+    generated_views(schema)
+        .into_iter()
+        .filter(|v| v.kind == GeneratedViewKind::Object)
+        .map(|v| (v.module, v.name, v.ddl))
+        .collect()
+}
+
+/// Which of the two kinds of view Pylon generates for an interface type a
+/// `GeneratedView` is. The planner emits them in separate phases — a
+/// cross-implementor exclusive constraint trigger queries the link views,
+/// so those have to be in place before the triggers are created — so the
+/// kind has to survive the one place both are built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedViewKind {
+    /// The interface's own view, selecting its pointers from each
+    /// implementor's table.
+    Object,
+    /// One multi-link's (or junction-backed link's) view, selecting from
+    /// each implementor's junction table.
+    Link,
+}
+
+/// One view Pylon generates for an interface type: how to create it, and
+/// which implementor relations and columns its `SELECT` reads.
+///
+/// The dependencies live here, next to the `SELECT` that establishes them,
+/// rather than being re-derived beside the migration planner, because they
+/// have to agree with that `SELECT` exactly. The planner uses them to
+/// decide which views a planned `ALTER TABLE` has to take down first —
+/// Postgres refuses to drop or retype a column a view selects — and a
+/// dependency list that had drifted from the `SELECT` would not produce a
+/// subtly wrong migration but a wholly unapplyable one.
+pub struct GeneratedView {
+    pub kind: GeneratedViewKind,
+    pub module: String,
+    /// The relation name, which for an interface is also its type name —
+    /// `@pylon.interface` takes no `table=`, so the two cannot diverge.
+    pub name: String,
+    pub ddl: String,
+    /// `(module, relation)` per `UNION ALL` branch — the implementor's own
+    /// table for an `Object` view, its junction table for a `Link` one.
+    pub reads: Vec<(String, String)>,
+    /// Unquoted names of the columns read from every one of `reads`.
+    pub columns: Vec<String>,
+}
+
+/// Every view Pylon generates for an interface type, object views and link
+/// views alike, in schema-declaration order (and per interface, its object
+/// view before its link views).
+pub fn generated_views(schema: &SchemaDescriptor) -> Vec<GeneratedView> {
+    let implementors = interface_implementors(schema);
     let mut result = Vec::new();
     for t in &schema.types {
         if !(t.abstract_ && t.materialized) {
@@ -1997,14 +2040,122 @@ pub fn interface_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, 
         if impls.is_empty() {
             continue;
         }
-        let mut ddl = String::new();
-        emit_one_interface_view(t, impls, &mut ddl);
-        let ddl = ddl.trim().to_string();
-        if !ddl.is_empty() {
-            result.push((t.module.clone(), t.name.clone(), ddl));
+
+        let columns = interface_view_columns(t);
+        let reads: Vec<(String, String)> = impls
+            .iter()
+            .map(|impl_t| (impl_t.module.clone(), impl_t.table.clone()))
+            .collect();
+        let column_list = columns.iter().map(|c| qi(c)).collect::<Vec<_>>().join(", ");
+        result.push(GeneratedView {
+            kind: GeneratedViewKind::Object,
+            module: t.module.clone(),
+            name: t.name.clone(),
+            ddl: union_view_ddl(&qn(&t.module, &t.table), &column_list, &reads),
+            reads,
+            columns,
+        });
+
+        // Every junction-shaped pointer on the interface: multi-links always,
+        // single links only when a `through()` type puts them in a junction.
+        let pointers: Vec<(&str, Option<&str>)> = t
+            .multilinks
+            .iter()
+            .map(|ml| (ml.name.as_str(), ml.through.as_deref()))
+            .chain(
+                t.links
+                    .iter()
+                    .filter(|l| l.is_junction_backed())
+                    .map(|l| (l.name.as_str(), l.through.as_deref())),
+            )
+            .collect();
+
+        for (link_name, through) in pointers {
+            let columns = interface_junction_view_columns(schema, through);
+            // `source`/`target` bare, a `through()` type's own properties
+            // quoted — see `union_view_ddl` on why this stays as it is.
+            let column_list = columns
+                .iter()
+                .map(|c| match c.as_str() {
+                    "source" | "target" => c.clone(),
+                    other => qi(other),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let view_name = interface_junction_view_name(&t.table, link_name);
+            let reads: Vec<(String, String)> = impls
+                .iter()
+                .map(|impl_t| (impl_t.module.clone(), format!("{}.{}", impl_t.table, link_name)))
+                .collect();
+            result.push(GeneratedView {
+                kind: GeneratedViewKind::Link,
+                module: t.module.clone(),
+                ddl: union_view_ddl(&qn(&t.module, &view_name), &column_list, &reads),
+                name: view_name,
+                reads,
+                columns,
+            });
         }
     }
     result
+}
+
+/// `CREATE VIEW <name> AS SELECT <column_list> FROM <read> UNION ALL …`.
+///
+/// Plain `CREATE VIEW` rather than `CREATE OR REPLACE`: replacing one
+/// cannot change its column list, which is exactly what an interface
+/// gaining or losing a pointer does. The migration planner therefore pairs
+/// every one of these with a `DROP VIEW IF EXISTS` of its own.
+///
+/// `column_list` arrives pre-rendered rather than being quoted from
+/// `GeneratedView::columns` here, because the two kinds of view quote
+/// differently (a link view's `source`/`target` are bare) and this text is
+/// what `diff::schema_to_db_state` hashes to recognise a changed
+/// definition — re-quoting either would read as a definition change in
+/// every already-migrated database.
+fn union_view_ddl(qualified_name: &str, column_list: &str, reads: &[(String, String)]) -> String {
+    let selects: Vec<String> = reads
+        .iter()
+        .map(|(module, relation)| format!("    SELECT {} FROM {}", column_list, qn(module, relation)))
+        .collect();
+    format!(
+        "CREATE VIEW {} AS\n{};",
+        qualified_name,
+        selects.join("\n    UNION ALL\n")
+    )
+}
+
+/// The columns an interface's object view selects from each implementor:
+/// the interface's own properties, plus a `{link}_id` for every link not
+/// backed by a junction table.
+fn interface_view_columns(t: &TypeDescriptor) -> Vec<String> {
+    t.properties
+        .iter()
+        .map(|p| p.name.clone())
+        .chain(
+            t.links
+                .iter()
+                .filter(|l| !l.is_junction_backed())
+                .map(|l| format!("{}_id", l.name)),
+        )
+        .collect()
+}
+
+/// The columns an interface's link view selects from each implementor's
+/// junction table. A `through()` type's own properties are real columns on
+/// every one of those tables, so the view has to carry them or `@propname`
+/// would be unreachable through the interface.
+fn interface_junction_view_columns(schema: &SchemaDescriptor, through: Option<&str>) -> Vec<String> {
+    let mut columns = vec!["source".to_string(), "target".to_string()];
+    if let Some(through_qname) = through
+        && let Some(td) = schema
+            .types
+            .iter()
+            .find(|td| format!("{}::{}", td.module, td.name) == through_qname && td.junction)
+    {
+        columns.extend(td.properties.iter().filter(|p| p.name != "id").map(|p| p.name.clone()));
+    }
+    columns
 }
 
 /// The view name a junction-backed exclusive link's cross-implementor
@@ -2032,64 +2183,11 @@ fn interface_junction_view_name(iface_table: &str, link_name: &str) -> String {
 /// Also what `make_excl_junction_info` queries for cross-implementor
 /// exclusivity, which is the narrower case this started as.
 pub fn interface_junction_view_ddl_with_names(schema: &SchemaDescriptor) -> Vec<(String, String, String)> {
-    let implementors = interface_implementors(schema);
-    let mut result = Vec::new();
-    for t in &schema.types {
-        if !(t.abstract_ && t.materialized) {
-            continue;
-        }
-        let key = format!("{}::{}", t.module, t.name);
-        let Some(impls) = implementors.get(&key) else { continue };
-        if impls.is_empty() {
-            continue;
-        }
-
-        // Every junction-shaped pointer on the interface: multi-links always,
-        // single links only when a `through()` type puts them in a junction.
-        let pointers: Vec<(&str, Option<&str>)> = t
-            .multilinks
-            .iter()
-            .map(|ml| (ml.name.as_str(), ml.through.as_deref()))
-            .chain(
-                t.links
-                    .iter()
-                    .filter(|l| l.is_junction_backed())
-                    .map(|l| (l.name.as_str(), l.through.as_deref())),
-            )
-            .collect();
-
-        for (link_name, through) in pointers {
-            // A `through()` type's own properties are real columns on each
-            // junction table, so the view has to carry them or `@propname`
-            // would be unreachable through the interface.
-            let mut columns = vec!["source".to_string(), "target".to_string()];
-            if let Some(through_qname) = through
-                && let Some(td) = schema
-                    .types
-                    .iter()
-                    .find(|td| format!("{}::{}", td.module, td.name) == through_qname && td.junction)
-            {
-                columns.extend(td.properties.iter().filter(|p| p.name != "id").map(|p| qi(&p.name)));
-            }
-            let column_list = columns.join(", ");
-
-            let view_name = interface_junction_view_name(&t.table, link_name);
-            let selects: Vec<String> = impls
-                .iter()
-                .map(|impl_t| {
-                    let jt_name = format!("{}.{}", impl_t.table, link_name);
-                    format!("    SELECT {} FROM {}", column_list, qn(&impl_t.module, &jt_name))
-                })
-                .collect();
-            let ddl = format!(
-                "CREATE VIEW {} AS\n{};",
-                qn(&t.module, &view_name),
-                selects.join("\n    UNION ALL\n"),
-            );
-            result.push((t.module.clone(), view_name, ddl));
-        }
-    }
-    result
+    generated_views(schema)
+        .into_iter()
+        .filter(|v| v.kind == GeneratedViewKind::Link)
+        .map(|v| (v.module, v.name, v.ddl))
+        .collect()
 }
 
 fn emit_interface_junction_views(schema: &SchemaDescriptor, out: &mut String) {
@@ -2141,40 +2239,10 @@ pub fn object_function_ddl_with_names(
 
 // ── Phase 12: interface views ──────────────────────────────────────────────────
 
-fn emit_one_interface_view(t: &TypeDescriptor, impls: &[&TypeDescriptor], out: &mut String) {
-    let cols: Vec<String> = t
-        .properties
-        .iter()
-        .map(|p| qi(&p.name))
-        .chain(
-            t.links
-                .iter()
-                .filter(|l| !l.is_junction_backed())
-                .map(|l| qi(&format!("{}_id", l.name))),
-        )
-        .collect();
-    let col_list = cols.join(", ");
-    let selects: Vec<String> = impls
-        .iter()
-        .map(|impl_t| format!("    SELECT {} FROM {}", col_list, qn(&impl_t.module, &impl_t.table)))
-        .collect();
-    out.push_str(&format!("CREATE VIEW {} AS\n", qn(&t.module, &t.table)));
-    out.push_str(&selects.join("\n    UNION ALL\n"));
-    out.push_str(";\n\n");
-}
-
 fn emit_interface_views(schema: &SchemaDescriptor, out: &mut String) {
-    let implementors = interface_implementors(schema);
-    for t in &schema.types {
-        if !(t.abstract_ && t.materialized) {
-            continue;
-        }
-        let key = format!("{}::{}", t.module, t.name);
-        let Some(impls) = implementors.get(&key) else { continue };
-        if impls.is_empty() {
-            continue;
-        }
-        emit_one_interface_view(t, impls, out);
+    for (_, _, ddl) in interface_view_ddl_with_names(schema) {
+        out.push_str(&ddl);
+        out.push_str("\n\n");
     }
 }
 
