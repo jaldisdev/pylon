@@ -957,13 +957,11 @@ def test_interface_pointer_changing_kind_applies_without_hand_reordering(live_po
 
         async def seed() -> None:
             await live_pool.execute(
-                f'INSERT INTO "{module}"."SystemBriefPreset" (title, builtin, required_components)'
-                ' VALUES ($1, $2, $3)',
+                f'INSERT INTO "{module}"."SystemBriefPreset" (title, builtin, required_components) VALUES ($1, $2, $3)',
                 ['system', True, ['a']],
             )
             await live_pool.execute(
-                f'INSERT INTO "{module}"."CustomBriefPreset" (title, owner, required_components)'
-                ' VALUES ($1, $2, $3)',
+                f'INSERT INTO "{module}"."CustomBriefPreset" (title, owner, required_components) VALUES ($1, $2, $3)',
                 ['custom', 'someone', ['b']],
             )
 
@@ -1001,8 +999,7 @@ def test_interface_pointer_changing_kind_applies_without_hand_reordering(live_po
             )
             assert rows == []
             gone = await live_pool.query_named(
-                'SELECT table_name FROM information_schema.views'
-                ' WHERE table_schema = $1 AND table_name = $2',
+                'SELECT table_name FROM information_schema.views WHERE table_schema = $1 AND table_name = $2',
                 [module, 'BriefPreset.required_addons'],
             )
             assert gone == [], 'the dropped multi-link left its link view behind'
