@@ -31,7 +31,7 @@ def export(*, schema: SchemaDescriptor | None = None) -> str:
     If schema is omitted, falls back to the process-level singleton SchemaDescriptor.
     PyQL fragments (computed columns, constraints, mutation rewrite trigger bodies)
     are compiled to SQL inline during export. Failures surface as PyQLFragmentError.
-    The returned string is valid PostgreSQL DDL ready for Atlas or direct inspection.
+    The returned string is valid PostgreSQL DDL, ready for direct inspection.
     """
     from pylon._core import export_schema as _core_export_schema
 

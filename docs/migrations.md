@@ -4,7 +4,7 @@ Pylon's schema is Python code — but Python code has no effect on the database 
 
 ## Migration files
 
-Each migration is a plain `.sql` file under `<schema-dir>/migrations/`, named `<seq>_<short-id>[_<name>].sql` (e.g. `00003_m1a3f9bc_add_author_bio.sql`), with a two-line header:
+Each migration is a plain `.sql` file under `<schema-dir>/migrations/`, named `<seq>_<short-id>[_<name>].sql` (e.g. `00003_m1a3f9bc12de45_add_author_bio.sql`), with a two-line header:
 
 ```sql
 -- migration: m1<38 hex chars>
@@ -13,7 +13,9 @@ Each migration is a plain `.sql` file under `<schema-dir>/migrations/`, named `<
 CREATE TABLE ...;
 ```
 
-The **ID** is `m1` followed by the first 38 hex characters of `SHA-256(body)` — a content hash, not a random UUID, so two people independently writing the same net change get the same ID. **`onto`** names the parent migration's ID (or the literal `initial` for the first migration in a chain), so the on-disk files form a linked list regardless of filename ordering — the filename's numeric prefix is just for human readability and gets renumbered by `squash`.
+The **ID** is the format prefix `m1` followed by 38 hex characters of a SHA-256 over the body *and* the migration's position in the chain (its `onto`, plus any IDs it squashes) — a content hash, not a random UUID, so two people independently writing the same net change at the same point in the chain get the same ID. Folding the position in is what keeps two identical bodies at different points apart: the tracking table keys on this ID, so a collision would make one apply overwrite the other's row. **`onto`** names the parent migration's ID (or the literal `initial` for the first migration in a chain), so the on-disk files form a linked list regardless of filename ordering — the filename's numeric prefix is just for human readability and gets renumbered by `squash`.
+
+Some existing chains carry `m2` IDs instead, from a period when this same hash was written under that prefix. They keep verifying and applying unchanged — nothing needs rewriting. Only newly created migrations get `m1`, and a chain may hold both.
 
 A migration body with more than one statement can contain `-- pylon:step` markers, splitting it into separately-committed groups — see [Transaction boundaries](#transaction-boundaries-and-concurrently) below.
 

@@ -8,6 +8,11 @@ from the same version number.
 
 ### Migrations
 
+* New migration IDs carry the `m1` prefix again. There is one ID format —
+  the hash over a migration's body and its position in the chain — and `m2`
+  was a second spelling of it, not a second format. Chains already carrying
+  `m2` IDs verify and apply unchanged; nothing needs rewriting, and a chain
+  may hold both prefixes.
 * `migration create` now records the state a migration reaches on that
   migration's own tracking row, and `migration apply` reads it rather than
   deriving one from the schema files. Since `create` refuses to run while

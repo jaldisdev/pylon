@@ -125,10 +125,11 @@ Pylon has its own vocabulary, and user-facing text should use it consistently:
 ## Migration files
 
 Migration IDs are content-addressed over the migration's body *and* its
-position in the chain, prefixed with a format version (`m2`). If you change
+position in the chain, prefixed with a format version (`m1`). If you change
 what goes into that hash, bump the prefix and keep the previous format
-verifying — existing migration files on disk must not stop validating. See
-`crates/pylon-core/src/migration/mod.rs`.
+verifying — existing migration files on disk must not stop validating. `m2`
+is read but never written: it was a second spelling of the current hash, not
+a second format. See `crates/pylon-core/src/migration/mod.rs`.
 
 ## The internal `_pylon` schema
 

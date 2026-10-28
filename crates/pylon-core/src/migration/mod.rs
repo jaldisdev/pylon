@@ -20,13 +20,13 @@
 //! Migration file parsing, ID computation, and chain validation.
 //!
 //! Every migration file has a two-line header:
-//!   -- migration: m2<38-hex>
-//!   -- onto: m2<38-hex> | initial
+//!   -- migration: m1<38-hex>
+//!   -- onto: m1<38-hex> | initial
 //!
-//! The migration ID is `m2` + 19 bytes (38 hex chars) of a SHA-256 over the
+//! The migration ID is `m1` + 19 bytes (38 hex chars) of a SHA-256 over the
 //! body *and* the migration's position in the chain (`onto`, plus any
 //! squashed IDs). The short ID used in filenames is the same digest cut to 6
-//! bytes (12 hex chars). `m1` — a body-only hash with a 3-byte short form —
+//! bytes (12 hex chars). `m2` — a short-lived spelling of this same digest —
 //! is still accepted for files already on disk; see `verify_integrity`.
 
 use sha2::{Digest, Sha256};
@@ -60,29 +60,24 @@ pub enum MigrationError {
 /// A parsed migration file.
 #[derive(Debug, Clone)]
 pub struct MigrationFile {
-    /// Full migration ID: a version prefix (`m2`, or `m1` for a file
-    /// written before the format change) + 38 hex chars.
+    /// Full migration ID: the format prefix `m1` (or `m2`, for a file
+    /// written while that spelling was in use) + 38 hex chars.
     pub id: String,
     /// Parent's full ID, or the literal string `"initial"`.
     pub onto: String,
     /// IDs this migration squashes (§12); empty for normal migrations.
     pub squashed: Vec<String>,
-    /// Original filename (stem only, e.g. `00001_m2a3f9bc12de4`).
+    /// Original filename (stem only, e.g. `00001_m1a3f9bc12de45`).
     pub filename: String,
     /// Everything after the two header lines.
     pub body: String,
 }
 
 impl MigrationFile {
-    /// Short ID used in filenames — the leading prefix of `id`, whose length
-    /// depends on which format wrote the file: `m1` carried 6 hex chars,
-    /// `m2` carries 12 (see `compute_short_id`).
+    /// Short ID used in filenames: the leading prefix of `id` — 2 for the
+    /// format prefix plus 12 hex chars (see `compute_short_id`).
     pub fn short_id(&self) -> &str {
-        if self.id.starts_with("m1") {
-            &self.id[..8]
-        } else {
-            &self.id[..14]
-        }
+        &self.id[..14]
     }
 
     /// Whether this is the "first" migration (onto == "initial").
@@ -93,13 +88,20 @@ impl MigrationFile {
 
 // ── ID computation ────────────────────────────────────────────────────────────
 
-/// Current ID format. `m1` hashed the body alone, which meant two migrations
-/// with identical bodies at different points in the chain collided on one ID
-/// — and `_pylon."Migrations"` keys on that ID, so the second apply
-/// overwrote the first's tracking row. `m2` folds `onto` and the squash list
-/// in, making the ID identify a migration's position in the chain and not
-/// just its text.
-const ID_VERSION: &str = "m2";
+/// The migration ID format — there is one, and it is version 1.
+///
+/// An earlier revision of it hashed the body alone, which meant two
+/// migrations with identical bodies at different points in the chain
+/// collided on one ID — and `_pylon."Migrations"` keys on that ID, so the
+/// second apply overwrote the first's tracking row. Folding `onto` and the
+/// squash list into the digest fixed that, and for a while the fixed digest
+/// was spelled `m2`. The format never forked, so the prefix is `m1`; `m2`
+/// survives only as a spelling `verify_integrity` still accepts.
+const ID_VERSION: &str = "m1";
+
+/// The prefix new IDs no longer carry, still read so chains written while it
+/// was in use don't have to be rewritten.
+const LEGACY_ID_VERSION: &str = "m2";
 
 /// The digest every ID is derived from: the body, plus the chain position
 /// that body sits at.
@@ -119,7 +121,7 @@ fn id_digest(body: &str, onto: &str, squashed: &[String]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Compute the full migration ID (§5): `m2` + 38 hex chars of the digest.
+/// Compute the full migration ID (§5): `m1` + 38 hex chars of the digest.
 pub fn compute_id(body: &str, onto: &str, squashed: &[String]) -> String {
     let digest = id_digest(body, onto, squashed);
     let hex = hex::encode(&digest[..19]); // 19 bytes = 38 hex chars
@@ -128,20 +130,13 @@ pub fn compute_id(body: &str, onto: &str, squashed: &[String]) -> String {
 
 /// Compute the short migration ID used as the filename component.
 ///
-/// 12 hex chars (48 bits), not the 6 (24 bits) the `m1` format used: at 24
+/// 12 hex chars (48 bits), not the 6 (24 bits) an early revision used: at 24
 /// bits two migrations share a filename stem with ~50% probability by the
 /// ~4,800th migration, and a few percent within the first few hundred.
 pub fn compute_short_id(body: &str, onto: &str, squashed: &[String]) -> String {
     let digest = id_digest(body, onto, squashed);
     let hex = hex::encode(&digest[..6]); // 6 bytes = 12 hex chars
     format!("{ID_VERSION}{hex}")
-}
-
-/// The `m1` full ID for `body` — body-only hash, kept solely so migration
-/// files written before the `m2` format still verify.
-fn legacy_compute_id(body: &str) -> String {
-    let digest = Sha256::digest(body.as_bytes());
-    format!("m1{}", hex::encode(&digest[..19]))
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
@@ -207,17 +202,14 @@ fn parse_squashed_lines(content: &str) -> Vec<String> {
 
 /// Re-hash a migration and verify it matches the ID in the header (§9.2).
 ///
-/// Which hash to check against comes from the ID's own version prefix, so a
-/// project with `m1` files on disk keeps verifying against the body-only
-/// hash those files were written with. Only newly created migrations get
-/// `m2` — there is no rewrite step and no flag day.
+/// There is one digest, so the prefix is the only thing that can differ: an
+/// `m2` file carries exactly the hash `compute_id` produces today, under the
+/// older spelling. Accepting it here is what makes the rename a no-op for
+/// chains already on disk — no rewrite step and no flag day.
 pub fn verify_integrity(m: &MigrationFile) -> Result<(), MigrationError> {
-    let computed = if m.id.starts_with("m1") {
-        legacy_compute_id(&m.body)
-    } else {
-        compute_id(&m.body, &m.onto, &m.squashed)
-    };
-    if computed != m.id {
+    let computed = compute_id(&m.body, &m.onto, &m.squashed);
+    let hex = computed.strip_prefix(ID_VERSION);
+    if computed != m.id && m.id.strip_prefix(LEGACY_ID_VERSION) != hex {
         return Err(MigrationError::IdMismatch {
             filename: m.filename.clone(),
             header_id: m.id.clone(),
@@ -491,15 +483,15 @@ mod tests {
     #[test]
     fn test_compute_id_prefix() {
         let id = compute_id("hello", "initial", &[]);
-        assert!(id.starts_with("m2"));
-        assert_eq!(id.len(), 40); // "m2" + 38 hex
+        assert!(id.starts_with("m1"));
+        assert_eq!(id.len(), 40); // "m1" + 38 hex
     }
 
     #[test]
     fn test_compute_short_id() {
         let sid = compute_short_id("hello", "initial", &[]);
-        assert!(sid.starts_with("m2"));
-        assert_eq!(sid.len(), 14); // "m2" + 12 hex
+        assert!(sid.starts_with("m1"));
+        assert_eq!(sid.len(), 14); // "m1" + 12 hex
     }
 
     #[test]
@@ -511,15 +503,15 @@ mod tests {
 
     #[test]
     fn identical_bodies_at_different_chain_positions_get_different_ids() {
-        // The `m1` collision: same DDL added, reverted, then re-added later
-        // hashed to one ID, and `_pylon."Migrations"` keys on that ID.
+        // The body-only collision: same DDL added, reverted, then re-added
+        // later hashed to one ID, and `_pylon."Migrations"` keys on that ID.
         let body = "ALTER TABLE t ADD COLUMN c int8;";
         let first = compute_id(body, "initial", &[]);
-        let second = compute_id(body, "m2aaaaaaaaaaaa", &[]);
+        let second = compute_id(body, "m1aaaaaaaaaaaa", &[]);
         assert_ne!(first, second);
         assert_ne!(
             compute_short_id(body, "initial", &[]),
-            compute_short_id(body, "m2aaaaaaaaaaaa", &[])
+            compute_short_id(body, "m1aaaaaaaaaaaa", &[])
         );
     }
 
@@ -539,25 +531,57 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_m1_file_still_verifies_against_the_body_only_hash() {
+    fn a_file_written_under_the_m2_spelling_still_verifies() {
         let body = "\nSELECT 1;\n";
-        let legacy_id = legacy_compute_id(body);
+        let legacy_id = compute_id(body, "initial", &[]).replacen(ID_VERSION, LEGACY_ID_VERSION, 1);
         let content = format!("-- migration: {legacy_id}\n-- onto: initial\n{body}");
-        let m = parse(&content, "00001_legacy").unwrap();
+        let mut m = parse(&content, "00001_legacy").unwrap();
         assert!(
             verify_integrity(&m).is_ok(),
-            "an m1 file written before the format change must keep verifying"
+            "renaming the prefix must not invalidate chains already on disk"
         );
-        assert_eq!(m.short_id().len(), 8, "m1 short IDs stay 6 hex chars wide");
+        assert_eq!(m.short_id().len(), 14);
+
+        // Accepting the old prefix is not accepting any prefix: the digest
+        // still has to match.
+        m.body = "TAMPERED;\n".to_string();
+        assert!(verify_integrity(&m).is_err());
+    }
+
+    #[test]
+    fn an_m1_migration_can_sit_on_top_of_an_m2_one() {
+        // What every existing chain's next `migration create` produces. The
+        // parent's ID goes into the child's digest verbatim, so the prefix
+        // must not be normalised on either side of that.
+        let parent_body = make_body("A");
+        let parent_id = compute_id(&parent_body, "initial", &[]).replacen(ID_VERSION, LEGACY_ID_VERSION, 1);
+        let parent = parse(
+            &format!("-- migration: {parent_id}\n-- onto: initial\n{parent_body}"),
+            "00001_legacy",
+        )
+        .unwrap();
+
+        let child = make_file(&parent.id, &make_body("B"));
+        assert!(child.id.starts_with(ID_VERSION));
+        assert_eq!(child.onto, parent_id);
+        verify_integrity(&parent).unwrap();
+        verify_integrity(&child).unwrap();
+
+        let files = [child.clone(), parent.clone()];
+        let chain = validate_chain(&files).unwrap();
+        assert_eq!(
+            chain.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![parent.id.as_str(), child.id.as_str()]
+        );
     }
 
     #[test]
     fn test_parse_and_verify() {
         let body = make_body("Person");
         let content = render_file("initial", &body, &[]);
-        let m = parse(&content, "00001_m1abc123").unwrap();
+        let m = parse(&content, "00001_m1abc123def456").unwrap();
         assert_eq!(m.onto, "initial");
-        assert!(m.id.starts_with("m2"));
+        assert!(m.id.starts_with("m1"));
         verify_integrity(&m).unwrap();
     }
 

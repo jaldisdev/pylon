@@ -1063,7 +1063,7 @@ mod tests {
             &pool,
             r#"{"probe": "schema_snapshot_round_trips"}"#,
             SchemaWriter::Apply,
-            Some("m2probe"),
+            Some("m1probe"),
         )
         .await
         .unwrap();
@@ -1076,7 +1076,7 @@ mod tests {
             read_schema_origin(&pool).await.unwrap(),
             Some(SchemaOrigin {
                 written_by: Some(SchemaWriter::Apply),
-                written_onto: Some("m2probe".to_string()),
+                written_onto: Some("m1probe".to_string()),
             })
         );
 
@@ -1129,7 +1129,7 @@ mod tests {
         let pool = test_pool().await;
         let previous = read_schema_snapshot(&pool).await.unwrap();
 
-        write_schema_snapshot(&pool, "{}", SchemaWriter::Watch, Some("m2gone"))
+        write_schema_snapshot(&pool, "{}", SchemaWriter::Watch, Some("m1gone"))
             .await
             .unwrap();
         pool.batch_execute(r#"UPDATE _pylon."Schema" SET written_by = NULL, written_onto = NULL"#)

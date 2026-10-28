@@ -47,7 +47,7 @@ class TestNextSeq:
         assert _next_seq(tmp_path) == 4
 
     def test_ignores_non_matching_files(self, tmp_path):
-        (tmp_path / 'atlas.sum').touch()
+        (tmp_path / 'notes.txt').touch()
         (tmp_path / 'README.md').touch()
         assert _next_seq(tmp_path) == 1
 
