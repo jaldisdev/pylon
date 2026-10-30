@@ -15390,7 +15390,17 @@ impl<'a> Compiler<'a> {
             // so its cardinality is the root binding's. Treating every join as
             // widening made `(select T filter .id = $x).link.prop` a
             // one-element set rather than the value itself.
-            let widens = ps.joins.iter().any(|join| !matches!(join, IrPathJoin::Single { .. }));
+            let widens = ps.joins.iter().any(|join| match join {
+                IrPathJoin::Single { .. } => false,
+                // `latest_data := select .data order by .created_at desc
+                // limit 1` reaches one row per source row however many its
+                // own path crosses. The lateral is only how that limit gets
+                // applied per row at all, so reading the join kind alone made
+                // every such computed multi — and its value came back as a
+                // one-element array to code expecting the value.
+                IrPathJoin::Lateral { inner, .. } => !matches!(inner.limit, Some(IrExpr::Literal(IrLiteral::Int(1)))),
+                _ => true,
+            });
             let root_is_multi = self.multi_row_ctes.contains(root.as_str());
             let multi = matches!(ps.result, IrPathResult::Scalar(..)) && (widens || root_is_multi);
             return Ok(if multi {

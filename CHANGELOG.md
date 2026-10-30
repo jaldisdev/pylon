@@ -15,6 +15,12 @@ from the same version number.
   presence guard, so the row vanished and the fallback was unreachable.
   Binding the walk to a name first, writing it as a sub-select, or reading it
   in a shape all answered correctly already; the four agree now.
+* A free object's field reading a computed link's own property now holds the
+  value, not a one-element array of it. A computed declared `select .data
+  order by … limit 1` is single by that `limit 1`, which is only expressible
+  per source row as a lateral join — and the field read its cardinality off
+  the join kinds the walk compiled to, so every such computed came back as a
+  set. A computed with no cap of its own still stands for one.
 
 ### Migrations
 
