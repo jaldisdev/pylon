@@ -4,6 +4,22 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.9.0
+
+### Migrations
+
+* Editing an exclusive constraint's `unless` now proposes a migration. The
+  predicate is the partial unique index's `WHERE NOT (…)`, and the diff asked
+  of it only whether there *was* one — so a predicate-only change was read as
+  the index already being there, nothing was proposed, and the constraint
+  went on enforcing the rule it was built with. The index is now dropped and
+  re-made, both `CONCURRENTLY`. Adding a second exclusive over different
+  pointers was diffed correctly all along.
+* An exclusive's partial unique index is named by the schema dump as well,
+  under the name the diff gives it, instead of being left for Postgres to
+  auto-name. A database installed from the dump had no index under the name
+  the rebuild above drops.
+
 ## 0.8.0 — 2026-10-28
 
 ### Migrations

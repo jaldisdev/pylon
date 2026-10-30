@@ -45,7 +45,9 @@ use pylon_core::diff::{
 };
 use pylon_core::export::export_schema;
 use pylon_core::query;
-use pylon_core::schema::{IndexDescriptor, SchemaDescriptor, SignalEntry, TypeDescriptor};
+use pylon_core::schema::{
+    IndexDescriptor, PropertyDescriptor, SchemaDescriptor, SignalEntry, TypeConstraint, TypeDescriptor,
+};
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
 use std::collections::HashMap;
@@ -485,6 +487,205 @@ async fn an_export_installed_plain_index_needs_no_further_migration() {
             .contains(&"Widget__name_idx".to_string()),
         "the dump should name it the way the diff does, got {:?}",
         widget_index_names(&pool, &module).await
+    );
+
+    // A full-database diff, so only this fixture's own module is inspected —
+    // every other live suite's leftover schema is in there too.
+    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    let proposed: Vec<String> = diff_schema_steps(&schema, &live, &HashMap::new())
+        .unwrap()
+        .iter()
+        .flat_map(|step| step.resolved_ddl(&HashMap::new()))
+        .map(|op| op.sql)
+        .filter(|sql| sql.contains("INDEX") && sql.contains(&module))
+        .collect();
+    assert!(
+        proposed.is_empty(),
+        "the index is already there; nothing to propose, got {proposed:?}"
+    );
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}
+
+/// A `Subscription` whose `(account, package)` pair is exclusive, with the
+/// `unless` predicate the revision under test declares — the two revisions a
+/// changed `unless` sits between.
+fn exclusive_schema(module: &str, unless: &str) -> SchemaDescriptor {
+    let nullable = |name: &str, pg_type: &str| PropertyDescriptor {
+        nullable: true,
+        pg_type: pg_type.into(),
+        ..text_prop(name)
+    };
+    SchemaDescriptor {
+        types: vec![TypeDescriptor {
+            name: "Subscription".into(),
+            module: module.into(),
+            table: "Subscription".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![
+                id_prop(),
+                text_prop("account"),
+                text_prop("package"),
+                nullable("ended_at", "timestamptz"),
+                nullable("brand", "text"),
+            ],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![TypeConstraint::Exclusive {
+                pointers: vec!["account".into(), "package".into()],
+                unless: Some(unless.into()),
+            }],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }],
+        ..Default::default()
+    }
+}
+
+/// Every index definition Postgres holds on one module's `Subscription`
+/// table, `WHERE` clause included — which is the half of a partial unique
+/// index that no name or column list can report.
+async fn subscription_index_defs(pool: &pylon_pgcon::PgPool, module: &str) -> Vec<String> {
+    let rows = pool
+        .query_typed(
+            &format!(
+                "SELECT (indexdef)::text FROM pg_indexes \
+                 WHERE schemaname = '{module}' AND tablename = 'Subscription' ORDER BY indexname"
+            ),
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| match row {
+            DecodedValue::Str(s) => s.clone(),
+            other => panic!("expected an index definition, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Editing an exclusive's `unless` has to rebuild its partial unique index.
+/// The main diff settles one of these by columns and uniqueness and asked of
+/// the predicate only whether there *was* one, so a predicate-only change
+/// proposed nothing at all and the index went on enforcing the rule it was
+/// built with — an exclusive that silently disagreed with its own
+/// declaration. Adding a second exclusive over *different* pointers was
+/// diffed correctly all along; only this case was missed.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_changed_exclusive_predicate_rebuilds_its_index() {
+    let module = unique_module("live_migdiff_excl");
+    let before = exclusive_schema(&module, "exists(.ended_at)");
+    let after = exclusive_schema(&module, "exists(.ended_at) or exists(.brand)");
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+
+    // Installed through the diff rather than through `export_schema`, because
+    // the name is what the drop below has to get right, and the create pass's
+    // name is the one a migrated database carries.
+    let steps = diff_schema_steps(&before, &pylon_core::diff::DbState::default(), &HashMap::new()).unwrap();
+    for step in &steps {
+        for op in step.resolved_ddl(&HashMap::new()) {
+            pool.batch_execute(&op.sql).await.unwrap();
+        }
+    }
+    let installed = subscription_index_defs(&pool, &module).await;
+    assert!(
+        installed
+            .iter()
+            .any(|def| def.contains("Subscription_account_package_0_key") && def.contains("ended_at")),
+        "the exclusive's partial unique index should exist to begin with, got {installed:?}"
+    );
+    assert!(
+        !installed.iter().any(|def| def.contains("brand")),
+        "no index should mention the new predicate's column yet, got {installed:?}"
+    );
+
+    let ops = index_amendment_ops(&after, Some(&before), true);
+    let sql: Vec<&str> = ops.iter().map(|op| op.sql.as_str()).collect();
+    assert!(
+        sql.iter()
+            .any(|s| s.starts_with("DROP INDEX CONCURRENTLY") && s.contains("Subscription_account_package_0_key")),
+        "the stale index should be dropped, got {sql:?}"
+    );
+    assert!(
+        sql.iter().any(|s| s.starts_with("CREATE UNIQUE INDEX CONCURRENTLY")
+            && s.contains("Subscription_account_package_0_key")
+            && s.contains("brand")),
+        "and re-made from the new predicate, got {sql:?}"
+    );
+    assert!(
+        ops.iter().all(|op| op.non_transactional),
+        "CONCURRENTLY cannot run inside a transaction block"
+    );
+
+    for op in &ops {
+        pool.batch_execute(&op.sql).await.unwrap();
+    }
+    let amended = subscription_index_defs(&pool, &module).await;
+    let unique: Vec<&String> = amended
+        .iter()
+        .filter(|def| def.contains("Subscription_account_package_0_key"))
+        .collect();
+    assert_eq!(
+        unique.len(),
+        1,
+        "the rebuild should leave one index, not a second one beside the stale one, got {amended:?}"
+    );
+    assert!(
+        unique[0].contains("brand"),
+        "the index Postgres holds should now enforce the declared predicate, got {amended:?}"
+    );
+
+    // And the amendment is settled: with both sides on the new predicate
+    // there is nothing left to rebuild. (A full-database `assert_zero_
+    // further_steps` would also see every other live suite's leftover
+    // schema, so the check stays within this fixture.)
+    assert!(
+        index_amendment_ops(&after, Some(&after), true).is_empty(),
+        "a second pass should propose nothing"
+    );
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}
+
+/// `export_schema` used to leave an exclusive's partial unique index
+/// unnamed, so a database built from the dump carried Postgres's own
+/// auto-name (`Subscription_account_package_idx`) and the rebuild above had
+/// nothing to drop. Both sides read the one naming helper now.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_export_installed_exclusive_index_carries_the_diffs_name() {
+    let module = unique_module("live_migdiff_exportexcl");
+    let schema = exclusive_schema(&module, "exists(.ended_at)");
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    let installed = subscription_index_defs(&pool, &module).await;
+    assert!(
+        installed
+            .iter()
+            .any(|def| def.contains("Subscription_account_package_0_key")),
+        "the dump should name it the way the diff does, got {installed:?}"
     );
 
     // A full-database diff, so only this fixture's own module is inspected —

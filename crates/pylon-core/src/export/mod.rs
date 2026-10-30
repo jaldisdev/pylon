@@ -1395,6 +1395,40 @@ fn constraint_column(t: &TypeDescriptor, pointer: &str) -> String {
     }
 }
 
+/// The `(...)` a composite `Exclusive` is keyed on and its `WHERE`, both as
+/// SQL — the partial unique index that *is* the constraint.
+///
+/// `unless` is PyQL (`.deleted`, `exists(.ended_at)`), so it has to be
+/// compiled the way a CHECK's expression is; emitted raw it was never valid
+/// SQL. `Err` is an expression that does not compile: validation reports it
+/// with a far better message than a half-built index could, and dropping the
+/// clause would silently *widen* the constraint, so every caller skips the
+/// index rather than emitting one without its predicate.
+///
+/// Shared by `emit_unique_indexes`, `schema_to_db_state`'s baseline and the
+/// amendment that re-makes one whose predicate changed, for the same reason
+/// the index names are: two paths disagreeing by a byte read as two
+/// different indexes.
+pub(crate) fn exclusive_body_and_predicate(
+    t: &TypeDescriptor,
+    pointers: &[String],
+    unless: Option<&str>,
+    schema: &SchemaDescriptor,
+) -> Result<(String, String), PyQLError> {
+    let cols: Vec<String> = pointers.iter().map(|f| qi(&constraint_column(t, f))).collect();
+    let predicate = match unless {
+        Some(u) => {
+            let qualified = format!("{}::{}", t.module, t.name);
+            format!(
+                " WHERE NOT ({})",
+                crate::ir::compile_constraint_expr(u, &qualified, schema)?
+            )
+        }
+        None => String::new(),
+    };
+    Ok((format!("({})", cols.join(", ")), predicate))
+}
+
 // ── Phase 8: unique indexes ────────────────────────────────────────────────────
 
 fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
@@ -1424,34 +1458,26 @@ fn emit_unique_indexes(schema: &SchemaDescriptor, out: &mut String) {
                 emitted = true;
             }
         }
-        for c in &t.constraints {
+        for (i, c) in t.constraints.iter().enumerate() {
             if let TypeConstraint::Exclusive {
                 pointers: fields,
                 unless,
             } = c
             {
-                let cols: Vec<String> = fields.iter().map(|f| qi(&constraint_column(t, f))).collect();
-                // `unless` is PyQL (`.deleted`, `exists(.effective_until)`),
-                // so it has to be compiled the way a CHECK's expression is;
-                // emitted raw it was never valid SQL.
-                let where_clause = match unless.as_deref() {
-                    Some(u) => {
-                        let qualified = format!("{}::{}", t.module, t.name);
-                        match crate::ir::compile_constraint_expr(u, &qualified, schema) {
-                            Ok(compiled) => format!(" WHERE NOT ({compiled})"),
-                            // Validation reports the same expression with a
-                            // far better message than a half-built index
-                            // could; skipping the clause here would silently
-                            // widen the constraint, so skip the index.
-                            Err(_) => continue,
-                        }
-                    }
-                    None => String::new(),
+                let Ok((body, where_clause)) = exclusive_body_and_predicate(t, fields, unless.as_deref(), schema)
+                else {
+                    continue;
                 };
+                // Named, not left to Postgres: a predicate-only edit is
+                // amended by dropping this index and re-making it, and the
+                // drop has only the name to go on. Postgres's own choice for
+                // an unnamed `CREATE UNIQUE INDEX` is `{table}_{cols}_idx`,
+                // which no other path here would ever arrive at.
                 out.push_str(&format!(
-                    "CREATE UNIQUE INDEX ON {} ({}){};\n",
+                    "CREATE UNIQUE INDEX {} ON {} {}{};\n",
+                    qi(&crate::diff::exclusive_index_name(&t.table, fields, i)),
                     qname,
-                    cols.join(", "),
+                    body,
                     where_clause,
                 ));
                 emitted = true;

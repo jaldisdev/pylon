@@ -43,6 +43,11 @@
 //!   that was deleted left its index alive in the database with nothing in
 //!   the schema referring to it, and one whose body changed under an
 //!   unchanged name was read as already there.
+//! * A composite `Exclusive`'s `unless` is a partial unique index's
+//!   `WHERE NOT (…)`, which `introspect` reports as Postgres's own
+//!   normalization of the predicate rather than as the string Pylon
+//!   compiled — so the main diff can only ask whether a predicate is
+//!   *present*, and an edited one reads as unchanged.
 //!
 //! So everything here diffs against the *previous `SchemaDescriptor`* —
 //! `_pylon."Migrations".schema_state` on the applied tip row, the same
@@ -57,7 +62,9 @@
 use serde_json::Value;
 
 use super::{DiffOp, qi, qn};
-use crate::schema::{IndexDescriptor, SchemaDescriptor, SearchBackend, SearchIndexDescriptor, TypeDescriptor};
+use crate::schema::{
+    IndexDescriptor, SchemaDescriptor, SearchBackend, SearchIndexDescriptor, TypeConstraint, TypeDescriptor,
+};
 
 fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -67,7 +74,7 @@ fn sql_str(s: &str) -> String {
 //
 // Every index Pylon names, it names here — the create path, the drop path,
 // `schema_to_db_state`'s baseline and `export_schema`'s DDL dump all read one
-// of the three functions below. Two paths naming the same index differently
+// of the four functions below. Two paths naming the same index differently
 // is not a cosmetic problem: the diff settles an index with a key by *name*,
 // so a second opinion reads as a second index and gets created alongside the
 // first. (`export_schema` used to leave plain indexes unnamed, letting
@@ -91,6 +98,13 @@ pub(crate) fn search_index_name(table: &str, index_name: Option<&str>) -> String
         None => format!("{table}__search__"),
         Some(n) => format!("{table}__search_{n}__"),
     })
+}
+
+/// The name of one composite `Exclusive` on `table`. Two of them may share a
+/// pointer list (differing only in their `unless`), so the constraint's
+/// position in the type's declaration list goes in the name as well.
+pub(crate) fn exclusive_index_name(table: &str, pointers: &[String], position: usize) -> String {
+    super::capped_index_name(format!("{table}_{}_{position}_key", pointers.join("_")))
 }
 
 /// The name of one plain `Index` on `table`. An expression index has no
@@ -336,6 +350,41 @@ fn plain_indexes(schema: &SchemaDescriptor, td: &TypeDescriptor) -> Vec<(String,
         .collect()
 }
 
+/// One composite `Exclusive`: the pointer list that identifies it across
+/// revisions, the name the database holds its index under, and the `(key,
+/// predicate)` Postgres would have built from it.
+type ExclusiveIndex = (Vec<String>, String, Option<(String, String)>);
+
+/// One type's composite `Exclusive` declarations as `(pointers, name, shape)`
+/// — the pointer list that identifies one across revisions, the name the
+/// database holds it under, and the key and predicate Postgres would have
+/// built from it.
+///
+/// Paired across revisions by the *pointers*, not the name or the position:
+/// those are what `schema_to_db_state` settles the index's existence by, and
+/// an `Exclusive` removed from in front of another would otherwise renumber
+/// it into a stranger.
+///
+/// `None` for a declaration whose `unless` doesn't compile, matching
+/// `emit_unique_indexes` and `schema_to_db_state`, which both skip those
+/// rather than emit an index missing the predicate that narrows it.
+fn exclusive_indexes(schema: &SchemaDescriptor, td: &TypeDescriptor) -> Vec<ExclusiveIndex> {
+    if td.junction {
+        return Vec::new();
+    }
+    td.constraints
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match c {
+            TypeConstraint::Exclusive { pointers, unless } => {
+                let shape = crate::export::exclusive_body_and_predicate(td, pointers, unless.as_deref(), schema).ok();
+                Some((pointers.clone(), exclusive_index_name(&td.table, pointers, i), shape))
+            }
+            TypeConstraint::Expression { .. } => None,
+        })
+        .collect()
+}
+
 fn tx(sql: String) -> DiffOp {
     DiffOp {
         sql,
@@ -347,12 +396,17 @@ fn tx(sql: String) -> DiffOp {
 /// declaration, covering the changes the main diff does not see (see this
 /// module's own header for why it does not see them).
 ///
-/// Five cases, all keyed off `previous` rather than `DbState`:
+/// Six cases, all keyed off `previous` rather than `DbState`:
 ///
 /// * A plain `Index` that went away, or whose key, uniqueness or predicate
 ///   changed under the name the database already holds it under. Dropped,
 ///   and re-made from the new declaration in the second case — the create
 ///   pass would read the stale index as the declared one.
+///
+/// * A composite `Exclusive` whose `unless` changed over unchanged
+///   pointers. The main diff asks of a partial index only whether it *has* a
+///   predicate, so the index kept the one it was built with and went on
+///   enforcing the old rule.
 ///
 /// * A `Postgres`-backed search index whose pointers or weights changed.
 ///   Its column is `GENERATED ALWAYS AS (…) STORED` and Postgres offers no
@@ -500,6 +554,45 @@ pub fn index_amendment_ops(
                     "CREATE {}INDEX {concurrently}IF NOT EXISTS {} ON {table} {body}{predicate};",
                     if *unique { "UNIQUE " } else { "" },
                     qi(&super::capped_index_name(name.clone())),
+                ),
+                non_transactional: for_migration,
+            });
+        }
+
+        // ── Composite exclusives ─────────────────────────────────────────
+        // A `pylon.Exclusive(("account", "package"), unless="exists(.ended_at)")`
+        // is a partial unique index, and its `WHERE NOT (<unless>)` is the
+        // whole of what makes the constraint narrower than the pointers
+        // alone. The main diff settles one of these by its columns and
+        // uniqueness — Postgres is free to have auto-named it, so the name is
+        // no guide — and asked of the predicate only whether there *was* one.
+        // So a changed `unless` over unchanged pointers read as the index
+        // already being there: nothing was proposed, and the index went on
+        // enforcing the predicate it was built with.
+        //
+        // An exclusive that is gone, or one that is new, needs nothing here:
+        // the drop is the main diff's business (it has the table's real
+        // indexes to work from) and the create is the pass that already
+        // covers a missing one.
+        let prev_exclusives = exclusive_indexes(previous, prev_td);
+        for (pointers, name, now) in exclusive_indexes(target, td) {
+            let Some((_, prev_name, before)) = prev_exclusives.iter().find(|(p, _, _)| *p == pointers) else {
+                continue;
+            };
+            let (Some((body, predicate)), Some(before)) = (&now, before) else {
+                continue;
+            };
+            if before == &(body.clone(), predicate.clone()) {
+                continue;
+            }
+            // Dropped under the name the *previous* revision gave it, which
+            // is the one the database holds — renumbering can have moved the
+            // declaration since.
+            ops.push(drop_index(prev_name));
+            ops.push(DiffOp {
+                sql: format!(
+                    "CREATE UNIQUE INDEX {concurrently}IF NOT EXISTS {} ON {table} {body}{predicate};",
+                    qi(&super::capped_index_name(name)),
                 ),
                 non_transactional: for_migration,
             });

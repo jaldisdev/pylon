@@ -32,6 +32,7 @@ use crate::schema::{SchemaDescriptor, SearchBackend, TypeDescriptor};
 
 pub mod indexes;
 
+pub(crate) use indexes::exclusive_index_name;
 pub use indexes::{
     DeferredIndex, changed_deferred_indexes, changed_index_backfill_ops, deferred_indexes, index_amendment_ops,
     index_backfill_sql,
@@ -448,19 +449,21 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
                 unless,
             } = constraint
             {
-                // Postgres auto-names these; mirror the convention.
-                let idx_name = format!("{}_{}_{}_key", td.table, fields.join("_"), i);
+                // The predicate is built by the same helper the export uses,
+                // so the `WHERE NOT (…)` a fresh install gives this index and
+                // the one a migration gives it are the same string rather
+                // than two readings of the same declaration.
+                let Ok((_, predicate)) =
+                    crate::export::exclusive_body_and_predicate(td, fields, unless.as_deref(), schema)
+                else {
+                    continue;
+                };
                 indexes.push(DbIndex {
-                    name: idx_name,
+                    name: exclusive_index_name(&td.table, fields, i),
                     is_unique: true,
                     method: "btree".to_string(),
                     columns: fields.iter().map(|f| pointer_column(td, f)).collect(),
-                    predicate: unless.as_deref().and_then(|u| {
-                        let qualified = format!("{}::{}", td.module, td.name);
-                        crate::ir::compile_constraint_expr(u, &qualified, schema)
-                            .ok()
-                            .map(|c| format!(" WHERE NOT ({c})"))
-                    }),
+                    predicate: (!predicate.is_empty()).then_some(predicate),
                     key: None,
                 });
             }
