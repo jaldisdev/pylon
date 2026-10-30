@@ -6,6 +6,16 @@ from the same version number.
 
 ## 0.9.0
 
+### Reading
+
+* `A ?? B` over a walk off a `with` binding now answers `B` when the walk
+  reaches nothing. `??` decides on its left operand being the empty set, and
+  the walk was folded into the enclosing select's own row source — where an
+  absent link joins to nothing and a NULL property fails the walk's own
+  presence guard, so the row vanished and the fallback was unreachable.
+  Binding the walk to a name first, writing it as a sub-select, or reading it
+  in a shape all answered correctly already; the four agree now.
+
 ### Migrations
 
 * Editing an exclusive constraint's `unless` now proposes a migration. The

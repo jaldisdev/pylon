@@ -5874,7 +5874,23 @@ impl<'a> Compiler<'a> {
         // Build the join chain for the path side, then apply the comparison
         // element-wise so we get one boolean per traversal element (not one EXISTS per root).
         if let Expr::BinOp(b) = result {
+            // `a.preferences.default_currency ?? <Currency>$0` — every other
+            // operator reads one element of the walk at a time, so the walk
+            // becoming this select's own row source is exactly right for
+            // them. `??` is the one that answers on the walk being *empty*,
+            // and a row source has already decided that by dropping the row:
+            // an absent link joins to nothing, and a property that is NULL
+            // fails the walk's own `IS NOT NULL` guard. Either way the
+            // coalesce never runs and the fallback it exists to supply is
+            // unreachable. The fallback route below keeps the root as the row
+            // source and reads the walk off it as a correlated expression,
+            // where reaching nothing is the NULL `COALESCE` tests — the same
+            // reading `{ c := a.preferences.default_currency ?? … }` and
+            // `(select a.preferences.default_currency) ?? …` already get.
             let (path_expr, value_expr, flip) = match (&b.left, &b.right) {
+                _ if b.op == ast::BinOpKind::Coalesce => {
+                    return self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct);
+                }
                 (Expr::Path(p), v) if !p.partial => (p, v, false),
                 (v, Expr::Path(p)) if !p.partial => (p, v, true),
                 _ => return self.compile_expr_as_path_select_fallback(sel, result, root_type_name, distinct),
