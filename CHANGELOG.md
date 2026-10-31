@@ -6,6 +6,15 @@ from the same version number.
 
 ## 0.9.0
 
+### Connections
+
+* A connection pool can be closed: `pool.close()` on the Rust `PgPool` and on
+  Python's `PgconPool`, with `is_closed()` to ask. Every idle connection is
+  disconnected at that point and one still checked out is disconnected when
+  it comes back, so a caller that has to make the *database* go away
+  underneath it — `migration squash` and its scratch database — can say when
+  that happens instead of waiting for the handle to be collected.
+
 ### Reading
 
 * `A ?? B` over a walk off a `with` binding now answers `B` when the walk
@@ -24,6 +33,43 @@ from the same version number.
 
 ### Migrations
 
+* `migration squash` works. It was unusable: four separate faults, three of
+  them silent.
+  - The squashed migration now builds the same schema as the migrations it
+    replaces. The net DDL was computed by diffing two snapshots of a shadow
+    database, and those snapshots carried only schemas, types, tables,
+    columns, foreign keys and indexes — so a squashed range created the
+    tables and the indexes and left out every view, every function and every
+    trigger. A 23-migration range collapsed into a file with no
+    cache-invalidation triggers, no interface-link cascade-delete triggers,
+    no rewrite triggers, no computed-link functions and no interface views,
+    and squash reported success. Foreign keys lost their `ON DELETE` policy
+    for the same reason, a new custom scalar's domain came out as a `TODO`
+    comment, a generated column came out as `GENERATED ALWAYS AS (/* see
+    source */)`, and a new table came out with no primary key, no defaults
+    and no check constraints. The range is now read as a full dump — every
+    object with the DDL `pg_catalog` itself reports for it — so views,
+    functions, triggers, primary keys, uniques, checks, delete policies,
+    generated expressions, domains, sequences and expression indexes all
+    carry across.
+  - Squash now proves its own output before writing it: the squashed DDL is
+    replayed on a second shadow database from the same starting state, and
+    the schema it reaches is compared against the one the constituents
+    reached. A difference, or a change that cannot be expressed as a single
+    migration at all (a scalar type losing an enum member), is reported and
+    nothing is written. `--dry-run` runs the same check.
+  - A squashed migration can be applied to a database that had not already
+    applied the migrations it replaces. Reading one back counted its
+    `-- squashed:` header line as part of the body, so the file never hashed
+    to the ID in its own header and `apply` refused it as tampered-with.
+  - The migrations a squash replaces are now deleted, and the shadow
+    database no longer leaks. The constituent files were looked up under a
+    name that never existed, so they stayed on disk beside the file meant to
+    replace them and renumbering then spread them into a chain with two
+    heads; and the drop of the scratch database ran while a pool was still
+    connected to it, failing every single run with `55006 database "…" is
+    being accessed by other users` — after all the real work had succeeded,
+    so the computed result was thrown away and the database survived.
 * Editing an exclusive constraint's `unless` now proposes a migration. The
   predicate is the partial unique index's `WHERE NOT (…)`, and the diff asked
   of it only whether there *was* one — so a predicate-only change was read as

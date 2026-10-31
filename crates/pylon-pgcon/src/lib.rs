@@ -231,6 +231,35 @@ impl PgPool {
         self.pool.manager().statement_caches.clear();
     }
 
+    /// Disconnects the pool: every idle connection is closed now, and one
+    /// still checked out is closed when it is returned rather than being put
+    /// back. Every later `checkout` fails, so a closed pool is spent — this
+    /// is not a reconnect.
+    ///
+    /// A pool is otherwise kept until the process ends, so nothing on a
+    /// query path needs this. What does is a caller that has to make the
+    /// *database* go away underneath it: `DROP DATABASE` fails with 55006
+    /// while any backend is still attached, and `pylon migration squash`
+    /// has a whole pool attached to the shadow database it just finished
+    /// with. Relying on the handle's last reference being dropped instead
+    /// leaves that to whenever the owning language collects it.
+    ///
+    /// Hands the runtime a turn before returning: closing drops each
+    /// connection, and it is that drop which ends the `tokio_postgres`
+    /// connection task and closes the socket the server sees. Awaiting here
+    /// means the backends are normally gone by the time the caller
+    /// continues — though a caller that truly cannot tolerate a straggler
+    /// should still say `WITH (FORCE)` on the drop.
+    pub async fn close(&self) {
+        self.pool.close();
+        tokio::task::yield_now().await;
+    }
+
+    /// Whether `close` has been called on this pool.
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
     /// Labels this pool in observability output — see `PoolWaitObserver`.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();

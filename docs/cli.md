@@ -122,6 +122,8 @@ Recomputes a hand-edited migration's content hash (its ID) and rewrites the file
 
 Collapses a contiguous range of on-disk migrations into one file, computing the *net* DDL via an ephemeral shadow database (requires `CREATEDB` privilege on the target Postgres server — the shadow database is created, the pre-range and in-range migrations are applied to it in turn to compute a before/after diff, then it's dropped).
 
+The result is then replayed on a second shadow database and the schema it reaches compared with the one the constituent migrations reach; the file is written only if the two match. `--dry-run` runs that check too, so it answers "would this squash be sound" without touching anything.
+
 | Flag | Description |
 |---|---|
 | `--from ID` | First migration in the range (inclusive); pairs with `--to`. |

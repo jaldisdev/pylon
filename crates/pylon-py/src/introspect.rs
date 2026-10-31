@@ -25,8 +25,8 @@ use pyo3::prelude::*;
 
 use pylon_core as core;
 
-use crate::DbState;
 use crate::pgcon::{PgconPool, pgcon_err};
+use crate::{DbDump, DbState};
 
 /// Query pg_catalog and return a `DbState` describing the live database.
 #[pyfunction]
@@ -38,7 +38,21 @@ fn introspect_db_state<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound
     })
 }
 
+/// Query pg_catalog and return a `DbDump`: the whole structure of the live
+/// database, every object's own DDL included. For `pylon migration squash`,
+/// which has no compiled schema to render anything from — see
+/// `pylon_core::diff::dump`.
+#[pyfunction]
+fn introspect_db_dump<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let dump = core::introspect::introspect_db_dump(&pool).await.map_err(pgcon_err)?;
+        Ok(DbDump { inner: dump })
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(introspect_db_state, m)?)?;
+    m.add_function(wrap_pyfunction!(introspect_db_dump, m)?)?;
     Ok(())
 }

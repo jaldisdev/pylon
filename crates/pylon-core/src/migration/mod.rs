@@ -158,12 +158,16 @@ pub fn parse(content: &str, filename: &str) -> Result<MigrationFile, MigrationEr
     let onto =
         parse_header_line(onto_line, "onto").ok_or_else(|| MigrationError::MalformedHeader(onto_line.to_string()))?;
 
-    // The body starts after the second newline.
-    // Strip exactly one leading newline that separates headers from body.
-    let body = rest.to_string();
-
     // Parse optional squashed: lines (§12)
     let squashed = parse_squashed_lines(content);
+
+    // The body starts after the header block, which is two lines plus any
+    // `-- squashed:` line below them. Those sit *above* the blank line that
+    // separates header from SQL, and `render_file` hashes the body without
+    // them — read as part of the body, every squashed migration ever written
+    // failed `verify_integrity` and so could never be applied to a database
+    // that had not already applied the migrations it replaced.
+    let body = strip_squashed_header(rest).to_string();
 
     Ok(MigrationFile {
         id: id.to_string(),
@@ -179,6 +183,21 @@ fn parse_header_line<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("-- {}:", key);
     let stripped = line.trim().strip_prefix(prefix.as_str())?;
     Some(stripped.trim())
+}
+
+/// Drop any `-- squashed:` line from the front of what follows the two
+/// positional header lines. Only that exact prefix: a body's own first line
+/// may well be a comment (`-- pylon:step non-transactional`), and taking
+/// that for a header would change what the file hashes to.
+fn strip_squashed_header(rest: &str) -> &str {
+    let mut body = rest;
+    while let Some(line) = body.split_inclusive('\n').next() {
+        if !line.trim_start().starts_with("-- squashed:") {
+            break;
+        }
+        body = &body[line.len()..];
+    }
+    body
 }
 
 /// Extract `-- squashed: id1, id2, ...` from the header block.
@@ -637,6 +656,33 @@ mod tests {
         let content = render_file("initial", &body, &ids);
         let m = parse(&content, "test").unwrap();
         assert_eq!(m.squashed, ids);
+    }
+
+    #[test]
+    fn test_a_squashed_file_round_trips_and_passes_integrity() {
+        // The `-- squashed:` line is a third header line, and the body the
+        // ID is hashed from is the SQL below it — so reading the file back
+        // has to land on that same body, or the only migration that can
+        // never be applied is the one squash just wrote.
+        let ids = vec!["m1aaa".to_string(), "m1bbb".to_string()];
+        let body = make_body("Squashed");
+        let content = render_file("initial", &body, &ids);
+        let m = parse(&content, "test").unwrap();
+        assert_eq!(m.body, body);
+        assert_eq!(m.id, compute_id(&body, "initial", &ids));
+        verify_integrity(&m).unwrap();
+    }
+
+    #[test]
+    fn test_a_body_opening_with_a_step_marker_is_not_read_as_a_header() {
+        // A migration that is entirely `CONCURRENTLY` statements starts with
+        // `-- pylon:step non-transactional`, which is a comment line in the
+        // same shape as a header.
+        let body = "\n-- pylon:step non-transactional\nCREATE INDEX CONCURRENTLY x ON y (z);\n";
+        let content = render_file("initial", body, &[]);
+        let m = parse(&content, "test").unwrap();
+        assert_eq!(m.body, body);
+        verify_integrity(&m).unwrap();
     }
 
     #[test]

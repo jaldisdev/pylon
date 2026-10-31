@@ -2055,16 +2055,43 @@ fn diff_schema(py: Python<'_>, target: &SchemaDescriptor, current: &DbState) -> 
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
-/// Compute the net DDL to go from `before` to `after` (two live-DB snapshots).
-/// Used by the squash command: apply migrations to a shadow DB, introspect before
-/// and after, then call this to produce a single equivalent migration body.
-/// Returns a list of `(sql, non_transactional)` tuples.
+/// A complete snapshot of a live database's structure, DDL included — what
+/// `introspect_db_dump` returns and `diff_dumps` compares. See
+/// `pylon_core::diff::dump`.
+#[pyclass(module = "pylon._core")]
+pub struct DbDump {
+    pub(crate) inner: core::diff::DbDump,
+}
+
+#[pymethods]
+impl DbDump {
+    /// The whole snapshot as JSON — every object and its DDL. Two dumps
+    /// whose JSON matches describe the same database structure, which is
+    /// how a test can compare two databases without going through
+    /// `diff_dumps` (the thing under test).
+    fn to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+/// Compute the net DDL to go from `before` to `after` (two live-DB dumps).
+/// Used by the squash command: apply migrations to a shadow database,
+/// introspect before and after, then call this to produce a single
+/// equivalent migration body. Returns a list of `(sql, non_transactional)`
+/// tuples.
+///
+/// Raises `ValueError` for a difference that cannot be expressed as DDL,
+/// rather than returning an incomplete answer — the caller must not write a
+/// migration file it got an error from.
 #[pyfunction]
-fn diff_states(py: Python<'_>, before: &DbState, after: &DbState) -> Vec<(String, bool)> {
-    py.detach(|| core::diff::diff_states(&before.inner, &after.inner))
-        .into_iter()
-        .map(|op| (op.sql, op.non_transactional))
-        .collect()
+fn diff_dumps(py: Python<'_>, before: &DbDump, after: &DbDump) -> PyResult<Vec<(String, bool)>> {
+    py.detach(|| core::diff::diff_dumps(&before.inner, &after.inner))
+        .map(|ops| {
+            ops.into_iter()
+                .map(|op| (op.sql, op.non_transactional))
+                .collect::<Vec<_>>()
+        })
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Detect potential type (table) renames.
@@ -2510,7 +2537,7 @@ fn deferred_index_backfills(schema: &SchemaDescriptor) -> Vec<DeferredIndex> {
 
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
 /// Returns a `DbState` object usable as a diff baseline for `diff_schema`, the
-/// `diff_schema_*_with_renames_and_fills` pair, and `diff_states`.
+/// `diff_schema_*_with_renames_and_fills` pair.
 #[pyfunction]
 fn db_state_from_json(py: Python<'_>, json: &str) -> PyResult<DbState> {
     py.detach(|| core::diff::db_state_from_json(json))
@@ -2879,11 +2906,12 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Diff / watch
     m.add_class::<DbState>()?;
+    m.add_class::<DbDump>()?;
     m.add_class::<Guidance>()?;
     m.add_class::<MigrationStep>()?;
     m.add_class::<DeferredIndex>()?;
     m.add_function(wrap_pyfunction!(diff_schema, m)?)?;
-    m.add_function(wrap_pyfunction!(diff_states, m)?)?;
+    m.add_function(wrap_pyfunction!(diff_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
     m.add_function(wrap_pyfunction!(detect_col_renames, m)?)?;
     m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;

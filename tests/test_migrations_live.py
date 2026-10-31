@@ -1019,3 +1019,196 @@ def test_interface_pointer_changing_kind_applies_without_hand_reordering(live_po
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{target_module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+@pytest.mark.parametrize('whole_chain', [False, True], ids=['mid-chain range', 'whole chain'])
+def test_squash_reaches_the_same_schema_as_the_migrations_it_replaces(live_pool, tmp_path, unique_module, whole_chain):
+    """`migration squash` wrote a file that did not build the schema the
+    migrations it replaced did.
+
+    The net DDL was computed by diffing two snapshots of a shadow database,
+    and the snapshot only carried schemas, types, tables, columns, foreign
+    keys and indexes — so the squashed migration created the tables and the
+    indexes and silently left out every view, every function and every
+    trigger. Nothing warned about it: a 23-migration range collapsed into a
+    file with no cache-invalidation triggers, no cascade-delete triggers,
+    no rewrite triggers, no computed-link functions and no interface views,
+    and squash reported success.
+
+    This replays the constituents into one database and the squashed file
+    into another, then compares what the two actually hold — the check that
+    would have caught it, and the one `squash` now runs on itself before
+    writing anything. The comparison goes through `DbDump.to_json`, not
+    `diff_dumps`, so the diff engine is not its own witness.
+    """
+    import json
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_squash')
+    target_module = unique_module('live_squash_tags')
+    (tmp_path / 'migrations').mkdir()
+    migrations_dir = tmp_path / 'migrations'
+    # Named after the module, not after the test: both parametrizations run
+    # in one interpreter, and two schema files of the same name are one
+    # cached import — the second would register the first's types and
+    # `create` would report nothing to do.
+    schema_file = tmp_path / f'{module}_schema.py'
+
+    # Version by version the chain adds, and then takes away again, objects
+    # of the kinds the old squash dropped on the floor: an interface view, a
+    # multi-link's junctions and link view, a rewrite's trigger *and* its
+    # function, a foreign key with a delete policy, check constraints and a
+    # unique index.
+    def write_schema(version: int) -> None:
+        tags = (
+            '    tags: pylon.MultiLink[Tag, pylon.OnDelete(pylon.Target, pylon.Allow)]\n' if version in (2, 3) else ''
+        )
+        note = "    note: pylon.Property[str, pylon.Rewrite(pylon.On.Insert, '.slug')]\n" if version >= 3 else ''
+        archive = (
+            (
+                f"@pylon.type(module={module!r}, name='Archive')\n"
+                'class Archive:\n'
+                '    slug: pylon.Property[str, pylon.Exclusive, pylon.MaxLen(40)]\n'
+                '    owner: pylon.Link[Tag, pylon.OnDelete(pylon.Target, pylon.DeleteSource)]\n'
+                f'{note}'
+            )
+            if version >= 3
+            else ''
+        )
+        # Present from the start and gone by v4, so a range that ends there
+        # has to drop it — the table and, after it, the function its trigger
+        # calls.
+        scratch = (
+            (
+                f"@pylon.type(module={module!r}, name='Scratch')\n"
+                'class Scratch:\n'
+                '    title: str\n'
+                "    label: pylon.Property[str, pylon.Rewrite(pylon.On.Insert, '.title')]\n"
+            )
+            if version <= 3
+            else ''
+        )
+        # And the length the interface's own check enforces changes, on two
+        # implementors' tables that are already there.
+        title_max = 60 if version >= 4 else 120
+        schema_file.write_text(
+            'import pylon.schema as pylon\n\n'
+            f"@pylon.type(module={target_module!r}, name='Tag')\n"
+            'class Tag:\n'
+            '    label: str\n\n'
+            f"@pylon.interface(module={module!r}, name='Perspective')\n"
+            'class Perspective:\n'
+            f'    title: pylon.Property[str, pylon.MaxLen({title_max})]\n'
+            f'{tags}\n'
+            f"@pylon.type(module={module!r}, name='Report')\n"
+            'class Report(Perspective):\n'
+            '    pages: int\n\n'
+            f"@pylon.type(module={module!r}, name='Brief')\n"
+            'class Brief(Perspective):\n'
+            '    summary: str\n\n'
+            f'{scratch}\n'
+            f'{archive}'
+        )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    written: list[str] = []
+
+    async def dump_of(bodies: list[str]) -> dict:
+        """Apply `bodies` in order to a throwaway database and introspect it."""
+        from pylon._core import introspect_db_dump, migration_apply_one, parse_migration, pgcon_connect
+
+        from pylon.cli.commands.migrations import _shadow_database
+
+        admin_pool = await pgcon_connect(live_db_dsn(), 2)
+        try:
+            async with _shadow_database(admin_pool, live_db_dsn()) as pool:
+                for i, body in enumerate(bodies, start=1):
+                    await migration_apply_one(pool, parse_migration(body, f'{i:05d}_replay'), False)
+                return json.loads((await introspect_db_dump(pool)).to_json())
+        finally:
+            await admin_pool.close()
+
+    try:
+        # `create` refuses while anything is unapplied, so the chain is built
+        # one applied migration at a time. Squash itself never touches this
+        # database beyond creating and dropping its shadow copies.
+        for version in (1, 2, 3, 4):
+            write_schema(version)
+            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            # Each file's text is kept as it appears: squash deletes the ones
+            # it replaces, and this database's tracking rows for them still
+            # have to be cleaned up afterwards.
+            written = [f.read_text() for f in sorted(migrations_dir.glob('*.sql'))]
+            assert result.exit_code == 0, result.output
+            result = runner.invoke(migration.commands['apply'], [], obj=obj)
+            assert result.exit_code == 0, result.output
+
+        assert len(written) == 4, written
+        ids = [re.search(r'^-- migration: (\S+)$', text, re.MULTILINE).group(1) for text in written]
+
+        # Either the whole chain — what squashing is usually reached for —
+        # or everything but the first, which starts the range from a state
+        # that already has tables, views and triggers in it.
+        if whole_chain:
+            args, replaced, kept = ['--count', '4'], ids, []
+        else:
+            args, replaced, kept = ['--from', ids[1], '--to', ids[3]], ids[1:], [written[0]]
+
+        result = runner.invoke(migration.commands['squash'], args, obj=obj)
+        assert result.exit_code == 0, result.output
+
+        remaining = sorted(migrations_dir.glob('*.sql'))
+        assert len(remaining) == len(kept) + 1, [f.name for f in remaining]
+        squashed = remaining[-1].read_text()
+        written.append(squashed)
+        assert f'-- squashed: {", ".join(replaced)}' in squashed, squashed
+
+        # The symptom, directly: the squashed body carries the object kinds
+        # the old one left out.
+        for ddl in ('CREATE TRIGGER', 'CREATE OR REPLACE FUNCTION'):
+            assert ddl in squashed, f'squashed migration has no {ddl} statement:\n{squashed}'
+        if whole_chain:
+            assert 'CREATE VIEW' in squashed, f'squashed migration has no view:\n{squashed}'
+        else:
+            # And churn *inside* the range cancels, which is the point of
+            # squashing: the multi-link v2 added and v4 took away leaves no
+            # junction table, no link view and no trace in the file.
+            assert '.tags' not in squashed, squashed
+            # And what was there before the range and gone by the end of it
+            # is dropped. (That a dropped table goes ahead of the function
+            # its trigger calls is unit-tested in `pylon_core::diff::dump`:
+            # `migration create` leaves a dropped type's rewrite function
+            # behind, so a replay of these files never has one to drop.)
+            assert 'DROP TABLE IF EXISTS' in squashed, squashed
+
+        async def check() -> None:
+            replayed = await dump_of(written[:4])
+            collapsed = await dump_of([*kept, squashed])
+            for section in sorted(replayed):
+                assert replayed[section] == collapsed[section], (
+                    f'the squashed migration reaches a different {section} than the migrations it replaces'
+                )
+            assert replayed == collapsed
+
+        asyncio.run(check())
+    finally:
+        migration_ids = re.findall(r'^-- migration: (\S+)$', '\n'.join(written), re.MULTILINE)
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{target_module}" CASCADE;')
+
+        asyncio.run(cleanup())

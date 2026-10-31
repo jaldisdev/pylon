@@ -450,6 +450,24 @@ impl PgconPool {
         let pool = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move { pool.refresh_types().await.map_err(pgcon_err) })
     }
+
+    /// See `PgPool::close` — disconnects every connection in the pool and
+    /// spends the handle. For a caller that has to drop the database it is
+    /// connected to (`pylon migration squash` and its shadow database);
+    /// `await`ing this is what makes the backends gone at a known moment
+    /// rather than whenever Python collects the last reference.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            pool.close().await;
+            Ok(())
+        })
+    }
+
+    /// Whether `close` has been called on this pool.
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
 }
 
 /// Opens a new pool against `dsn`, returning a `PgconPool` handle.

@@ -125,6 +125,8 @@ pylon migration squash --from m1aaaa... --to m1bbbb...
 
 Long-lived projects accumulate migrations faster than anyone wants to read through. `squash` collapses a contiguous range into one file containing only the **net** DDL — not the concatenation of the originals, the actual before/after diff. It computes this safely by spinning up a real, ephemeral shadow database (requires `CREATEDB` privilege): applying every migration before the range to reach the "before" state, applying the range itself to reach "after," diffing the two, then dropping the shadow database.
 
+Then it proves the result. The squashed DDL is replayed on a *second* shadow database, from the same starting state, and the schema it reaches is compared with the one the constituents reached — every table, column, constraint, index, view, function and trigger, with the DDL the catalog itself reports for each. Only if the two match is the file written. If anything differs, or if the range contains a change that cannot be expressed as a single migration at all (removing a member from a scalar type's enum, say), `squash` reports it and writes nothing rather than leaving you a file that quietly builds a different schema.
+
 The squashed file's header records every migration ID it replaced. This matters for compatibility: a database that already applied the old, unsquashed chain is recognized as already up to date (backfilled silently) the next time `pylon migration apply` runs against it — it doesn't try to reapply DDL that's already there under the old file names.
 
 ## First-time setup

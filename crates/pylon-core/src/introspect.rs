@@ -31,6 +31,10 @@
 //! here rather than teaching `pylon-pgcon` a second, more general
 //! "decode every column" path for this one caller.
 
+use crate::diff::dump::{
+    ConstraintKind, DbDump, DumpAttribute, DumpColumn, DumpComposite, DumpConstraint, DumpDomain, DumpEnum,
+    DumpFunction, DumpIndex, DumpSequence, DumpTable, DumpTrigger, DumpView,
+};
 use crate::diff::{
     DbColumn, DbComposite, DbCompositeAttr, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence, DbState,
     DbTable, DbView,
@@ -96,6 +100,13 @@ fn as_opt_str(v: DecodedValue) -> Option<String> {
     match v {
         DecodedValue::Null => None,
         DecodedValue::Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn as_i64(v: DecodedValue) -> Option<i64> {
+    match v {
+        DecodedValue::I64(i) => Some(i),
         _ => None,
     }
 }
@@ -557,6 +568,509 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
     }
 
     Ok(state)
+}
+
+// ── Full dump (for squash) ────────────────────────────────────────────────────
+//
+// `DbState` above answers "does the database already have what the schema
+// asks for". These queries answer a different question — "what exactly does
+// this database hold" — for `pylon migration squash`, which has no compiled
+// schema to re-render anything from and so needs the catalog's own DDL for
+// every object it carries across. See `crate::diff::dump`.
+//
+// Every one of them skips objects an extension owns (`pg_depend.deptype =
+// 'e'`): `CREATE EXTENSION vector` installs functions and operators into the
+// schema it is created in, and a squash re-creating those by hand instead of
+// saying `CREATE EXTENSION` would be both wrong and unrunnable.
+
+/// Schema names as Postgres has them, `public` included — unlike
+/// `SCHEMAS_SQL`, which leaves it out because `DbState` calls it `default`.
+const DUMP_SCHEMAS_SQL: &str = r#"
+    SELECT nspname AS result
+    FROM pg_namespace
+    WHERE nspname NOT LIKE 'pg_%'
+      AND nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_namespace'::regclass AND d.objid = pg_namespace.oid AND d.deptype = 'e'
+      )
+    ORDER BY nspname
+"#;
+
+const DUMP_ENUMS_SQL: &str = r#"
+    SELECT (n.nspname, t.typname, e.enumlabel) AS result
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    JOIN pg_enum e ON e.enumtypid = t.oid
+    WHERE t.typtype = 'e'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e'
+      )
+    ORDER BY n.nspname, t.typname, e.enumsortorder
+"#;
+
+const DUMP_DOMAINS_SQL: &str = r#"
+    SELECT (
+        n.nspname,
+        t.typname,
+        pg_catalog.format_type(t.typbasetype, t.typtypmod),
+        t.typnotnull,
+        t.typdefault
+    ) AS result
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typtype = 'd'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e'
+      )
+    ORDER BY n.nspname, t.typname
+"#;
+
+const DUMP_DOMAIN_CHECKS_SQL: &str = r#"
+    SELECT (n.nspname, t.typname, c.conname, pg_get_constraintdef(c.oid)) AS result
+    FROM pg_constraint c
+    JOIN pg_type t ON t.oid = c.contypid
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE c.contype = 'c'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+    ORDER BY n.nspname, t.typname, c.conname
+"#;
+
+const DUMP_SEQUENCES_SQL: &str = r#"
+    SELECT (
+        n.nspname,
+        c.relname,
+        pg_catalog.format_type(s.seqtypid, NULL),
+        s.seqstart,
+        s.seqincrement,
+        s.seqmin,
+        s.seqmax,
+        s.seqcycle
+    ) AS result
+    FROM pg_sequence s
+    JOIN pg_class c ON c.oid = s.seqrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype IN ('a', 'i', 'e')
+      )
+    ORDER BY n.nspname, c.relname
+"#;
+
+const DUMP_TABLES_SQL: &str = r#"
+    SELECT (n.nspname, c.relname) AS result
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      )
+    ORDER BY n.nspname, c.relname
+"#;
+
+const DUMP_COLUMNS_SQL: &str = r#"
+    SELECT (
+        a.attname,
+        pg_catalog.format_type(a.atttypid, a.atttypmod),
+        NOT a.attnotnull,
+        CASE WHEN a.atthasdef AND a.attgenerated = '' THEN
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+        END,
+        CASE WHEN a.attgenerated = 's' THEN
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+        END
+    ) AS result
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+    WHERE n.nspname = $1
+      AND c.relname = $2
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY a.attnum
+"#;
+
+const DUMP_CONSTRAINTS_SQL: &str = r#"
+    SELECT (con.conname, con.contype::text, pg_get_constraintdef(con.oid), i.relname) AS result
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_class i ON i.oid = con.conindid
+    WHERE n.nspname = $1
+      AND c.relname = $2
+    ORDER BY con.conname
+"#;
+
+// Every valid index, the ones a constraint owns included — those are
+// reported with their constraint's name so the emitter knows not to create
+// them a second time. An invalid index (a `CONCURRENTLY` build that failed)
+// is left out: it enforces nothing and reproducing it would be reproducing
+// the failure.
+const DUMP_INDEXES_SQL: &str = r#"
+    SELECT (
+        i.relname,
+        pg_get_indexdef(ix.indexrelid),
+        (SELECT con.conname FROM pg_constraint con WHERE con.conindid = ix.indexrelid LIMIT 1)
+    ) AS result
+    FROM pg_index ix
+    JOIN pg_class i ON i.oid = ix.indexrelid
+    JOIN pg_class t ON t.oid = ix.indrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    WHERE ix.indisvalid
+      AND n.nspname = $1
+      AND t.relname = $2
+    ORDER BY i.relname
+"#;
+
+const DUMP_TRIGGERS_SQL: &str = r#"
+    SELECT (t.tgname, pg_get_triggerdef(t.oid)) AS result
+    FROM pg_trigger t
+    JOIN pg_class c ON c.oid = t.tgrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE NOT t.tgisinternal
+      AND n.nspname = $1
+      AND c.relname = $2
+    ORDER BY t.tgname
+"#;
+
+const DUMP_VIEWS_SQL: &str = r#"
+    SELECT (n.nspname, c.relname, pg_get_viewdef(c.oid, true)) AS result
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'v'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      )
+    ORDER BY n.nspname, c.relname
+"#;
+
+/// Which relations each view reads, via the rewrite rule that is its
+/// definition. A view over a view has to be created second, and a name says
+/// nothing about which way round that is.
+const DUMP_VIEW_DEPS_SQL: &str = r#"
+    SELECT DISTINCT (dn.nspname, dc.relname, sn.nspname, sc.relname) AS result
+    FROM pg_depend d
+    JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+    JOIN pg_class dc ON dc.oid = r.ev_class
+    JOIN pg_namespace dn ON dn.oid = dc.relnamespace
+    JOIN pg_class sc ON sc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+    JOIN pg_namespace sn ON sn.oid = sc.relnamespace
+    WHERE dc.relkind = 'v'
+      AND sc.oid <> dc.oid
+      AND sc.relkind IN ('r', 'v', 'm', 'p', 'f')
+      AND dn.nspname <> ALL($1::text[])
+      AND sn.nspname <> ALL($1::text[])
+    ORDER BY 1
+"#;
+
+const DUMP_FUNCTIONS_SQL: &str = r#"
+    SELECT (
+        n.nspname,
+        p.proname,
+        pg_get_function_identity_arguments(p.oid),
+        pg_get_functiondef(p.oid)
+    ) AS result
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.prokind = 'f'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+      )
+    ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
+"#;
+
+/// Read the whole structure of the live database, DDL included — see
+/// `crate::diff::dump` for what this is for and `diff_dumps` for what reads
+/// it.
+pub async fn introspect_db_dump(pool: &PgPool) -> Result<DbDump> {
+    let mut dump = DbDump::default();
+    let excludes = exclude_param(&OBJECT_EXCLUDES);
+    let one = std::slice::from_ref(&excludes);
+
+    for row in query(pool, DUMP_SCHEMAS_SQL, one).await? {
+        if let Some(nspname) = as_str(row) {
+            dump.schemas.push(nspname);
+        }
+    }
+
+    for row in query(pool, EXTENSIONS_SQL, &[]).await? {
+        if let Some(extname) = as_str(row) {
+            dump.extensions.push(extname);
+        }
+    }
+
+    // One row per member, consecutive rows sharing a type.
+    for row in query(pool, DUMP_ENUMS_SQL, one).await? {
+        let Some([schema, name, member]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(member)) = (as_str(schema), as_str(name), as_str(member)) else {
+            continue;
+        };
+        match dump.enums.last_mut() {
+            Some(e) if e.schema == schema && e.name == name => e.members.push(member),
+            _ => dump.enums.push(DumpEnum {
+                schema,
+                name,
+                members: vec![member],
+            }),
+        }
+    }
+
+    for row in query(pool, DUMP_DOMAINS_SQL, one).await? {
+        let Some([schema, name, base_type, not_null, default]) = fields::<5>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(base_type), Some(not_null)) =
+            (as_str(schema), as_str(name), as_str(base_type), as_bool(not_null))
+        else {
+            continue;
+        };
+        dump.domains.push(DumpDomain {
+            schema,
+            name,
+            base_type,
+            not_null,
+            default_expr: as_opt_str(default),
+            checks: Vec::new(),
+        });
+    }
+
+    for row in query(pool, DUMP_DOMAIN_CHECKS_SQL, one).await? {
+        let Some([schema, name, conname, definition]) = fields::<4>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(conname), Some(definition)) =
+            (as_str(schema), as_str(name), as_str(conname), as_str(definition))
+        else {
+            continue;
+        };
+        if let Some(domain) = dump.domains.iter_mut().find(|d| d.schema == schema && d.name == name) {
+            domain.checks.push(DumpConstraint {
+                name: conname,
+                kind: ConstraintKind::Check,
+                definition,
+                index: None,
+            });
+        }
+    }
+
+    // Composite types — `relkind = 'c'` separates a declared tuple's type
+    // from the row type every table and view also has. One row per
+    // attribute, in attribute order, which is part of the type's identity.
+    for row in query(pool, COMPOSITES_SQL, one).await? {
+        let Some([schema, name, attname, attr_type]) = fields::<4>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else {
+            continue;
+        };
+        let attribute = match (as_str(attname), as_str(attr_type)) {
+            (Some(name), Some(pg_type)) => Some(DumpAttribute { name, pg_type }),
+            // A composite with no attributes at all reports one row with none.
+            _ => None,
+        };
+        match dump.composites.last_mut() {
+            Some(c) if c.schema == schema && c.name == name => c.attributes.extend(attribute),
+            _ => dump.composites.push(DumpComposite {
+                schema,
+                name,
+                attributes: attribute.into_iter().collect(),
+            }),
+        }
+    }
+
+    for row in query(pool, DUMP_SEQUENCES_SQL, one).await? {
+        let Some([schema, name, data_type, start, increment, min, max, cycle]) = fields::<8>(row) else {
+            continue;
+        };
+        let (
+            Some(schema),
+            Some(name),
+            Some(data_type),
+            Some(start_value),
+            Some(increment_by),
+            Some(min_value),
+            Some(max_value),
+            Some(cycle),
+        ) = (
+            as_str(schema),
+            as_str(name),
+            as_str(data_type),
+            as_i64(start),
+            as_i64(increment),
+            as_i64(min),
+            as_i64(max),
+            as_bool(cycle),
+        )
+        else {
+            continue;
+        };
+        dump.sequences.push(DumpSequence {
+            schema,
+            name,
+            data_type,
+            start_value,
+            increment_by,
+            min_value,
+            max_value,
+            cycle,
+        });
+    }
+
+    for row in query(pool, DUMP_TABLES_SQL, one).await? {
+        let Some([schema_v, name_v]) = fields::<2>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name)) = (as_str(schema_v), as_str(name_v)) else {
+            continue;
+        };
+        let params = [DecodedValue::Str(schema.clone()), DecodedValue::Str(name.clone())];
+
+        let mut columns = Vec::new();
+        for col in query(pool, DUMP_COLUMNS_SQL, &params).await? {
+            let Some([attname, pg_type, nullable, default, generated]) = fields::<5>(col) else {
+                continue;
+            };
+            let (Some(attname), Some(pg_type), Some(nullable)) = (as_str(attname), as_str(pg_type), as_bool(nullable))
+            else {
+                continue;
+            };
+            columns.push(DumpColumn {
+                name: attname,
+                pg_type,
+                nullable,
+                default_expr: as_opt_str(default),
+                generated_expr: as_opt_str(generated),
+            });
+        }
+
+        let mut constraints = Vec::new();
+        for con in query(pool, DUMP_CONSTRAINTS_SQL, &params).await? {
+            let Some([conname, contype, definition, index]) = fields::<4>(con) else {
+                continue;
+            };
+            let (Some(conname), Some(contype), Some(definition)) =
+                (as_str(conname), as_str(contype), as_str(definition))
+            else {
+                continue;
+            };
+            let Some(kind) = ConstraintKind::from_contype(&contype) else {
+                continue;
+            };
+            constraints.push(DumpConstraint {
+                name: conname,
+                kind,
+                definition,
+                index: as_opt_str(index),
+            });
+        }
+
+        let mut indexes = Vec::new();
+        for idx in query(pool, DUMP_INDEXES_SQL, &params).await? {
+            let Some([relname, definition, constraint]) = fields::<3>(idx) else {
+                continue;
+            };
+            let (Some(relname), Some(definition)) = (as_str(relname), as_str(definition)) else {
+                continue;
+            };
+            indexes.push(DumpIndex {
+                name: relname,
+                definition,
+                constraint: as_opt_str(constraint),
+            });
+        }
+
+        let mut triggers = Vec::new();
+        for trigger in query(pool, DUMP_TRIGGERS_SQL, &params).await? {
+            let Some([tgname, definition]) = fields::<2>(trigger) else {
+                continue;
+            };
+            let (Some(tgname), Some(definition)) = (as_str(tgname), as_str(definition)) else {
+                continue;
+            };
+            triggers.push(DumpTrigger {
+                name: tgname,
+                definition,
+            });
+        }
+
+        dump.tables.push(DumpTable {
+            schema,
+            name,
+            columns,
+            constraints,
+            indexes,
+            triggers,
+        });
+    }
+
+    for row in query(pool, DUMP_VIEWS_SQL, one).await? {
+        let Some([schema, name, definition]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(definition)) = (as_str(schema), as_str(name), as_str(definition)) else {
+            continue;
+        };
+        dump.views.push(DumpView {
+            schema,
+            name,
+            definition,
+            depends_on: Vec::new(),
+        });
+    }
+
+    for row in query(pool, DUMP_VIEW_DEPS_SQL, one).await? {
+        let Some([schema, name, dep_schema, dep_name]) = fields::<4>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(dep_schema), Some(dep_name)) =
+            (as_str(schema), as_str(name), as_str(dep_schema), as_str(dep_name))
+        else {
+            continue;
+        };
+        if let Some(view) = dump.views.iter_mut().find(|v| v.schema == schema && v.name == name) {
+            view.depends_on.push((dep_schema, dep_name));
+        }
+    }
+
+    for row in query(pool, DUMP_FUNCTIONS_SQL, one).await? {
+        let Some([schema, name, identity_args, definition]) = fields::<4>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name), Some(identity_args), Some(definition)) =
+            (as_str(schema), as_str(name), as_str(identity_args), as_str(definition))
+        else {
+            continue;
+        };
+        dump.functions.push(DumpFunction {
+            schema,
+            name,
+            identity_args,
+            definition,
+        });
+    }
+
+    Ok(dump)
 }
 
 #[cfg(test)]

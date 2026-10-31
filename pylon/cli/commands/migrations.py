@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import click
@@ -1557,19 +1558,13 @@ async def _squash(
     count: int | None,
     dry_run: bool,
 ) -> None:
-    import secrets
-
     from pylon._core import (
         compute_migration_short_id,
-        introspect_db_state,
-        migration_ensure_internal_schema,
+        diff_dumps,
+        introspect_db_dump,
         pgcon_connect,
         render_migration_file,
     )
-    from pylon._core import (
-        diff_states as _core_diff_states,
-    )
-    from pylon.exceptions import QueryError
 
     config = ctx.obj['config']
     d = _migrations_dir(config)
@@ -1613,55 +1608,52 @@ async def _squash(
         f'Squashing {len(squash_range)} migration(s) ({squash_range[0].short_id} … {squash_range[-1].short_id})…'
     )
 
-    # ── Spin up ephemeral shadow database ──────────────────────────────────────
-    dsn = _pg_dsn(config)
-    shadow_name = f'_pylon_shadow_{secrets.token_hex(8)}'
-    click.echo(f'Creating shadow database {shadow_name!r}…')
+    pre_range = chain[:range_start]
 
+    # ── Compute the net DDL on an ephemeral shadow database ───────────────────
+    dsn = _pg_dsn(config)
     admin_pool = await pgcon_connect(dsn, 2)
     try:
-        await admin_pool.execute(f'CREATE DATABASE "{shadow_name}" TEMPLATE template0', [])
-    except QueryError as exc:
-        if getattr(exc, 'sqlstate', None) == '42501':  # insufficient_privilege
-            raise click.ClickException('Squash requires CREATEDB privilege on the PostgreSQL server.') from exc
-        raise
+        async with _shadow_database(admin_pool, dsn) as shadow_pool:
+            for m in pre_range:
+                await _apply_one(shadow_pool, m, False)
+            before_dump = await introspect_db_dump(shadow_pool)
 
-    before_state = after_state = None
-    try:
-        shadow_dsn = _shadow_dsn(dsn, shadow_name)
-        shadow_pool = await pgcon_connect(shadow_dsn, 2)
-        await shadow_pool.execute('CREATE SCHEMA IF NOT EXISTS _pylon', [])
-        await migration_ensure_internal_schema(shadow_pool)
+            for m in squash_range:
+                await _apply_one(shadow_pool, m, False)
+            after_dump = await introspect_db_dump(shadow_pool)
 
-        # Apply migrations before the squash range to reach the "before" state.
-        pre_range = chain[:range_start]
-        for m in pre_range:
-            await _apply_one(shadow_pool, m, False)
+        try:
+            ops = diff_dumps(before_dump, after_dump)
+        except ValueError as exc:
+            raise click.ClickException(
+                f'This range cannot be collapsed into one migration: {exc}\nNothing was written.'
+            ) from exc
 
-        before_state = await introspect_db_state(shadow_pool)
+        if not ops:
+            raise click.ClickException('Squash range produces no net DDL changes — nothing to write.')
 
-        # Apply the squash range to reach the "after" state.
-        for m in squash_range:
-            await _apply_one(shadow_pool, m, False)
+        body = _assemble_migration_body(ops)
+        new_short_id = compute_migration_short_id(body, onto, squashed_ids)
+        content = render_migration_file(onto, body, squashed_ids)
 
-        after_state = await introspect_db_state(shadow_pool)
+        # Sequence number = position of range_start in the final file list (1-indexed).
+        seq = range_start + 1
+        filename = f'{seq:05d}_{new_short_id}.sql'
+
+        differences = await _verify_squash(admin_pool, dsn, pre_range, content, filename, after_dump)
     finally:
-        await admin_pool.execute(f'DROP DATABASE IF EXISTS "{shadow_name}"', [])
-        click.echo(f'Dropped shadow database {shadow_name!r}.')
+        await admin_pool.close()
 
-    # ── Compute the net DDL ────────────────────────────────────────────────────
-    ops = _core_diff_states(before_state, after_state)
-
-    if not ops:
-        raise click.ClickException('Squash range produces no net DDL changes — nothing to write.')
-
-    body = _assemble_migration_body(ops)
-    new_short_id = compute_migration_short_id(body, onto, squashed_ids)
-    content = render_migration_file(onto, body, squashed_ids)
-
-    # Sequence number = position of range_start in the final file list (1-indexed).
-    seq = range_start + 1
-    filename = f'{seq:05d}_{new_short_id}.sql'
+    if differences:
+        shown = '\n'.join(f'  {sql}' for sql in differences[:10])
+        more = f'\n  … and {len(differences) - 10} more' if len(differences) > 10 else ''
+        raise click.ClickException(
+            'The squashed migration does not reach the same schema as the migrations it would '
+            f'replace. Nothing was written.\n\nStill different afterwards:\n{shown}{more}\n\n'
+            'This is a bug in Pylon — the range is sound, since applying it is what produced the '
+            'state being compared against. Please report it with the migrations involved.'
+        )
 
     if dry_run:
         click.echo(f'\n-- would write: {d / filename}')
@@ -1671,16 +1663,102 @@ async def _squash(
         return
 
     # ── Write squashed file, delete constituents, renumber ────────────────────
-    (d / filename).write_text(content)
+    # `_load_migrations` parses each file under its *stem*, so that is what
+    # `filename` holds — `.sql` is not part of it, and `d / m.filename` named
+    # nothing that existed. The constituents stayed on disk next to the
+    # squashed file that was supposed to replace them, and the renumbering
+    # below then spread them out as a chain with two heads.
+    doomed = [d / f'{m.filename}.sql' for m in squash_range]
+    missing = [f.name for f in doomed if not f.exists()]
+    if missing:
+        raise click.ClickException(f'Cannot find the file(s) to replace: {", ".join(missing)}. Nothing was written.')
 
-    for m in squash_range:
-        f = d / m.filename
-        if f.exists():
-            f.unlink()
+    (d / filename).write_text(content)
+    for f in doomed:
+        f.unlink()
 
     _renumber_migrations(d)
 
     click.echo(f'Squashed {len(squash_range)} migration(s) → {filename}')
+
+
+@asynccontextmanager
+async def _shadow_database(admin_pool, dsn: str):
+    """Create a throwaway database, yield a pool on it, then drop both.
+
+    The pool is closed before the drop: PostgreSQL refuses to drop a
+    database anything is still connected to (55006
+    `is being accessed by other users`), and this pool is connected to it.
+    Letting the last Python reference go instead would leave that to
+    whenever the interpreter collects it, which is why `PgconPool.close`
+    exists. Any backend that outlived the close — another `pylon` in
+    flight, a psql someone left open — is terminated, and the drop says
+    `WITH (FORCE)` on top of that, so a stray connection cannot leave the
+    scratch database behind either.
+    """
+    import secrets
+
+    from pylon._core import migration_ensure_internal_schema, pgcon_connect
+    from pylon.exceptions import QueryError
+
+    name = f'_pylon_shadow_{secrets.token_hex(8)}'
+    click.echo(f'Creating shadow database {name!r}…')
+    try:
+        await admin_pool.execute(f'CREATE DATABASE "{name}" TEMPLATE template0', [])
+    except QueryError as exc:
+        if getattr(exc, 'sqlstate', None) == '42501':  # insufficient_privilege
+            raise click.ClickException('Squash requires CREATEDB privilege on the PostgreSQL server.') from exc
+        raise
+
+    pool = None
+    try:
+        pool = await pgcon_connect(_shadow_dsn(dsn, name), 2)
+        await pool.execute('CREATE SCHEMA IF NOT EXISTS _pylon', [])
+        await migration_ensure_internal_schema(pool)
+        yield pool
+    finally:
+        if pool is not None:
+            await pool.close()
+        await admin_pool.execute(
+            'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()',
+            [name],
+        )
+        await admin_pool.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)', [])
+        click.echo(f'Dropped shadow database {name!r}.')
+
+
+async def _verify_squash(admin_pool, dsn: str, pre_range: list, content: str, filename: str, expected) -> list[str]:
+    """Return every way the squashed migration's schema differs from the one
+    the migrations it replaces reach — empty when the two are the same.
+
+    A squashed migration is written from what two snapshots of a database
+    differ by, and a snapshot can only carry what `pg_catalog` was asked
+    for. That makes "did this capture everything" a question about Pylon's
+    own introspection, which no amount of reading the generated SQL can
+    answer — so the file is not written on the strength of the diff alone.
+    It is replayed, on a second shadow database, against the same starting
+    state, and the schema it actually reaches is compared with the one the
+    constituents actually reached.
+
+    Compared in both directions: an object present on one side and not the
+    other is an *addition* in exactly one of them, and additions are what a
+    diff is surest about.
+    """
+    from pylon._core import diff_dumps, introspect_db_dump, parse_migration
+
+    click.echo('\nVerifying the squashed migration reaches the same schema…')
+    squashed = parse_migration(content, Path(filename).stem)
+    async with _shadow_database(admin_pool, dsn) as shadow_pool:
+        for m in pre_range:
+            await _apply_one(shadow_pool, m, False)
+        await _apply_one(shadow_pool, squashed, False)
+        reached = await introspect_db_dump(shadow_pool)
+
+    try:
+        drift = diff_dumps(expected, reached) + diff_dumps(reached, expected)
+    except ValueError as exc:
+        return [str(exc)]
+    return [sql for sql, _ in drift]
 
 
 def _shadow_dsn(dsn: str, shadow_name: str) -> str:
