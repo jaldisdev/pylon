@@ -70,6 +70,45 @@ from the same version number.
     connected to it, failing every single run with `55006 database "…" is
     being accessed by other users` — after all the real work had succeeded,
     so the computed result was thrown away and the database survived.
+* A database that applied the chain as it was before a squash can be
+  brought onto the squashed chain. Its tip is the last migration the squash
+  replaced — by definition no longer a file on disk — and `apply`, `status`
+  and `create` each read that as a diverged history and refused. So
+  `apply`'s own backfill for exactly this case was unreachable in every
+  case it was written for, `status` reported a correctly-migrated database
+  as broken, and `create` would not write the next migration until the
+  tracking table had been resolved by hand. All three now place the tip
+  through the `-- squashed:` headers the squashed files carry:
+  - `apply` records the squashed migration without re-running DDL the
+    database already has, and deletes the tracking rows of the migrations
+    it replaced — so a database reconciled this way holds exactly the
+    tracking a freshly migrated one does, rather than rows naming files
+    nobody has.
+  - `status` reports the database as up to date and names the file that
+    absorbed its tip.
+  - `create` proceeds.
+  - The published schema snapshot's `written_onto` no longer names a
+    migration that no longer exists; the backfill re-points it without
+    republishing the schema itself.
+  - A database that stopped *partway* into a replaced range is the one case
+    none of this can resolve — the squashed migration's DDL starts from the
+    state before the range — and all three commands now say so, and which
+    file, instead of "history has diverged. Resolve manually."
+* `migration squash` refuses a range that does not end at the chain tip
+  (`--count` always does). The migration after the range kept naming the
+  one it followed, which the squash had just deleted, and nothing rewrote
+  that link — rewriting it would change that migration's own ID and every
+  ID after it, which is the history other databases have already recorded.
+  Squashing a middle range therefore produced a chain every later command
+  rejected as a conflict.
+* `migration apply` clears tracking rows for unapplied migrations that no
+  file on disk has any more, and `status` lists them. `create` writes a row
+  for the migration it has just written, ahead of that migration being
+  applied, and nothing removed it when the migration stopped existing —
+  regenerated after a further schema edit, or squashed away. They
+  accumulated under IDs no file ever had, and they are not inert: the
+  squash backfill above decides what a database has already run from this
+  table. Applied rows are never touched.
 * Editing an exclusive constraint's `unless` now proposes a migration. The
   predicate is the partial unique index's `WHERE NOT (…)`, and the diff asked
   of it only whether there *was* one — so a predicate-only change was read as

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 import click
 
@@ -76,6 +77,73 @@ def _ordered_chain(migrations: list) -> list:
         raise click.ClickException(f'Migration chain error: {exc}') from exc
     by_id = {m.id: m for m in migrations}
     return [by_id[mid] for mid in ordered_ids]
+
+
+class _TipPosition(NamedTuple):
+    """Where a database's applied tip sits in the on-disk chain.
+
+    `applied_through` indexes the last migration in the chain whose effect
+    the database already holds — `-1` when it holds none. `absorbed_by` is
+    that migration when its DDL has already run under the names it
+    replaced, so it wants recording rather than running. `problem` says
+    why the tip could not be placed at all, and is the only case a caller
+    should refuse on.
+    """
+
+    applied_through: int
+    absorbed_by: object | None
+    problem: str | None
+
+
+def _place_applied_tip(applied_tip: str | None, chain: list) -> _TipPosition:
+    """Resolve the database's applied tip against the chain on disk.
+
+    A tip naming no file on disk is not by itself a diverged history. A
+    squash deletes the files it replaces, and the squashed migration's
+    `-- squashed:` header is the record of which IDs those were — so a
+    database that applied the pre-squash chain has a tip that is, by
+    definition, no longer a file. Reading the tip through those headers is
+    what carries such a database onto the squashed chain. Without it every
+    command read a correctly-migrated database as diverged, the backfill
+    `apply` has for exactly this case could never be reached, and
+    `create` refused to write anything until the tracking table was
+    resolved by hand.
+    """
+    if applied_tip is None:
+        return _TipPosition(-1, None, None)
+
+    chain_ids = [m.id for m in chain]
+    if applied_tip in chain_ids:
+        return _TipPosition(chain_ids.index(applied_tip), None, None)
+
+    for idx, m in enumerate(chain):
+        if applied_tip not in m.squashed:
+            continue
+        # The header lists the replaced migrations in chain order, so the
+        # tip has to be the last of them. Anywhere earlier and the database
+        # stopped partway into the range: the squashed migration's DDL
+        # carries the state *before* the range to the state after it, which
+        # is neither what this database has nor something it can be given —
+        # running it would collide with the objects already there, and
+        # recording it would claim DDL that never ran.
+        reached = m.squashed.index(applied_tip) + 1
+        if reached == len(m.squashed):
+            return _TipPosition(idx, m, None)
+        return _TipPosition(
+            idx,
+            None,
+            f'This database is {reached} migration(s) into the range of {len(m.squashed)} that '
+            f'{m.filename} replaced, so no file on disk describes the state it is in.\n'
+            'Restore the replaced migrations, apply them here, and squash again — or bring this '
+            'database to the end of that range before squashing.',
+        )
+
+    return _TipPosition(
+        -1,
+        None,
+        f'Database tip {applied_tip!r} is not in the on-disk chain, and no migration on disk '
+        'lists it among the ones it replaced — history has diverged. Resolve manually.',
+    )
 
 
 def _next_seq(d: Path) -> int:
@@ -141,7 +209,7 @@ async def _apply(
         migration_ensure_internal_schema,
         migration_read_schema_origin,
         migration_read_tracking,
-        migration_record_applied,
+        migration_retarget_schema_snapshot,
         migration_try_advisory_lock,
         migration_write_schema_snapshot,
         pgcon_connect,
@@ -176,52 +244,45 @@ async def _apply(
 
         chain_ids = [m.id for m in chain]
 
-        if applied_tip is None:
-            pending_start = 0
-        elif applied_tip in chain_ids:
-            pending_start = chain_ids.index(applied_tip) + 1
-        else:
-            raise click.ClickException(
-                f'Database tip {applied_tip!r} not found in on-disk chain — history has diverged. Resolve manually.'
-            )
+        position = _place_applied_tip(applied_tip, chain)
+        if position.problem:
+            raise click.ClickException(position.problem)
 
-        pending = chain[pending_start:]
+        await _forget_unknown_rows(pool, chain_ids)
+
+        # Applied rows only: `migration create` pre-inserts a row for the
+        # migration it writes, and treating one of those as proof that a
+        # squash's constituents already ran would skip its DDL entirely.
+        applied_ids = {id_ for id_, _onto, _db_state, _schema_state, applied in tracking if applied}
+        backfilled = await _backfill_squashes(pool, chain[: position.applied_through + 1], applied_ids)
+
+        pending = chain[position.applied_through + 1 :]
         if to_id is not None:
             if to_id not in chain_ids:
                 raise click.ClickException(f'--to target {to_id!r} not in chain.')
             stop_idx = chain_ids.index(to_id)
-            if stop_idx < pending_start:
+            if stop_idx <= position.applied_through:
                 raise click.ClickException(f'--to target {to_id!r} is already applied.')
-            pending = chain[pending_start : stop_idx + 1]
+            pending = chain[position.applied_through + 1 : stop_idx + 1]
 
-        if not pending:
+        if not pending and not backfilled:
             click.echo('Already up to date.')
             return
 
-        # `watch` pushes DDL straight to the database and records itself as
-        # the last writer of `_pylon."Schema"`. Without reading that back,
-        # the only way to know is for the operator to remember --dev-mode,
-        # and forgetting it fails the first already-existing object with a
-        # bare Postgres duplicate-object error partway through a step.
-        origin = await migration_read_schema_origin(pool)
-        if not dev_mode and origin is not None and origin[0] == 'Watch':
-            dev_mode = True
-            onto = f' since {origin[1]}' if origin[1] else ''
-            click.echo(f"'watch' has pushed DDL to this database{onto} — rebasing onto it (as --dev-mode).")
+        if pending:
+            # `watch` pushes DDL straight to the database and records itself
+            # as the last writer of `_pylon."Schema"`. Without reading that
+            # back, the only way to know is for the operator to remember
+            # --dev-mode, and forgetting it fails the first already-existing
+            # object with a bare Postgres duplicate-object error partway
+            # through a step. Nothing to rebase when there is no DDL to run.
+            origin = await migration_read_schema_origin(pool)
+            if not dev_mode and origin is not None and origin[0] == 'Watch':
+                dev_mode = True
+                onto = f' since {origin[1]}' if origin[1] else ''
+                click.echo(f"'watch' has pushed DDL to this database{onto} — rebasing onto it (as --dev-mode).")
 
-        # Applied rows only: `migration create` now pre-inserts a row for the
-        # migration it writes, and treating one of those as proof that a
-        # squash's constituents already ran would skip its DDL entirely.
-        applied_ids = {id_ for id_, _onto, _db_state, _schema_state, applied in tracking if applied}
         for m in pending:
-            # §12 squash compatibility: if any of this migration's squashed
-            # constituent IDs are already in the tracking table, the DB was
-            # updated via the old (pre-squash) chain — backfill and skip DDL.
-            if m.squashed and any(sid in applied_ids for sid in m.squashed):
-                await migration_record_applied(pool, m.id, m.onto, m.filename)
-                click.echo(f'  Backfilled {m.filename} (squash of already-applied migrations)')
-                applied_ids.add(m.id)
-                continue
             await _apply_one(pool, m, dev_mode)
             applied_ids.add(m.id)
 
@@ -230,7 +291,7 @@ async def _apply(
         # re-deriving one from the schema files here is what used to corrupt
         # it, since the files have usually moved on by the time a migration
         # is applied.
-        tip = pending[-1]
+        tip = pending[-1] if pending else backfilled[-1]
         recorded = {id_: (db, sch) for id_, _onto, db, sch, _applied in tracking}
         schema_json: str | None = None
 
@@ -271,9 +332,82 @@ async def _apply(
         # is still unaccounted for.
         if schema_json is not None:
             await migration_write_schema_snapshot(pool, schema_json, 'Apply', tip.id)
+        elif backfilled:
+            # Nothing to publish, but `written_onto` names one of the
+            # migrations the squash replaced — a file nobody has any more.
+            # The schema it names is still the right one, so only the name
+            # is corrected: republishing would claim this command knows the
+            # database matches the schema files, which on this path it does
+            # not.
+            await migration_retarget_schema_snapshot(pool, tip.id)
 
     finally:
         await lock.unlock()
+
+
+async def _backfill_squashes(pool, applied_range: list, applied_ids: set[str]) -> list:
+    """Record every migration in `applied_range` whose DDL this database
+    already ran under the names a squash replaced, dropping those names'
+    rows. Returns what it recorded, in chain order.
+
+    A squashed migration's DDL carries the state before its range to the
+    state after it, so a database that already walked that range the long
+    way is at the state it would produce: running it again would collide
+    with the first object that is already there. What such a database is
+    missing is the tracking row, not the DDL — which is what the
+    `-- squashed:` header is in the file for.
+
+    The replaced rows go at the same time (one transaction, in
+    `pylon_core::migrate::record_squash_backfill`). Leaving 23 rows naming
+    files nobody has was not harmless: they are what this function reads to
+    decide what already ran.
+    """
+    from pylon._core import migration_record_squash_backfill
+
+    recorded = []
+    for m in applied_range:
+        if not m.squashed or m.id in applied_ids:
+            continue
+        # Its own last replaced migration being applied is what says the
+        # whole range ran; `_place_applied_tip` has already refused a
+        # database that stopped partway into one.
+        if m.squashed[-1] not in applied_ids:
+            continue
+        replaced = [sid for sid in m.squashed if sid in applied_ids]
+        await migration_record_squash_backfill(pool, m.id, m.onto, m.filename, replaced)
+        applied_ids.add(m.id)
+        applied_ids.difference_update(replaced)
+        click.echo(
+            f'  Backfilled {m.filename} — the {len(m.squashed)} migration(s) it replaced '
+            f'are already applied here ({len(replaced)} row(s) cleared)'
+        )
+        recorded.append(m)
+    return recorded
+
+
+async def _forget_unknown_rows(pool, chain_ids: list[str]) -> None:
+    """Delete tracking rows for unapplied migrations no file on disk has.
+
+    `create` records the state its migration reaches on a row of its own,
+    written ahead of that migration being applied — and nothing removed
+    that row when the migration stopped existing, which is what happens
+    every time one is regenerated after a further schema edit, or squashed
+    away. The rows pile up naming files no checkout has, and they are not
+    inert: `_backfill_squashes` reads this table to decide what a database
+    has already run.
+
+    Applied rows are never touched, here or in the SQL underneath — the
+    constituents of a squash are deliberately not on disk, and their rows
+    are the record that the range ran.
+    """
+    from pylon._core import migration_forget_unapplied, migration_unknown_rows
+
+    unknown = await migration_unknown_rows(pool, chain_ids)
+    if not unknown:
+        return
+    await migration_forget_unapplied(pool, [id_ for id_, _filename in unknown])
+    names = ', '.join(filename for _id, filename in unknown)
+    click.echo(f'Cleared {len(unknown)} tracking row(s) for migration(s) no longer on disk: {names}')
 
 
 async def _apply_one(pool, m, dev_mode: bool) -> None:
@@ -314,6 +448,7 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
         migration_ensure_internal_schema,
         migration_read_schema_origin,
         migration_read_tracking,
+        migration_unknown_rows,
         pgcon_connect,
     )
 
@@ -357,13 +492,12 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
     click.echo(f'Chain tip (disk):  {fs_tip}')
     click.echo(f'Applied tip (db):  {applied_tip or "(none)"}')
 
-    if applied_tip is None:
-        pending = chain
-    elif applied_tip in chain_ids:
-        pending = chain[chain_ids.index(applied_tip) + 1 :]
-    else:
-        click.echo('\n⚠  Database tip not found in on-disk chain — history has diverged.')
+    position = _place_applied_tip(applied_tip, chain)
+    if position.problem:
+        click.echo(f'\n⚠  {position.problem}')
         return
+
+    pending = chain[position.applied_through + 1 :]
 
     if pending:
         click.echo(f'\n{len(pending)} pending migration(s):')
@@ -371,6 +505,23 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
             click.echo(f'  {m.filename}')
     else:
         click.echo('\nDatabase is up to date.')
+
+    # The tip names a migration a squash replaced: this database holds that
+    # whole range's DDL, under the old files' names, and only wants the
+    # squashed migration's tracking row.
+    if position.absorbed_by is not None:
+        click.echo(
+            f'\n   {position.absorbed_by.filename} replaced the migration this database is at, '
+            'whose DDL it already has.'
+            "\n   'pylon migration apply' records that without re-running it."
+        )
+
+    unknown = await migration_unknown_rows(pool, chain_ids)
+    if unknown:
+        click.echo(f'\n⚠  {len(unknown)} tracking row(s) for migration(s) not on disk, none of them applied:')
+        for _id, filename in unknown:
+            click.echo(f'   {filename}')
+        click.echo("   'pylon migration apply' clears these.")
 
     report_watch_drift(with_hint=True)
 
@@ -1198,24 +1349,21 @@ async def _create_from_diff(
     await migration_ensure_internal_schema(pool)
     tracking = await migration_read_tracking(pool)  # [(id, onto, db_state, schema_state, applied), ...]
     applied_tip = migration_applied_tip(tracking)
-    chain_ids = [m.id for m in chain]
 
-    # Diverged history → abort.
-    if applied_tip is not None and applied_tip not in chain_ids:
-        raise click.ClickException(
-            f'Database tip {applied_tip!r} not found in on-disk chain — history has diverged. Resolve manually.'
-        )
+    # Diverged history → abort. A tip that a squash replaced is not that:
+    # it resolves to the migration that absorbed it.
+    position = _place_applied_tip(applied_tip, chain)
+    if position.problem:
+        raise click.ClickException(position.problem)
 
     # Pending migrations → abort. All migrations must be applied before
     # creating a new one so the live database is the correct diff baseline.
-    if applied_tip != chain_tip:
-        pending_start = 0 if applied_tip is None else (chain_ids.index(applied_tip) + 1)
-        pending = chain[pending_start:]
-        if pending:
-            names = ', '.join(m.filename for m in pending)
-            raise click.ClickException(
-                f"{len(pending)} unapplied migration(s): {names}\nRun 'pylon migration apply' first."
-            )
+    pending = chain[position.applied_through + 1 :]
+    if pending:
+        names = ', '.join(m.filename for m in pending)
+        raise click.ClickException(
+            f"{len(pending)} unapplied migration(s): {names}\nRun 'pylon migration apply' first."
+        )
 
     # Use the db_state snapshot from the tip row as the baseline — this is
     # what the schema looked like after the last migration was applied, which
@@ -1599,6 +1747,22 @@ async def _squash(
             raise click.ClickException('--from must precede --to in the chain.')
     else:
         raise click.UsageError('Specify --count or both --from and --to.')
+
+    # The range has to end at the chain tip. A squash gives its range one
+    # new ID, and the migration that followed the range still names the one
+    # it followed — a file that is about to be deleted. Carrying that link
+    # across would mean rewriting that migration's parent, which changes its
+    # own ID (the parent is hashed into it) and every ID after it, which is
+    # exactly the history other databases have already recorded as applied.
+    # So this is refused rather than half-done: squashing a middle range used
+    # to leave a chain every command then rejected as a conflict.
+    if range_end != len(chain) - 1:
+        tail = chain[range_end + 1]
+        raise click.ClickException(
+            f'A squash has to end at the chain tip, and {chain[range_end].filename} is followed by '
+            f'{tail.filename}. Extend the range to {chain[-1].filename} (or use --count), or squash '
+            'this range later, once there is nothing after it.'
+        )
 
     squash_range = chain[range_start : range_end + 1]
     squashed_ids = [m.id for m in squash_range]

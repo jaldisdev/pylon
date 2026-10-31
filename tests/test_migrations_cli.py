@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from click.testing import CliRunner
@@ -121,3 +122,148 @@ class TestMigrationsDirAutoCreate:
         )
 
         assert migrations_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# _place_applied_tip: reading a database's tip through squashed headers
+# ---------------------------------------------------------------------------
+
+
+def _fake_migration(id_: str, onto: str, filename: str, squashed=()):
+    """Stand-in for `pylon._core.MigrationFile` — the resolver reads four
+    attributes off it and nothing else."""
+    return SimpleNamespace(id=id_, onto=onto, filename=filename, squashed=list(squashed))
+
+
+class TestPlaceAppliedTip:
+    """A squash deletes the files it replaces, so a database that applied the
+    pre-squash chain has a tip that names no file. Every command used to read
+    that as a diverged history and refuse: `apply` could never reach its own
+    backfill, `status` reported a correct database as broken, and `create`
+    would not write a migration at all.
+    """
+
+    def _chain(self):
+        return [
+            _fake_migration('m1aaa', 'initial', '00001_m1aaa'),
+            _fake_migration('m1sss', 'm1aaa', '00002_m1sss', squashed=['m1bbb', 'm1ccc', 'm1ddd']),
+            _fake_migration('m1eee', 'm1sss', '00003_m1eee'),
+        ]
+
+    def test_no_tip_at_all(self):
+        from pylon.cli.commands.migrations import _place_applied_tip
+
+        position = _place_applied_tip(None, self._chain())
+        assert position == (-1, None, None)
+
+    def test_tip_on_disk(self):
+        from pylon.cli.commands.migrations import _place_applied_tip
+
+        position = _place_applied_tip('m1aaa', self._chain())
+        assert position.applied_through == 0
+        assert position.absorbed_by is None
+        assert position.problem is None
+
+    def test_tip_is_the_last_migration_a_squash_replaced(self):
+        from pylon.cli.commands.migrations import _place_applied_tip
+
+        # The whole replaced range ran, so the database is at the squashed
+        # migration's own state — it wants that migration's tracking row,
+        # not its DDL.
+        position = _place_applied_tip('m1ddd', self._chain())
+        assert position.applied_through == 1
+        assert position.absorbed_by.filename == '00002_m1sss'
+        assert position.problem is None
+
+    def test_tip_partway_into_a_replaced_range_is_refused(self):
+        from pylon.cli.commands.migrations import _place_applied_tip
+
+        # Only part of the range ran. The squashed migration's DDL starts
+        # from the state before the range, so neither running nor recording
+        # it is right, and saying so beats either.
+        position = _place_applied_tip('m1ccc', self._chain())
+        assert position.absorbed_by is None
+        assert '2 migration(s) into the range of 3' in position.problem
+        assert '00002_m1sss' in position.problem
+
+    def test_unknown_tip_is_still_a_diverged_history(self):
+        from pylon.cli.commands.migrations import _place_applied_tip
+
+        position = _place_applied_tip('m1zzz', self._chain())
+        assert position.applied_through == -1
+        assert 'history has diverged' in position.problem
+
+    def test_a_tip_absorbed_by_the_last_file_leaves_nothing_pending(self):
+        from pylon.cli.commands.migrations import _place_applied_tip
+
+        chain = [
+            _fake_migration('m1aaa', 'initial', '00001_m1aaa'),
+            _fake_migration('m1sss', 'm1aaa', '00002_m1sss', squashed=['m1bbb', 'm1ccc']),
+        ]
+        position = _place_applied_tip('m1ccc', chain)
+        assert chain[position.applied_through + 1 :] == []
+
+
+# ---------------------------------------------------------------------------
+# squash: the range has to end at the chain tip
+# ---------------------------------------------------------------------------
+
+
+def _write_chain(migrations_dir: Path, count: int) -> list[str]:
+    """Write `count` linked migration files and return their IDs."""
+    from pylon._core import compute_migration_id, compute_migration_short_id, render_migration_file
+
+    migrations_dir.mkdir(parents=True, exist_ok=True)
+    ids: list[str] = []
+    onto = 'initial'
+    for seq in range(1, count + 1):
+        body = f'\nSELECT {seq};\n'
+        (migrations_dir / f'{seq:05d}_{compute_migration_short_id(body, onto)}.sql').write_text(
+            render_migration_file(onto, body)
+        )
+        onto = compute_migration_id(body, onto)
+        ids.append(onto)
+    return ids
+
+
+class TestSquashRangeMustEndAtTip:
+    """Squashing a middle range left the migration *after* the range naming a
+    file the squash had just deleted. Nothing rewrote that link — doing so
+    would change that migration's ID, and every ID after it, which is the
+    history other databases have already recorded — so every later command
+    failed with a chain conflict. The range is refused up front instead.
+    """
+
+    def test_a_middle_range_is_refused(self, tmp_path):
+        from pylon.cli.commands.migrations import migration
+
+        migrations_dir = tmp_path / 'migrations'
+        ids = _write_chain(migrations_dir, 4)
+
+        result = CliRunner().invoke(
+            migration.commands['squash'],
+            ['--from', ids[1], '--to', ids[2]],
+            obj=_make_ctx_obj(migrations_dir),
+        )
+
+        assert result.exit_code == 1, result.output
+        assert 'has to end at the chain tip' in result.output, result.output
+        # Refused before anything was touched.
+        assert len(list(migrations_dir.glob('*.sql'))) == 4
+
+    def test_a_range_through_the_tip_is_accepted(self, tmp_path):
+        from pylon.cli.commands.migrations import migration
+
+        migrations_dir = tmp_path / 'migrations'
+        ids = _write_chain(migrations_dir, 4)
+
+        result = CliRunner().invoke(
+            migration.commands['squash'],
+            ['--from', ids[1], '--to', ids[3]],
+            obj=_make_ctx_obj(migrations_dir),
+        )
+
+        # Gets past range resolution and on to the shadow database, which is
+        # where this test's unreachable DSN stops it.
+        assert 'has to end at the chain tip' not in result.output, result.output
+        assert 'Squashing 3 migration(s)' in result.output, result.output

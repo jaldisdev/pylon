@@ -103,22 +103,49 @@ fn migration_applied_tip(tracking: Vec<(String, String, Option<String>, Option<S
     core_migrate::applied_tip(&rows)
 }
 
-/// Records a migration as applied without running its DDL — the
-/// squash-backfill case in `apply`'s outer loop (a migration whose
-/// squashed constituent IDs are already applied under the old chain).
+/// Carries a database that applied a squash's constituents onto the
+/// squashed migration itself — records it applied and drops the rows of the
+/// migrations it replaced, in one transaction. See
+/// `pylon_core::migrate::record_squash_backfill`.
 #[pyfunction]
-fn migration_record_applied<'py>(
+fn migration_record_squash_backfill<'py>(
     py: Python<'py>,
     pool: &PgconPool,
     id: String,
     onto: String,
     filename: String,
+    replaced: Vec<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        core_migrate::record_applied(&pool, &id, &onto, &filename)
+        core_migrate::record_squash_backfill(&pool, &id, &onto, &filename, &replaced)
             .await
             .map_err(migrate_err)
+    })
+}
+
+/// Tracking rows, as `(id, filename)`, for migrations that are not applied
+/// and that none of `known_ids` names — see
+/// `pylon_core::migrate::unknown_rows`.
+#[pyfunction]
+fn migration_unknown_rows<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    known_ids: Vec<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_migrate::unknown_rows(&pool, &known_ids).await.map_err(migrate_err)
+    })
+}
+
+/// Deletes tracking rows by ID, returning how many went — never an applied
+/// one.
+#[pyfunction]
+fn migration_forget_unapplied<'py>(py: Python<'py>, pool: &PgconPool, ids: Vec<String>) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_migrate::forget_unapplied(&pool, &ids).await.map_err(migrate_err)
     })
 }
 
@@ -239,6 +266,24 @@ fn migration_write_schema_snapshot<'py>(
     })
 }
 
+/// Points the schema snapshot at a different migration, leaving the
+/// snapshot and the record of who wrote it alone — what a squash backfill
+/// needs, since `written_onto` named one of the migrations it replaced.
+/// Returns whether there was a snapshot to re-point.
+#[pyfunction]
+fn migration_retarget_schema_snapshot<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    written_onto: String,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pool = pool.inner.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_migrate::retarget_schema_snapshot(&pool, &written_onto)
+            .await
+            .map_err(migrate_err)
+    })
+}
+
 /// Who last wrote `_pylon."Schema"`, as `(written_by, written_onto)` — or
 /// `None` when no command ever has. `written_by` is `None` on a row written
 /// before Pylon tracked this.
@@ -270,14 +315,17 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migration_check_internal_schema, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_tracking, m)?)?;
     m.add_function(wrap_pyfunction!(migration_applied_tip, m)?)?;
-    m.add_function(wrap_pyfunction!(migration_record_applied, m)?)?;
     m.add_function(wrap_pyfunction!(migration_record_baseline, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_record_squash_backfill, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_unknown_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_forget_unapplied, m)?)?;
     m.add_function(wrap_pyfunction!(migration_apply_one, m)?)?;
     m.add_function(wrap_pyfunction!(migration_advisory_lock, m)?)?;
     m.add_function(wrap_pyfunction!(migration_try_advisory_lock, m)?)?;
     m.add_function(wrap_pyfunction!(migration_write_schema_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_schema_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(migration_read_schema_origin, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_retarget_schema_snapshot, m)?)?;
     m.add_class::<MigrationLock>()?;
     Ok(())
 }

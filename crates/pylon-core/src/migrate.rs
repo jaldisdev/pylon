@@ -222,6 +222,26 @@ pub async fn write_schema_snapshot(
     Ok(())
 }
 
+/// Points the schema snapshot at a different migration, leaving the
+/// snapshot itself and the record of who wrote it alone. Returns whether
+/// there was a snapshot to re-point.
+///
+/// `written_onto` names the migration the published schema was reached by.
+/// A squash replaces the migration it used to name with one that covers the
+/// same ground, and nothing about the *schema* changes in that — so there is
+/// nothing to republish, only a name to correct. Rewriting the whole row
+/// would mean claiming `Apply` wrote it, which would erase a `Watch` marker
+/// that still has unaccounted drift behind it.
+pub async fn retarget_schema_snapshot(pool: &PgPool, written_onto: &str) -> Result<bool> {
+    let affected = pool
+        .execute_typed(
+            r#"UPDATE _pylon."Schema" SET written_onto = $1 WHERE singleton"#,
+            &[DecodedValue::Str(written_onto.to_string())],
+        )
+        .await?;
+    Ok(affected > 0)
+}
+
 /// Which command last wrote `_pylon."Schema"` — the `_pylon."SchemaWriter"`
 /// enum, mirrored in Rust.
 ///
@@ -504,11 +524,10 @@ fn record_applied_params(id: &str, onto: &str, filename: &str) -> Vec<DecodedVal
     ]
 }
 
-/// Records a migration as applied without running its DDL — used both by
-/// `apply_one`'s last step (inside its transaction, via `record_applied_in_tx`)
-/// and by `apply`'s squash-backfill case (a migration whose squashed
-/// constituent IDs are already applied under the old chain: no DDL to run,
-/// just mark it applied so future `apply` runs see it as done).
+/// Records a migration as applied without running its DDL — `apply_one`'s
+/// own non-transactional last step. The squash-backfill case goes through
+/// `record_squash_backfill` instead, which also drops the rows of the
+/// migrations the squash replaced.
 pub async fn record_applied(pool: &PgPool, id: &str, onto: &str, filename: &str) -> Result<()> {
     check_no_id_collision(pool, id, onto).await?;
     pool.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename))
@@ -520,6 +539,94 @@ async fn record_applied_in_tx(tx: &PgTransaction, id: &str, onto: &str, filename
     tx.execute_typed(RECORD_APPLIED_SQL, &record_applied_params(id, onto, filename))
         .await?;
     Ok(())
+}
+
+fn text_array(values: &[String]) -> DecodedValue {
+    DecodedValue::Array(values.iter().map(|v| DecodedValue::Str(v.clone())).collect())
+}
+
+/// Carries a database that applied a squash's constituents onto the
+/// squashed migration itself: records that migration as applied — its DDL
+/// is already in the database, under the old files' names — and drops the
+/// rows of the migrations it replaced.
+///
+/// The two happen in one transaction because either alone is a worse state
+/// than neither: the insert without the deletes leaves rows naming files
+/// nobody has, and the deletes without the insert loses the only record
+/// that the range ran at all. Dropping the replaced rows is what makes a
+/// database reconciled this way hold exactly the tracking a freshly
+/// migrated one does.
+pub async fn record_squash_backfill(
+    pool: &PgPool,
+    id: &str,
+    onto: &str,
+    filename: &str,
+    replaced: &[String],
+) -> Result<()> {
+    check_no_id_collision(pool, id, onto).await?;
+    let tx = pool.begin_default().await?;
+    let result = async {
+        record_applied_in_tx(&tx, id, onto, filename).await?;
+        tx.execute_typed(
+            r#"DELETE FROM _pylon."Migrations" WHERE id = ANY($1::text[])"#,
+            &[text_array(replaced)],
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = tx.rollback().await;
+        return Err(e);
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Tracking rows, as `(id, filename)`, for migrations that are not applied
+/// and that none of `known_ids` names.
+///
+/// `create` writes a row for the migration it has just written, ahead of
+/// that migration being applied, so that the state it reaches is recorded
+/// by the command that actually knows it. Nothing removed that row when the
+/// migration itself stopped existing — regenerated under a new ID after a
+/// schema edit, or squashed away — so the table accumulated rows for files
+/// no checkout has. They are not inert: the squash backfill above decides
+/// what a database already ran from this table.
+pub async fn unknown_rows(pool: &PgPool, known_ids: &[String]) -> Result<Vec<(String, String)>> {
+    let rows = pool
+        .query_typed(
+            r#"SELECT (id, filename) AS result FROM _pylon."Migrations"
+               WHERE applied_at IS NULL AND id <> ALL($1::text[])
+               ORDER BY filename"#,
+            &[text_array(known_ids)],
+            &pool.types(),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let DecodedValue::Composite(fields) = row else {
+                return None;
+            };
+            let [DecodedValue::Str(id), DecodedValue::Str(filename)] = <[DecodedValue; 2]>::try_from(fields).ok()?
+            else {
+                return None;
+            };
+            Some((id, filename))
+        })
+        .collect())
+}
+
+/// Deletes tracking rows by ID, returning how many went. Never touches an
+/// applied one: history is not something a cleanup gets to rewrite.
+pub async fn forget_unapplied(pool: &PgPool, ids: &[String]) -> Result<u64> {
+    Ok(pool
+        .execute_typed(
+            r#"DELETE FROM _pylon."Migrations" WHERE id = ANY($1::text[]) AND applied_at IS NULL"#,
+            &[text_array(ids)],
+        )
+        .await?)
 }
 
 /// `WHERE applied_at IS NULL` keeps an applied migration's baseline

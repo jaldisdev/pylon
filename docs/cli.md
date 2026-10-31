@@ -79,7 +79,7 @@ Two kinds of change are detected against the *schema snapshot* recorded on the a
 
 ### `pylon migration apply`
 
-Applies every migration between the database's recorded tip and the on-disk chain tip (or `--to`), under a session advisory lock so concurrent `apply` runs serialize instead of racing.
+Applies every migration between the database's recorded tip and the on-disk chain tip (or `--to`), under a session advisory lock so concurrent `apply` runs serialize instead of racing. A database whose tip a squash replaced is carried onto the squashed chain here — see [`pylon migration squash`](#pylon-migration-squash).
 
 | Flag | Description |
 |---|---|
@@ -89,7 +89,7 @@ Applies every migration between the database's recorded tip and the on-disk chai
 
 ### `pylon migration status`
 
-Prints the on-disk chain tip, the database's recorded applied tip, and the list of pending migrations (or a chain-divergence warning if the recorded tip isn't in the on-disk chain at all).
+Prints the on-disk chain tip, the database's recorded applied tip, and the list of pending migrations. A recorded tip that a squash replaced is reported as up to date, naming the file that absorbed it; one that is in neither the chain nor any squash's header is reported as diverged history. Also lists tracking rows for migrations no longer on disk, which `apply` clears.
 
 | Flag | Description |
 |---|---|
@@ -131,7 +131,9 @@ The result is then replayed on a second shadow database and the schema it reache
 | `--count N` | Squash the last N migrations instead of an explicit range. Mutually exclusive with `--from`/`--to`. Must be at least 2. |
 | `--dry-run` | Print the squashed body without touching any files. |
 
-The squashed file's header records every constituent migration's original ID, so a database that already applied the old, unsquashed chain is still recognized as up to date (backfilled, not reapplied) the next time `pylon migration apply` runs against it.
+The range must end at the chain tip; a middle range is refused, since the migration after it would be left naming a file that no longer exists.
+
+The squashed file's header records every constituent migration's original ID. A database that already applied the old, unsquashed chain has a tip that is one of those IDs, and `apply`, `status` and `create` all resolve it through those headers: `apply` records the squashed migration without re-running its DDL and clears the replaced migrations' tracking rows, `status` reports the database as up to date and names the file that absorbed its tip, and `create` proceeds. A database that stopped partway into the replaced range cannot be carried across and is reported as such.
 
 ## `pylon database`
 

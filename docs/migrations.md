@@ -26,9 +26,10 @@ Postgres itself remembers which migrations have been applied, in `_pylon."Migrat
 0. Brings the internal `_pylon` schema up to date — creating the tracking tables on a database that has never seen Pylon, and adding anything a newer Pylon version introduced on one that has. Every migration command does this first, so an upgrade reaches the internal structures without a separate step.
 
 1. Takes a session-level Postgres advisory lock, so concurrent `apply` invocations serialize instead of racing (`--no-wait` fails fast instead of blocking if another one already holds it).
-2. Reads the tracking table's recorded tip and compares it against the on-disk chain. If the recorded tip isn't found in the chain at all, that's treated as **diverged history** and refused outright — Pylon won't guess which side is right.
-3. Applies everything between the recorded tip and the chain tip (or `--to ID`), one migration at a time, each in its own transaction (or transaction-per-step, for a file with `-- pylon:step` markers).
-4. Stamps the newly-applied tip row as applied. The schema snapshot on that row — what `pylon migration create`'s next run diffs against as its baseline, rather than a fresh live-database introspection, so it stays correct even if `watch` has touched the database since — was already written by `create`, and `apply` leaves it alone. Only `create` knows what state a migration is meant to reach; deriving it here from the schema files would record whatever you happened to have edited since.
+2. Reads the tracking table's recorded tip and places it in the on-disk chain. A tip that is no longer a file may still be one a squash replaced, which its `-- squashed:` header records — see [Databases that already applied the old chain](#databases-that-already-applied-the-old-chain). A tip that is neither is **diverged history**, refused outright: Pylon won't guess which side is right.
+3. Clears tracking rows for unapplied migrations that no file on disk has any more — what `create` leaves behind each time a migration it wrote is regenerated or squashed away. Applied rows are never touched.
+4. Applies everything between the recorded tip and the chain tip (or `--to ID`), one migration at a time, each in its own transaction (or transaction-per-step, for a file with `-- pylon:step` markers).
+5. Stamps the newly-applied tip row as applied. The schema snapshot on that row — what `pylon migration create`'s next run diffs against as its baseline, rather than a fresh live-database introspection, so it stays correct even if `watch` has touched the database since — was already written by `create`, and `apply` leaves it alone. Only `create` knows what state a migration is meant to reach; deriving it here from the schema files would record whatever you happened to have edited since.
 
 ## Creating a migration
 
@@ -127,7 +128,17 @@ Long-lived projects accumulate migrations faster than anyone wants to read throu
 
 Then it proves the result. The squashed DDL is replayed on a *second* shadow database, from the same starting state, and the schema it reaches is compared with the one the constituents reached — every table, column, constraint, index, view, function and trigger, with the DDL the catalog itself reports for each. Only if the two match is the file written. If anything differs, or if the range contains a change that cannot be expressed as a single migration at all (removing a member from a scalar type's enum, say), `squash` reports it and writes nothing rather than leaving you a file that quietly builds a different schema.
 
-The squashed file's header records every migration ID it replaced. This matters for compatibility: a database that already applied the old, unsquashed chain is recognized as already up to date (backfilled silently) the next time `pylon migration apply` runs against it — it doesn't try to reapply DDL that's already there under the old file names.
+The range has to end at the chain tip (`--count` always does). A squash gives its range one new ID, and the migration that followed the range still names the one it followed — so squashing a middle range would mean rewriting that migration's parent, which changes its own ID and every ID after it: the very history other databases have recorded as applied. `squash` refuses rather than half-doing it.
+
+### Databases that already applied the old chain
+
+The squashed file's header records every migration ID it replaced, and that is what carries an existing database across. Its tip is the last migration the squash replaced — by definition no longer a file on disk — so every command reads the tip through those headers:
+
+* `pylon migration apply` records the squashed migration without re-running its DDL (`Backfilled …`), since the database already walked that range the long way, and deletes the tracking rows of the migrations it replaced. A database reconciled this way holds exactly the tracking a freshly migrated one does.
+* `pylon migration status` reports it as up to date and names the file that absorbed its tip.
+* `pylon migration create` proceeds as normal.
+
+A database that stopped *partway* into the replaced range is the one case none of this can resolve: the squashed migration's DDL starts from the state before the range, so neither running it nor recording it would be true. Every command says so and names the file. Bring such a database to the end of the range with the original migrations before squashing them.
 
 ## First-time setup
 

@@ -1212,3 +1212,205 @@ def test_squash_reaches_the_same_schema_as_the_migrations_it_replaces(live_pool,
             await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{target_module}" CASCADE;')
 
         asyncio.run(cleanup())
+
+
+def test_apply_carries_a_pre_squash_database_onto_the_squashed_chain(live_pool, tmp_path, unique_module):
+    """A database that applied the chain as it was before a squash could not
+    be brought onto the squashed chain by any command.
+
+    `apply` had the right logic for it — a migration whose replaced
+    constituents are already applied gets recorded, not re-run — but an
+    identical guard in `apply`, `status` and `create`, thirty lines earlier,
+    rejected the database first: its tip is the last migration the squash
+    replaced, which is by definition no longer a file on disk, and all three
+    read that as a diverged history. So the backfill was unreachable in
+    every case it was written for, `status` called a correct database
+    broken, and `create` refused to write the next migration at all.
+
+    This drives the whole sequence against a real database: three migrations
+    created and applied, the last two squashed, then `status`, `apply` and
+    `create` over the result.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_backfill')
+    (tmp_path / 'migrations').mkdir()
+    migrations_dir = tmp_path / 'migrations'
+    schema_file = tmp_path / f'{module}_schema.py'
+
+    def write_schema(version: int) -> None:
+        schema_file.write_text(
+            'import pylon.schema as pylon\n\n'
+            f"@pylon.type(module={module!r}, name='Widget')\n"
+            'class Widget:\n'
+            '    name: pylon.Property[str, pylon.MaxLen(60)]\n'
+            # Nullable, so a new column on a table that may hold rows needs
+            # no fill expression and `--non-interactive` can write it.
+            + ('    size: int | None\n' if version >= 2 else '')
+            + ('    note: str | None\n' if version >= 3 else '')
+        )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    written: list[str] = []
+
+    async def tracked() -> dict[str, bool]:
+        rows = await live_pool.query_named(
+            'SELECT id, (applied_at IS NOT NULL) AS applied FROM _pylon."Migrations"', []
+        )
+        return {r['id']: r['applied'] for r in rows}
+
+    try:
+        for version in (1, 2, 3):
+            write_schema(version)
+            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            written = [f.read_text() for f in sorted(migrations_dir.glob('*.sql'))]
+            assert result.exit_code == 0, result.output
+            result = runner.invoke(migration.commands['apply'], [], obj=obj)
+            assert result.exit_code == 0, result.output
+
+        ids = [re.search(r'^-- migration: (\S+)$', text, re.MULTILINE).group(1) for text in written]
+
+        result = runner.invoke(migration.commands['squash'], ['--from', ids[1], '--to', ids[2]], obj=obj)
+        assert result.exit_code == 0, result.output
+        remaining = sorted(migrations_dir.glob('*.sql'))
+        written.append(remaining[-1].read_text())
+        squashed_id = re.search(r'^-- migration: (\S+)$', written[-1], re.MULTILINE).group(1)
+
+        # The database is now at ids[2] — the last migration the squashed
+        # file replaced, and no longer a file on disk.
+        assert asyncio.run(tracked())[ids[2]] is True
+
+        # status: not diverged, and it says which file absorbed the tip.
+        result = runner.invoke(migration.commands['status'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'diverged' not in result.output, result.output
+        assert 'Database is up to date.' in result.output, result.output
+        assert f'{remaining[-1].stem} replaced the migration this database is at' in result.output, result.output
+
+        # apply: records the squashed migration without re-running its DDL,
+        # and clears the rows of the migrations it replaced.
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'Backfilled' in result.output, result.output
+
+        rows = asyncio.run(tracked())
+        assert rows.get(squashed_id) is True, rows
+        assert ids[1] not in rows, 'a replaced migration kept its row'
+        assert ids[2] not in rows, 'a replaced migration kept its row'
+        assert rows.get(ids[0]) is True, 'the migration outside the range lost its row'
+
+        async def snapshot_target() -> str | None:
+            rows = await live_pool.query_named('SELECT written_onto FROM _pylon."Schema"', [])
+            return rows[0]['written_onto'] if rows else None
+
+        assert asyncio.run(snapshot_target()) == squashed_id, (
+            'the published schema still names a migration that no longer exists'
+        )
+
+        # create: proceeds, and sees the schema as already recorded rather
+        # than re-proposing it — which is only true if the backfill left a
+        # usable baseline behind.
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'No schema changes detected.' in result.output, result.output
+
+        # A second apply has nothing left to do.
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'Already up to date.' in result.output, result.output
+    finally:
+        migration_ids = re.findall(r'^-- migration: (\S+)$', '\n'.join(written), re.MULTILINE)
+
+        async def cleanup() -> None:
+            if migration_ids:
+                await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())
+
+
+def test_apply_clears_tracking_rows_for_migrations_that_no_longer_exist(live_pool, tmp_path, unique_module):
+    """`create` writes a row for the migration it has just written, ahead of
+    that migration being applied. Nothing removed it when the migration
+    stopped existing — regenerated under a new ID after a further schema
+    edit, or squashed away — so the table accumulated rows for files no
+    checkout has. They are a live hazard, not clutter: the squash backfill
+    decides what a database already ran from this table.
+    """
+    import re
+
+    from click.testing import CliRunner
+    from conftest import live_db_dsn
+
+    from pylon.cli.commands.migrations import migration
+    from pylon.config import Config, DatabaseConfig, ProjectConfig
+
+    module = unique_module('live_orphanrow')
+    (tmp_path / 'migrations').mkdir()
+    migrations_dir = tmp_path / 'migrations'
+    schema_file = tmp_path / f'{module}_schema.py'
+    schema_file.write_text(
+        f"import pylon.schema as pylon\n\n@pylon.type(module={module!r}, name='Widget')\nclass Widget:\n    name: str\n"
+    )
+
+    config = Config(
+        database=DatabaseConfig(dsn=live_db_dsn()),
+        project=ProjectConfig(schema_dir=tmp_path),
+    )
+    obj = {'config': config}
+    runner = CliRunner()
+    written: list[str] = []
+    discarded_id = ''
+
+    try:
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        files = sorted(migrations_dir.glob('*.sql'))
+        written = [f.read_text() for f in files]
+        discarded_id = re.search(r'^-- migration: (\S+)$', written[0], re.MULTILINE).group(1)
+
+        # Regenerate: the file is discarded unapplied, which is what leaves
+        # its row behind under an ID no file has any more.
+        files[0].unlink()
+        schema_file.write_text(schema_file.read_text() + '    size: int | None\n')
+        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        assert result.exit_code == 0, result.output
+        written = [f.read_text() for f in sorted(migrations_dir.glob('*.sql'))]
+        assert discarded_id not in written[0]
+
+        result = runner.invoke(migration.commands['status'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'tracking row(s) for migration(s) not on disk' in result.output, result.output
+
+        result = runner.invoke(migration.commands['apply'], [], obj=obj)
+        assert result.exit_code == 0, result.output
+        assert 'Cleared 1 tracking row(s)' in result.output, result.output
+
+        async def ids() -> set[str]:
+            rows = await live_pool.query_named('SELECT id FROM _pylon."Migrations"', [])
+            return {r['id'] for r in rows}
+
+        assert discarded_id not in asyncio.run(ids())
+
+        # And it stays clean: status has nothing left to report.
+        result = runner.invoke(migration.commands['status'], [], obj=obj)
+        assert 'not on disk' not in result.output, result.output
+    finally:
+        migration_ids = [discarded_id, *re.findall(r'^-- migration: (\S+)$', '\n'.join(written), re.MULTILINE)]
+
+        async def cleanup() -> None:
+            await live_pool.execute('DELETE FROM _pylon."Migrations" WHERE id = ANY($1)', [migration_ids])
+            await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+        asyncio.run(cleanup())
