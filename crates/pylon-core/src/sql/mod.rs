@@ -13111,6 +13111,97 @@ select owner { posts := (select owner.posts.title) };",
         assert!(ddl.contains("NEW.\"slug\" := _pylon_rewrites.\"v0\";"), "{ddl}");
     }
 
+    /// The three anchor shapes a user-declared `Trigger` can take: an
+    /// `On.Update` handler reading both rows, an `On.Delete` one reading the
+    /// old row, and an `On.Insert` one reading the new row. `__new__` is
+    /// bound only when the mask excludes Delete and `__old__` only when it
+    /// excludes Insert, so these are the three distinct lowerings.
+    fn triggers_over_every_anchor_shape() -> Vec<crate::schema::TriggerDescriptor> {
+        use crate::schema::TriggerDescriptor;
+        let after = |on: u8, handler: &str| TriggerDescriptor {
+            on,
+            timing: "After".into(),
+            handler: handler.into(),
+        };
+        vec![
+            after(
+                2,
+                "insert Post { title := __old__.name ++ __new__.name } unless conflict",
+            ),
+            after(4, "insert Post { title := __old__.name } unless conflict"),
+            after(1, "insert Post { title := __new__.name } unless conflict"),
+        ]
+    }
+
+    /// One declaration, one trigger — whatever the handler reads.
+    ///
+    /// `export_schema` and `diff::expected_triggers` both derive the set from
+    /// `export::user_trigger_names`, so a generator that invented a variant
+    /// the differ did not account for would show up here as a count mismatch:
+    /// `migration create` would then propose dropping the extra one on every
+    /// run, and never come back empty after an apply.
+    #[test]
+    fn a_trigger_declaration_produces_exactly_one_trigger_per_declaration() {
+        let mut schema = make_schema();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        person.triggers = triggers_over_every_anchor_shape();
+        let ddl = crate::export::export_schema(&schema).unwrap();
+
+        // The hash-named triggers on `Person`: `{table}_{hash12}`, which is
+        // the form only a user-declared `Trigger` takes.
+        let hash_named: Vec<&str> = ddl
+            .lines()
+            .filter_map(|line| line.strip_prefix("CREATE OR REPLACE TRIGGER \"Person_"))
+            .filter_map(|rest| rest.strip_suffix('"'))
+            .filter(|hash| hash.len() == 12 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        assert_eq!(hash_named.len(), 3, "one per declaration, got {hash_named:?}\n{ddl}");
+
+        // One per declared event, and no event a declaration did not ask
+        // for — an `On.Update` handler reading `__old__` must not also
+        // produce an `OLD`-free insert variant.
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            assert_eq!(
+                ddl.matches(&format!("AFTER {event} ON \"public\".\"Person\"")).count(),
+                1,
+                "AFTER {event}:\n{ddl}"
+            );
+        }
+
+        // And the differ expects exactly those three, so a second
+        // `migration create` after an apply has nothing to say about them.
+        let type_map = schema
+            .types
+            .iter()
+            .map(|t| {
+                (
+                    format!("{}::{}", t.module, t.name),
+                    (t.module.as_str(), t.table.as_str()),
+                )
+            })
+            .collect();
+        let expected = crate::diff::expected_triggers(&schema, &type_map);
+        let on_person = expected
+            .get(&("default".to_string(), "Person".to_string()))
+            .expect("Person is a key");
+        for hash in &hash_named {
+            assert!(
+                on_person.contains(&format!("Person_{hash}")),
+                "the differ does not expect Person_{hash}: {on_person:?}"
+            );
+        }
+        assert_eq!(
+            on_person
+                .iter()
+                .filter(|name| name.len() == "Person_".len() + 12
+                    && name.starts_with("Person_")
+                    && name["Person_".len()..].chars().all(|c| c.is_ascii_hexdigit()))
+                .count(),
+            3,
+            "{on_person:?}"
+        );
+    }
+
     /// The SQL a rewrite of `Person.slug` compiles to on insert.
     fn rewrite_sql(handler: &str, pg_type: &str) -> String {
         let assignments = crate::ir::compile_rewrite_assignments(

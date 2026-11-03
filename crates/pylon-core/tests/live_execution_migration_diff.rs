@@ -46,7 +46,8 @@ use pylon_core::diff::{
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{
-    IndexDescriptor, PropertyDescriptor, SchemaDescriptor, SignalEntry, TypeConstraint, TypeDescriptor,
+    IndexDescriptor, PropertyDescriptor, SchemaDescriptor, SignalEntry, TriggerDescriptor, TypeConstraint,
+    TypeDescriptor,
 };
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
@@ -65,6 +66,16 @@ use std::collections::HashMap;
 /// *and* in three statement-level ones on the junction (see
 /// `export::rewrite_junction_trigger_infos`), so both diff directions have
 /// to record those as already present too.
+///
+/// And three user-declared `Trigger`s, one per anchor shape a handler can
+/// take: `__new__` is bound only when the declared `on` excludes Delete and
+/// `__old__` only when it excludes Insert, so an `On.Update` handler reading
+/// both rows, an `On.Delete` one reading the old row and an `On.Insert` one
+/// reading the new row are three distinct lowerings. Each must produce
+/// exactly the trigger it declares and nothing else: a generator that also
+/// emitted, say, an `OLD`-free insert variant of the update handler would
+/// leave the differ proposing to drop it on every run, so neither diff
+/// direction below would ever come back empty after an apply.
 fn triggered_schema(module: &str) -> SchemaDescriptor {
     let qname = format!("{module}::Widget");
     let related_names = PropertyDescriptor {
@@ -77,30 +88,55 @@ fn triggered_schema(module: &str) -> SchemaDescriptor {
         }],
         ..text_prop("related_names")
     };
+    // Writing to a second type, not to `Widget`: a handler that mutates its
+    // own type is rejected outright as recursive.
+    let after = |on: u8, handler: &str| TriggerDescriptor {
+        on,
+        timing: "After".into(),
+        handler: handler.into(),
+    };
+    let triggers = vec![
+        after(
+            2,
+            &format!("insert {module}::Log {{ note := __old__.name ++ __new__.name }}"),
+        ),
+        after(4, &format!("insert {module}::Log {{ note := __old__.name }}")),
+        after(1, &format!("insert {module}::Log {{ note := __new__.name }}")),
+    ];
+    let bare = |name: &str, properties: Vec<PropertyDescriptor>| TypeDescriptor {
+        name: name.into(),
+        module: module.into(),
+        table: name.into(),
+        abstract_: false,
+        materialized: true,
+        description: None,
+        parents: vec![],
+        interfaces: vec![],
+        bases: vec![],
+        properties,
+        links: vec![],
+        multilinks: vec![],
+        computed: vec![],
+        constraints: vec![],
+        indexes: vec![],
+        partition: None,
+        vector_indexes: vec![],
+        search_indexes: vec![],
+        triggers: vec![],
+        junction: false,
+        signals: vec![],
+    };
     SchemaDescriptor {
-        types: vec![TypeDescriptor {
-            name: "Widget".into(),
-            module: module.into(),
-            table: "Widget".into(),
-            abstract_: false,
-            materialized: true,
-            description: None,
-            parents: vec![],
-            interfaces: vec![],
-            bases: vec![],
-            properties: vec![id_prop(), text_prop("name"), related_names],
-            links: vec![],
-            multilinks: vec![multilink("related", &qname)],
-            computed: vec![],
-            constraints: vec![],
-            indexes: vec![],
-            partition: None,
-            vector_indexes: vec![],
-            search_indexes: vec![],
-            triggers: vec![],
-            junction: false,
-            signals: vec![SignalEntry { on: 1 | 2 | 4 }],
-        }],
+        types: vec![
+            TypeDescriptor {
+                properties: vec![id_prop(), text_prop("name"), related_names],
+                multilinks: vec![multilink("related", &qname)],
+                triggers,
+                signals: vec![SignalEntry { on: 1 | 2 | 4 }],
+                ..bare("Widget", vec![])
+            },
+            bare("Log", vec![id_prop(), text_prop("note")]),
+        ],
         ..Default::default()
     }
 }
