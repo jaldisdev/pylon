@@ -43,7 +43,10 @@ pub use compiler::inlined_pointer_defaults;
 pub use compiler::pg_type_to_pyql;
 pub(crate) use compiler::types_compatible;
 pub use compiler::{GLOBALS_ARG, compile_fn_body, functions_needing_globals};
-pub use compiler::{RewriteAssignment, compile_rewrite_assignments};
+pub use compiler::{
+    JunctionRef, REWRITE_OWNER_ALIAS, RewriteAssignment, compile_rewrite_assignments,
+    compile_rewrite_assignments_anchored,
+};
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use std::collections::HashMap;

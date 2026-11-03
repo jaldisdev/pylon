@@ -4,6 +4,44 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.10.0
+
+### Writing
+
+* `array_agg` over a set that is already gathered as an array no longer wraps
+  it a second time. A rewrite declared `array_agg((select distinct
+  (.prices.currency)))` compiled to `array_agg(ARRAY(SELECT …))` and stored
+  `{{EUR}}` for a single-currency row — a nested array the write side never
+  objected to, since a `contains(.currencies, .default_currency)` constraint
+  passes on it too (Postgres `= ANY` flattens one level). Only reading the
+  property back noticed, as a value that is no member of its enum. The
+  materialized `ARRAY(SELECT …)` *is* the array `array_agg` would build, in
+  the same order and `{}` over no rows, so it now stands for itself; the other
+  set aggregates reaching a set by that same route — `count`, `sum`, `min`,
+  `max`, `mean`, `any`, `all` — run over its elements rather than over the
+  array as one value.
+
+  The rewrite trigger's name is derived from the SQL it compiles to, so
+  upgrading changes it: `pylon migration create` will emit the replacement,
+  and rows written by the old trigger keep the array they were given until
+  something rewrites them.
+* A rewrite that reads one of its type's multi-links now re-runs when only
+  that multi-link changes. Such a rewrite runs in an `AFTER` trigger on the
+  owning table, because a `BEFORE` one would see none of the junction rows
+  yet — and `update Listing set { prices := … }` never writes the owning
+  row, so the stored value silently kept whatever the last write to the row
+  itself had computed. Each junction table a rewrite reads now carries its
+  own statement-level `AFTER INSERT`/`DELETE`/`UPDATE` trigger that
+  recomputes it for the owners whose links the statement touched; adding,
+  removing, replacing and clearing a multi-link all land, as does deleting
+  the owner. One recompute per owner per statement, not per junction row.
+
+  A rewrite reading `__old__` is left to the owner's own trigger, which is
+  the only place the row as the statement found it exists. Still out of
+  scope: a linked object's *own* columns changing (`.prices.currency`
+  updated in place) — that is dependency tracking across a path, not a
+  trigger on one table.
+
 ## 0.9.0 — 2026-10-31
 
 ### Connections

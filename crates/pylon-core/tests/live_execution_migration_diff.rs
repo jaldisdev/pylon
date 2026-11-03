@@ -59,8 +59,24 @@ use std::collections::HashMap;
 /// triggers on both the main table and the junction table, plus a signal
 /// capture trigger, none of which `schema_to_db_state`'s baseline used to
 /// record as already present.
+///
+/// `related_names` adds the other kind of junction-table trigger: a rewrite
+/// reading the multi-link runs in an `AFTER` trigger on the owning table
+/// *and* in three statement-level ones on the junction (see
+/// `export::rewrite_junction_trigger_infos`), so both diff directions have
+/// to record those as already present too.
 fn triggered_schema(module: &str) -> SchemaDescriptor {
     let qname = format!("{module}::Widget");
+    let related_names = PropertyDescriptor {
+        name: "related_names".into(),
+        pg_type: "text[]".into(),
+        nullable: true,
+        rewrites: vec![pylon_core::schema::RewriteEntry {
+            on: 2,
+            handler: "std::array_agg((select distinct (.related.name)))".into(),
+        }],
+        ..text_prop("related_names")
+    };
     SchemaDescriptor {
         types: vec![TypeDescriptor {
             name: "Widget".into(),
@@ -72,7 +88,7 @@ fn triggered_schema(module: &str) -> SchemaDescriptor {
             parents: vec![],
             interfaces: vec![],
             bases: vec![],
-            properties: vec![id_prop(), text_prop("name")],
+            properties: vec![id_prop(), text_prop("name"), related_names],
             links: vec![],
             multilinks: vec![multilink("related", &qname)],
             computed: vec![],

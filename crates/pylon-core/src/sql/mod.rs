@@ -13111,6 +13111,247 @@ select owner { posts := (select owner.posts.title) };",
         assert!(ddl.contains("NEW.\"slug\" := _pylon_rewrites.\"v0\";"), "{ddl}");
     }
 
+    /// The SQL a rewrite of `Person.slug` compiles to on insert.
+    fn rewrite_sql(handler: &str, pg_type: &str) -> String {
+        let assignments = crate::ir::compile_rewrite_assignments(
+            "default::Person",
+            1,
+            &schema_with_slug_rewrite(handler, pg_type, 1),
+        )
+        .unwrap();
+        assignments[0].sql.clone()
+    }
+
+    /// `make_schema_with_rewrite` with `Person.slug` re-declared: one rewrite,
+    /// `handler` on the `on` mask (1 = insert, 2 = update).
+    fn schema_with_slug_rewrite(handler: &str, pg_type: &str, on: u8) -> SchemaDescriptor {
+        use crate::schema::RewriteEntry;
+        let mut schema = make_schema_with_rewrite();
+        let person = schema.types.iter_mut().find(|t| t.name == "Person").unwrap();
+        let slug = person.properties.iter_mut().find(|p| p.name == "slug").unwrap();
+        slug.pg_type = pg_type.into();
+        slug.rewrites = vec![RewriteEntry {
+            on,
+            handler: handler.into(),
+        }];
+        schema
+    }
+
+    /// A deferred rewrite's `AFTER` trigger sits on the *owning* table, which
+    /// `update Person set { posts := … }` never writes — it deletes and
+    /// inserts junction rows and reads the owner through a CTE. So the
+    /// junction table carries its own statement-level triggers.
+    #[test]
+    fn a_deferred_rewrite_gets_statement_triggers_on_the_junction_it_reads() {
+        let schema = schema_with_slug_rewrite("std::array_agg((select distinct (.posts.title)))", "text[]", 2);
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        for (event, referencing) in [
+            ("INSERT", "REFERENCING NEW TABLE AS \"_pylon_added\""),
+            ("DELETE", "REFERENCING OLD TABLE AS \"_pylon_removed\""),
+            (
+                "UPDATE",
+                "REFERENCING OLD TABLE AS \"_pylon_removed\" NEW TABLE AS \"_pylon_added\"",
+            ),
+        ] {
+            let expected = format!(
+                "AFTER {event} ON \"public\".\"Person.posts\"\n{referencing}\nFOR EACH STATEMENT EXECUTE FUNCTION"
+            );
+            assert!(ddl.contains(&expected), "missing {event} trigger:\n{ddl}");
+        }
+        // The recompute reads the owner out of its table rather than out of
+        // plpgsql's `NEW`: by the time this runs, the row is in there.
+        assert!(
+            ddl.contains("FROM \"public\".\"Person\" AS \"_pylon_owner\"")
+                && ddl.contains("WHERE \"_pylon_owner\".\"id\" IN (SELECT \"source\" FROM \"_pylon_added\")"),
+            "{ddl}"
+        );
+        // And writes only the owners whose value actually changed, which is
+        // what stops the owner's own `AFTER UPDATE` rewrite trigger — which
+        // this `UPDATE` fires — from going round again.
+        assert!(
+            ddl.contains("(\"_pylon_target\".\"slug\") IS DISTINCT FROM (\"_pylon_values\".\"v0\")"),
+            "{ddl}"
+        );
+    }
+
+    /// A rewrite that reads no multi-link runs in the owner's own `BEFORE`
+    /// trigger, where nothing about a junction can go stale.
+    #[test]
+    fn a_rewrite_reading_no_multi_link_gets_no_junction_triggers() {
+        let schema = schema_with_slug_rewrite("str_lower(.name)", "text", 2);
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        assert!(!ddl.contains("_rwj_"), "{ddl}");
+    }
+
+    /// `__old__` is the row as the statement found it. A junction-side
+    /// recompute has no such row — it reads the owner out of the table, long
+    /// after — so a rewrite needing one is left to the owner's own trigger.
+    #[test]
+    fn a_rewrite_reading_the_old_row_gets_no_junction_triggers() {
+        let schema = schema_with_slug_rewrite(
+            "std::array_agg((select distinct (.posts.title))) ++ [__old__.name]",
+            "text[]",
+            2,
+        );
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("OLD.\"name\""),
+            "the rewrite should read the old row:\n{ddl}"
+        );
+        assert!(!ddl.contains("_rwj_"), "{ddl}");
+    }
+
+    /// The migration diff drops every trigger it does not expect on a table,
+    /// and these live on a junction table rather than on the owner's.
+    #[test]
+    fn junction_rewrite_triggers_are_expected_by_the_diff() {
+        let schema = schema_with_slug_rewrite("std::array_agg((select distinct (.posts.title)))", "text[]", 2);
+        let type_map = schema
+            .types
+            .iter()
+            .map(|t| {
+                (
+                    format!("{}::{}", t.module, t.name),
+                    (t.module.as_str(), t.table.as_str()),
+                )
+            })
+            .collect();
+        let expected = crate::diff::expected_triggers(&schema, &type_map);
+        let on_junction = expected
+            .get(&("default".to_string(), "Person.posts".to_string()))
+            .expect("the junction table is a key");
+        assert_eq!(
+            on_junction.iter().filter(|name| name.contains("_rwj_")).count(),
+            3,
+            "{on_junction:?}"
+        );
+    }
+
+    /// A walk off a type with subtypes reads their junctions beside its own,
+    /// which is enough to make the rewrite deferred — but a subtype's
+    /// junction holds only that subtype's rows, so a trigger there
+    /// recomputing the *parent* could never match one. The subtype's own
+    /// triggers are the ones that cover it.
+    #[test]
+    fn a_subtypes_junction_only_carries_that_subtypes_own_recompute() {
+        let mut schema = schema_with_slug_rewrite("std::array_agg((select distinct (.posts.title)))", "text[]", 2);
+        let person = schema.types.iter().find(|t| t.name == "Person").unwrap().clone();
+        schema.types.push(TypeDescriptor {
+            name: "Manager".into(),
+            table: "Manager".into(),
+            parents: vec!["default::Person".into()],
+            ..person
+        });
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("AFTER INSERT ON \"public\".\"Person.posts\"") && ddl.contains("\"Person_rwj_ins_"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("AFTER INSERT ON \"public\".\"Manager.posts\"") && ddl.contains("\"Manager_rwj_ins_"),
+            "{ddl}"
+        );
+        // Each junction carries exactly one owner's three triggers.
+        for junction in ["Person.posts", "Manager.posts"] {
+            assert_eq!(
+                ddl.matches(&format!("ON \"public\".\"{junction}\"\nREFERENCING"))
+                    .count(),
+                3,
+                "{junction}:\n{ddl}"
+            );
+        }
+    }
+
+    /// A `@pylon.junction` through type has no table of its own — its
+    /// properties become columns on the owner-derived junction — so the
+    /// trigger belongs on that one, under its `source`.
+    #[test]
+    fn a_rewrite_over_a_through_multi_link_triggers_on_the_owner_derived_junction() {
+        use crate::schema::RewriteEntry;
+        let mut schema = make_schema_with_through_and_prop();
+        let product = schema.types.iter_mut().find(|t| t.name == "Product").unwrap();
+        product.properties.push(PropertyDescriptor {
+            name: "tag_names".into(),
+            pg_type: "text[]".into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![RewriteEntry {
+                on: 2,
+                handler: "std::array_agg((select distinct (.tags.name)))".into(),
+            }],
+            tuple_members: None,
+            column_type: None,
+        });
+        let ddl = crate::export::export_schema(&schema).unwrap();
+        assert!(
+            ddl.contains("AFTER INSERT ON \"public\".\"Product.tags\""),
+            "no junction trigger:\n{ddl}"
+        );
+        assert!(
+            ddl.contains("WHERE \"_pylon_owner\".\"id\" IN (SELECT \"source\" FROM \"_pylon_added\")"),
+            "{ddl}"
+        );
+    }
+
+    /// `array_agg((select distinct .<multi-link>.<prop>))` gathers the walk's
+    /// values into one flat array. The walk is already materialized as
+    /// `ARRAY(SELECT …)` — the array the property asks for — so an `array_agg`
+    /// around it stored `{{EUR}}` where `{EUR}` belonged, which only the read
+    /// back out of the property ever noticed.
+    #[test]
+    fn a_rewrite_aggregating_a_multi_link_property_is_a_flat_array() {
+        // Every spelling of the same walk: the sub-select's `distinct`, the
+        // aggregate's own, and the bare path.
+        for handler in [
+            "std::array_agg((select distinct (.posts.title)))",
+            "std::array_agg((select .posts.title))",
+            "std::array_agg(distinct .posts.title)",
+            "std::array_agg(.posts.title)",
+        ] {
+            let sql = rewrite_sql(handler, "text[]");
+            assert!(
+                !sql.contains("array_agg(ARRAY(SELECT"),
+                "doubly wrapped by {handler}:\n{sql}"
+            );
+            assert!(
+                sql.contains(r#""public"."Person.posts""#) && sql.contains(r#""title""#),
+                "{handler}:\n{sql}"
+            );
+        }
+        // The walk is this select's own row source, so `distinct` stays on it.
+        for handler in [
+            "std::array_agg((select distinct (.posts.title)))",
+            "std::array_agg(distinct .posts.title)",
+        ] {
+            let sql = rewrite_sql(handler, "text[]");
+            assert!(sql.contains("SELECT DISTINCT"), "{handler}:\n{sql}");
+        }
+    }
+
+    /// The other set aggregates reach the same walk by the same route, and run
+    /// over its elements rather than over the array as one value.
+    #[test]
+    fn a_rewrite_aggregating_a_multi_link_property_runs_over_its_elements() {
+        for (handler, aggregate) in [
+            ("std::count((select distinct (.posts.title)))", "count"),
+            ("std::min((select distinct (.posts.title)))", "min"),
+            ("std::max(.posts.title)", "max"),
+        ] {
+            let sql = rewrite_sql(handler, "text");
+            assert!(
+                !sql.contains(&format!("{aggregate}(ARRAY(SELECT")),
+                "{handler} aggregates the array itself:\n{sql}"
+            );
+            assert!(sql.contains(aggregate), "{handler}:\n{sql}");
+        }
+    }
+
     #[test]
     fn a_rewrite_walking_a_link_starts_from_the_new_row() {
         // The row is not in its table yet when a `BEFORE INSERT` trigger runs.

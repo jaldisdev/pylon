@@ -778,6 +778,129 @@ def test_a_set_of_array_valued_properties_reads_back_as_the_arrays_it_holds(live
     asyncio.run(run())
 
 
+def test_a_rewrite_aggregating_a_multi_links_property_stores_a_flat_array(live_pool, unique_module):
+    """`array_agg((select distinct .prices.currency))` as a rewrite.
+
+    The walk is already materialized as `ARRAY(SELECT …)` — the array the
+    property asks for — and the `array_agg` around it wrapped that a second
+    time, so a listing with one EUR price stored `{{EUR}}`. Nothing on the
+    write side noticed: a `contains(.currencies, .default_currency)`
+    constraint passes on the nested array too, because Postgres `= ANY`
+    flattens it. Reading the property back is what caught it, which is why
+    this test goes all the way out through the typed client.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_rewrite_array_agg')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.enum('EUR', 'USD')
+        class Currency(pylon.Enum):
+            pass
+
+        Currency.__pylon_module__ = module
+
+        @pylon.type(module=module, name='ListingPrice')
+        class ListingPrice:
+            currency: Currency
+
+        @pylon.type(module=module, name='Listing')
+        class Listing:
+            name: pylon.Str
+            prices: pylon.MultiLink[ListingPrice]
+            currencies: pylon.Property[
+                pylon.Array[Currency],
+                pylon.Rewrite(
+                    pylon.On.Insert | pylon.On.Update,
+                    'std::array_agg((select distinct (.prices.currency)))',
+                ),
+            ] | None
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        await client.execute(
+            f"""insert {module}::ListingPrice {{ currency := <{module}::Currency>'EUR' }};
+                insert {module}::ListingPrice {{ currency := <{module}::Currency>'USD' }};"""
+        )
+        # One currency is the case that fails silently: `{{EUR}}` reads back
+        # as one bogus element rather than as a length mismatch.
+        await client.execute(
+            f"""insert {module}::Listing {{
+                  name := 'single',
+                  prices := (select {module}::ListingPrice filter .currency = <{module}::Currency>'EUR')
+                }};"""
+        )
+        await client.execute(f"insert {module}::Listing {{ name := 'both', prices := {module}::ListingPrice }};")
+
+        rows = await client.query(f'select {module}::Listing {{ name, currencies }} order by .name;')
+        by_name = {row.name: row.currencies for row in rows}
+        assert sorted(by_name['both']) == [Currency.EUR, Currency.USD]
+        assert list(by_name['single']) == [Currency.EUR]
+
+        # And the stored column itself is one-dimensional — the dimensionality
+        # the typed read above infers, asserted directly against Postgres so a
+        # hydration change cannot mask it.
+        dims = await live_pool.query_named(
+            f'SELECT array_ndims("currencies") AS dims FROM "{module}"."Listing" ORDER BY "name"',
+            [],
+        )
+        assert [row['dims'] for row in dims] == [1, 1]
+
+        # The same rewrite on update, where only the multi-link changes — the
+        # statement never writes the Listing row itself, so this runs from the
+        # junction table's own trigger.
+        await client.execute(
+            f"""update {module}::Listing filter .name = 'single'
+                set {{ prices := {module}::ListingPrice }};"""
+        )
+        updated = await client.query_required_single(
+            f"select {module}::Listing {{ currencies }} filter .name = 'single';"
+        )
+        assert sorted(updated.currencies) == [Currency.EUR, Currency.USD]
+
+        # And shrinking it again, which removes junction rows.
+        await client.execute(
+            f"""update {module}::Listing filter .name = 'single'
+                set {{ prices := (select {module}::ListingPrice
+                                  filter .currency = <{module}::Currency>'USD') }};"""
+        )
+        shrunk = await client.query_required_single(
+            f"select {module}::Listing {{ currencies }} filter .name = 'single';"
+        )
+        assert list(shrunk.currencies) == [Currency.USD]
+
+        # Emptying the link set entirely, which the rewrite answers with the
+        # empty array rather than leaving the last value in place.
+        await client.execute(f"update {module}::Listing filter .name = 'single' set {{ prices := {{}} }};")
+        emptied = await client.query_required_single(
+            f"select {module}::Listing {{ currencies }} filter .name = 'single';"
+        )
+        assert list(emptied.currencies) == []
+
+        # Deleting the owner cascades its junction rows away, firing the same
+        # trigger with the owner row already gone: the recompute finds no row
+        # to write rather than failing the statement.
+        await client.execute(f"delete {module}::Listing filter .name = 'both';")
+        assert [row.name for row in await client.query(f'select {module}::Listing {{ name }};')] == ['single']
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
 def test_a_decimal_inside_a_tuple_keeps_every_digit(live_pool, unique_module):
     """A tuple travels as jsonb, which has one number type and no scale.
 

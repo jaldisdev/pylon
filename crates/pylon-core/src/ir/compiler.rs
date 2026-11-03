@@ -579,6 +579,47 @@ fn aggregate_over_nothing_sql(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The PostgreSQL aggregate a one-argument call over a set resolves to, or
+/// `None` for anything else — a scalar function, or a set-taking builtin of
+/// Pylon's own like `assert_single`, which is no aggregate.
+fn single_set_aggregate(module: Option<&str>, name: &str) -> Option<String> {
+    crate::stdlib::lookup(module.unwrap_or("std"), name)
+        .into_iter()
+        .find_map(|d| match &d.impl_strategy {
+            crate::stdlib::ImplStrategy::SqlBuiltin(sql_name) if d.is_aggregate() && d.params.len() == 1 => {
+                Some(sql_name.to_string())
+            }
+            _ => None,
+        })
+}
+
+/// Apply a set aggregate to a set already gathered as an array: the array's
+/// elements are the rows to aggregate, so it becomes a row source of its own.
+///
+/// `array_agg` is the identity here. The materialized `ARRAY(SELECT …)` *is*
+/// the array it would build — in the same order, and `{}` over no rows without
+/// a `coalesce` to stand in for SQL's NULL — so aggregating it again only buys
+/// a second level of nesting.
+fn aggregate_over_array(sql_name: &str, pyql_name: &str, values: IrExpr) -> IrExpr {
+    if sql_name == "array_agg" {
+        return values;
+    }
+    // `min`/`max` over no rows answer NULL, which is the empty set; `count`
+    // answers 0. Only the aggregates whose SQL answer differs from PyQL's need
+    // the `coalesce` to stand in.
+    let aggregated = match aggregate_over_nothing_sql(pyql_name) {
+        Some(over_nothing) => format!("coalesce({sql_name}(\"_s\".\"v\"), {over_nothing})"),
+        None => format!("{sql_name}(\"_s\".\"v\")"),
+    };
+    IrExpr::FunctionCall(IrFunctionCall {
+        return_pg_type: None,
+        schema: None,
+        name: sql_name.to_string(),
+        args: vec![values],
+        sql_template: Some(format!("(SELECT {aggregated} FROM unnest($1) AS \"_s\"(\"v\"))")),
+    })
+}
+
 fn aggregate_over_nothing(name: &str, aggregate: IrExpr) -> IrExpr {
     let Some(value) = aggregate_over_nothing_sql(name) else {
         return aggregate;
@@ -973,17 +1014,52 @@ pub fn compile_fn_body_with(
 /// mask combining Insert and Delete (with no Update) legally binds
 /// neither. Referencing an anchor that isn't bound is a compile error, not
 /// a runtime NULL.
+/// One junction table a rewrite's walk reads, and the column in it naming
+/// the owner row — what lets a trigger on that table recompute the rewrite
+/// for exactly the rows whose links changed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JunctionRef {
+    pub module: String,
+    pub table: String,
+    pub source_column: String,
+    /// True when this junction's `source_column` names a row of the owner's
+    /// *own* table. A walk off a type with subtypes reads their junctions
+    /// beside its own, and those hold only their own subtype's rows — enough
+    /// to make the walk reach a junction at all (which is what
+    /// `RewriteAssignment::reads_a_multi_link` asks), but nothing a trigger
+    /// recomputing *this* type could ever match.
+    pub owner_sourced: bool,
+}
+
 /// One compiled rewrite: the column it writes and the value it writes there.
 pub struct RewriteAssignment {
     pub pointer: String,
     pub column: String,
     pub ir: IrExpr,
     pub sql: String,
-    /// True when the expression reads one of the owner's multi-links. Those
-    /// rows live in a junction table the statement writes *after* the row
-    /// itself, so a `BEFORE` trigger reading one sums an empty set — see
-    /// `export::rewrite_trigger_infos`.
-    pub reads_a_multi_link: bool,
+    /// The junction tables the expression actually reads, read off the
+    /// emitted SQL. Those rows live in a table the statement writes *after*
+    /// the row itself, so a `BEFORE` trigger reading one sums an empty set: a
+    /// rewrite with any of these runs in an `AFTER` trigger instead, and
+    /// needs one on each of these tables too — see
+    /// `export::rewrite_trigger_infos` and
+    /// `export::rewrite_junction_trigger_infos`.
+    pub junctions: Vec<JunctionRef>,
+}
+
+impl RewriteAssignment {
+    /// True when the expression reads one of the owner's multi-links, and so
+    /// cannot run in a `BEFORE` trigger.
+    pub fn reads_a_multi_link(&self) -> bool {
+        !self.junctions.is_empty()
+    }
+
+    /// True when the expression reads the row as it was *before* the
+    /// statement. Nothing outside the owner's own trigger can supply that, so
+    /// a junction-side recompute has to leave such a rewrite alone.
+    pub fn reads_the_old_row(&self) -> bool {
+        self.sql.contains("OLD.")
+    }
 }
 
 /// A type's rewrites for one event (`on_mask`: 1 = insert, 2 = update), each
@@ -996,11 +1072,32 @@ pub fn compile_rewrite_assignments(
     on_mask: u8,
     schema: &SchemaDescriptor,
 ) -> Result<Vec<RewriteAssignment>, crate::error::PyQLError> {
+    compile_rewrite_assignments_anchored(type_name, on_mask, schema, "NEW")
+}
+
+/// The alias a junction-side recompute anchors a rewrite on: an ordinary
+/// table alias for the owner row, read out of the table it is already in
+/// rather than out of plpgsql's `NEW`. See
+/// `export::rewrite_junction_trigger_infos`.
+pub const REWRITE_OWNER_ALIAS: &str = "_pylon_owner";
+
+/// `compile_rewrite_assignments`, with the SQL alias the owner row is read
+/// through. `"NEW"` is plpgsql's trigger row variable, which the emitter
+/// and the path correlation both recognize by name — the row may not be in
+/// its table yet, so a walk starts from the variable itself. Any other alias
+/// is an ordinary table alias, correlating to a row the statement has
+/// already written.
+pub fn compile_rewrite_assignments_anchored(
+    type_name: &str,
+    on_mask: u8,
+    schema: &SchemaDescriptor,
+    anchor: &str,
+) -> Result<Vec<RewriteAssignment>, crate::error::PyQLError> {
     let mut c = Compiler::new(schema);
     c.in_fn_body = true;
     let owner_td = c.resolve_type(type_name)?;
     c.special_anchors
-        .insert("__new__".to_string(), (owner_td, "NEW".to_string()));
+        .insert("__new__".to_string(), (owner_td, anchor.to_string()));
     if on_mask & 1 == 0 {
         c.special_anchors
             .insert("__old__".to_string(), (owner_td, "OLD".to_string()));
@@ -1025,7 +1122,7 @@ pub fn compile_rewrite_assignments(
                 continue;
             }
             let expr = crate::parse::parse_pointer_expr(&rw.handler)?;
-            let ir = c.compile_expr(&expr, owner_td, "NEW")?;
+            let ir = c.compile_expr(&expr, owner_td, anchor)?;
             if !c.params.is_empty() || !c.hoisted_ctes.is_empty() {
                 return Err(PyQLError::Type(PyQLTypeError {
                     message: format!(
@@ -1039,14 +1136,17 @@ pub fn compile_rewrite_assignments(
             // reaches a junction through computeds, subtypes and `through`
             // types, and what it actually joins is the one answer all of
             // those agree on.
-            let junctions = c.junction_tables_of(owner_td)?;
-            let reads_a_multi_link = junctions.iter().any(|table| sql.contains(table.as_str()));
+            let junctions = c
+                .junction_tables_of(owner_td)?
+                .into_iter()
+                .filter(|junction| sql.contains(&format!("\"{}\"", junction.table)))
+                .collect();
             out.push(RewriteAssignment {
                 pointer: name.clone(),
                 column: column.clone(),
                 ir,
                 sql,
-                reads_a_multi_link,
+                junctions,
             });
         }
     }
@@ -9519,26 +9619,51 @@ impl<'a> Compiler<'a> {
         Ok((junction_table, module, source_col, target_col, through_td))
     }
 
-    /// Every junction table a read of `td`'s multi-links can name, quoted as
-    /// the emitter spells it. A `through` type brings its own table; an
-    /// owner-derived junction is named after the owner, and a subtype's
-    /// carries that subtype's table, so each implementor contributes one.
-    fn junction_tables_of(&mut self, td: &TypeDescriptor) -> Result<Vec<String>, PyQLError> {
-        let mut tables = vec![];
+    /// Every junction table a read of `td`'s multi-links can name. A real
+    /// `through` type brings its own table, in its own module, naming the
+    /// owner through its own link column; everything else is an
+    /// owner-derived junction with a plain `source`, named after the owner —
+    /// and a subtype's carries that subtype's table, so each implementor
+    /// contributes one.
+    fn junction_tables_of(&mut self, td: &TypeDescriptor) -> Result<Vec<JunctionRef>, PyQLError> {
+        let mut tables: Vec<JunctionRef> = vec![];
         for multilink in &td.multilinks {
-            match &multilink.through {
-                Some(through) => {
-                    let through_td = self.resolve_type(through)?;
-                    tables.push(format!("\"{}\"", through_td.table));
-                }
+            let (_, _, source_col, _, through_td) =
+                self.own_junction_info_for(td, &multilink.name, &multilink.target, &multilink.through)?;
+            // A `@pylon.junction` through type has no table of its own — its
+            // properties become extra columns on the owner-derived junction,
+            // which is otherwise the shape a plain multi-link gets.
+            match through_td.filter(|through_td| !through_td.junction) {
+                // A real `through` type is one table for the whole hierarchy,
+                // naming the owner through its own link column, so every
+                // implementor's rows are in it.
+                Some(through_td) => tables.push(JunctionRef {
+                    module: through_td.module.clone(),
+                    table: through_td.table.clone(),
+                    source_column: format!("{source_col}_id"),
+                    owner_sourced: true,
+                }),
                 None => {
-                    tables.push(format!("\"{}.{}\"", td.table, multilink.name));
+                    tables.push(JunctionRef {
+                        module: td.module.clone(),
+                        table: format!("{}.{}", td.table, multilink.name),
+                        source_column: "source".to_string(),
+                        owner_sourced: true,
+                    });
                     for implementor in self.find_poly_implementors(&format!("{}::{}", td.module, td.name)) {
-                        tables.push(format!("\"{}.{}\"", implementor.table, multilink.name));
+                        tables.push(JunctionRef {
+                            module: implementor.module.clone(),
+                            table: format!("{}.{}", implementor.table, multilink.name),
+                            source_column: "source".to_string(),
+                            owner_sourced: implementor.table == td.table,
+                        });
                     }
                 }
             }
         }
+        // `find_poly_implementors` counts the type itself among its own
+        // implementors, so a plain multi-link lists its junction twice.
+        tables.dedup();
         Ok(tables)
     }
 
@@ -14095,29 +14220,21 @@ impl<'a> Compiler<'a> {
                     self.explicit_set_depth -= 1;
                 }
                 let args = args?;
-                // `all(.required_addons in licensed_addons)` — the argument is
-                // a set of booleans, gathered as an array the way every other
-                // multi-valued expression is, and the quantifier ranges over
-                // its elements. Handed the array itself, `bool_and` would
-                // aggregate the enclosing query's rows instead.
-                if is_explicit_set
+                // An aggregate over a set that is already gathered as an array
+                // runs over that array's elements: `all(.required_addons in
+                // licensed_addons)` ranges over one boolean per element, and
+                // `array_agg((select distinct .prices.currency))` asks for
+                // exactly the array the walk is already materialized as.
+                // Handed the array itself, the aggregate would run over the
+                // enclosing query's rows instead, and `array_agg` would wrap
+                // the answer in a second level — storing `{{EUR}}` for a
+                // single-element set.
+                if f.args.len() == 1
                     && let [values] = args.as_slice()
                     && yields_array(values)
+                    && let Some(sql_name) = single_set_aggregate(f.module.as_deref(), &f.name)
                 {
-                    let (aggregate, over_nothing) = if f.name == "all" {
-                        ("bool_and", "true")
-                    } else {
-                        ("bool_or", "false")
-                    };
-                    return Ok(IrExpr::FunctionCall(IrFunctionCall {
-                        return_pg_type: None,
-                        schema: None,
-                        name: aggregate.to_string(),
-                        args: vec![values.clone()],
-                        sql_template: Some(format!(
-                            "(SELECT coalesce({aggregate}(\"_s\".\"v\"), {over_nothing}) FROM unnest($1) AS \"_s\"(\"v\"))"
-                        )),
-                    }));
+                    return Ok(aggregate_over_array(&sql_name, &f.name, values.clone()));
                 }
                 self.resolve_fn_call(f.module.as_deref(), &f.name, args)
             }

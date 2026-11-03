@@ -1775,6 +1775,11 @@ pub fn user_trigger_names(schema: &SchemaDescriptor) -> Vec<(String, String, Str
             }
         }
     }
+    // These sit on junction tables, not on the owning table, so they cannot
+    // be derived from `t` alone the way the two above are.
+    for info in rewrite_junction_trigger_infos(schema) {
+        result.push((info.table_module, info.table_name, info.trigger_name));
+    }
     result
 }
 
@@ -1806,7 +1811,7 @@ fn rewrite_trigger_name(t: &TypeDescriptor, on: u8, schema: &SchemaDescriptor, d
         crate::ir::compile_rewrite_assignments(&format!("{}::{}", t.module, t.name), on, schema).unwrap_or_default();
     let assignments: Vec<&crate::ir::RewriteAssignment> = assignments
         .iter()
-        .filter(|a| a.reads_a_multi_link == deferred)
+        .filter(|a| a.reads_a_multi_link() == deferred)
         .collect();
     if assignments.is_empty() {
         return None;
@@ -1850,7 +1855,7 @@ fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigge
                 };
                 let assignments: Vec<&crate::ir::RewriteAssignment> = compiled
                     .iter()
-                    .filter(|assignment| assignment.reads_a_multi_link == deferred)
+                    .filter(|assignment| assignment.reads_a_multi_link() == deferred)
                     .collect();
                 if assignments.is_empty() {
                     continue;
@@ -1925,6 +1930,190 @@ fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigge
     Ok(result)
 }
 
+/// The events a junction-side recompute fires on: the short name that goes
+/// into the trigger's own name, the trigger event, and the transition tables
+/// it reads the touched owner ids out of. One trigger per event rather than
+/// one `INSERT OR UPDATE OR DELETE` trigger, because PostgreSQL allows
+/// transition tables only on a single-event trigger.
+const REWRITE_JUNCTION_EVENTS: [(&str, &str); 3] = [("ins", "INSERT"), ("del", "DELETE"), ("upd", "UPDATE")];
+
+/// `REFERENCING` clause and affected-owner query for one of those events.
+fn rewrite_junction_transition(event: &str, source_column: &str) -> (String, String) {
+    let source = qi(source_column);
+    match event {
+        "INSERT" => (
+            "REFERENCING NEW TABLE AS \"_pylon_added\"".to_string(),
+            format!("SELECT {source} FROM \"_pylon_added\""),
+        ),
+        "DELETE" => (
+            "REFERENCING OLD TABLE AS \"_pylon_removed\"".to_string(),
+            format!("SELECT {source} FROM \"_pylon_removed\""),
+        ),
+        // A junction row that moves between owners leaves one owner's link
+        // set and joins another's, so both sides are recomputed.
+        _ => (
+            "REFERENCING OLD TABLE AS \"_pylon_removed\" NEW TABLE AS \"_pylon_added\"".to_string(),
+            format!("SELECT {source} FROM \"_pylon_removed\" UNION SELECT {source} FROM \"_pylon_added\""),
+        ),
+    }
+}
+
+/// The statement-level `AFTER` triggers that re-run a type's deferred
+/// rewrites when only its *junction* rows change.
+///
+/// `rewrite_trigger_infos` puts a rewrite that reads one of the type's
+/// multi-links in an `AFTER` trigger on the owning table, because a `BEFORE`
+/// one would see none of the junction rows yet. That trigger fires only when
+/// the owner row is itself written — and `update Listing set { prices := … }`
+/// never writes it: the statement deletes and inserts junction rows and
+/// reads the owner through a CTE, so the rewrite did not re-run and the
+/// stored value went stale. (Having the statement touch the owner row
+/// instead cannot work: every CTE in it sees the same pre-statement
+/// snapshot, so a row update in the same statement would recompute from the
+/// *old* link set.)
+///
+/// So each junction table a deferred rewrite reads gets its own `AFTER
+/// INSERT`/`DELETE`/`UPDATE FOR EACH STATEMENT` trigger, which recomputes
+/// that rewrite for the owners whose rows appear in the statement's
+/// transition table. Statement-level and set-based rather than per row: a
+/// multi-link replacement writes every junction row in one statement, and a
+/// per-row trigger would recompute an aggregate over all of them once per
+/// row.
+///
+/// The rewrite is compiled a second time here, anchored on the owner's table
+/// rather than on plpgsql's `NEW` (`ir::REWRITE_OWNER_ALIAS`): by the time
+/// an `AFTER` trigger on the junction runs, the owner row is in its table
+/// and can simply be joined to. A rewrite reading `__old__` is left out —
+/// nothing outside the owner's own trigger has the row as it was before.
+///
+/// Two things this deliberately does not do. It covers the link
+/// *membership* changing, not a linked object's own columns: a rewrite
+/// reading `.prices.currency` still goes stale if that `ListingPrice`'s
+/// `currency` is updated directly, and recomputing across arbitrary paths is
+/// dependency tracking rather than a trigger on one table. And an `insert
+/// Listing { prices := … }` writes the row and its junction rows in one
+/// statement, so these fire there too — an `On.Update`-only rewrite reading
+/// a multi-link is computed on that insert as well. For the aggregates this
+/// applies to, that is the value the links call for either way; the owner's
+/// own `AFTER INSERT` trigger runs first, so the recompute finds nothing to
+/// change whenever the rewrite applies on both events.
+fn rewrite_junction_trigger_infos(schema: &SchemaDescriptor) -> Vec<DeletionTriggerInfo> {
+    let mut result = Vec::new();
+    for t in &schema.types {
+        if t.abstract_ || t.junction {
+            continue;
+        }
+        let type_name = format!("{}::{}", t.module, t.name);
+        // Update-event rewrites: an insert of the owner row writes its
+        // junction rows in the same statement, and the owner's own `AFTER
+        // INSERT` trigger already runs after all of them.
+        let Ok(compiled) =
+            crate::ir::compile_rewrite_assignments_anchored(&type_name, 2, schema, crate::ir::REWRITE_OWNER_ALIAS)
+        else {
+            // `rewrite_trigger_infos` reports a rewrite that will not compile.
+            continue;
+        };
+        let deferred: Vec<&crate::ir::RewriteAssignment> = compiled
+            .iter()
+            .filter(|a| a.reads_a_multi_link() && !a.reads_the_old_row())
+            .collect();
+        if deferred.is_empty() {
+            continue;
+        }
+        // One trigger per junction table, recomputing only the rewrites that
+        // actually read it.
+        let mut junctions: Vec<&crate::ir::JunctionRef> = deferred
+            .iter()
+            .flat_map(|a| a.junctions.iter())
+            .filter(|junction| junction.owner_sourced)
+            .collect();
+        junctions.sort_by(|a, b| (&a.module, &a.table).cmp(&(&b.module, &b.table)));
+        junctions.dedup();
+        for junction in junctions {
+            let assignments: Vec<&crate::ir::RewriteAssignment> = deferred
+                .iter()
+                .copied()
+                .filter(|a| a.junctions.contains(junction))
+                .collect();
+            let owner_qname = qn(&t.module, &t.table);
+            let junction_qname = qn(&junction.module, &junction.table);
+            let globals_arg = qi(crate::ir::GLOBALS_ARG);
+            let values = assignments
+                .iter()
+                .enumerate()
+                .map(|(i, a)| format!("\t\t\t{} AS \"v{i}\"", a.sql))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let sets = assignments
+                .iter()
+                .enumerate()
+                .map(|(i, a)| format!("\t\t{} = \"_pylon_values\".\"v{i}\"", qi(&a.column)))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let stored = assignments
+                .iter()
+                .map(|a| format!("\"_pylon_target\".{}", qi(&a.column)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let computed = (0..assignments.len())
+                .map(|i| format!("\"_pylon_values\".\"v{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let owner_alias = qi(crate::ir::REWRITE_OWNER_ALIAS);
+            for (short, event) in REWRITE_JUNCTION_EVENTS {
+                let (referencing, sources) = rewrite_junction_transition(event, &junction.source_column);
+                // As for `rewrite_trigger_name`: the compiled SQL is part of
+                // the name, so a rewrite Pylon now compiles differently
+                // replaces the trigger rather than keeping the old one.
+                let hash = fnv(&[
+                    &t.table,
+                    &junction.table,
+                    short,
+                    &assignments
+                        .iter()
+                        .map(|a| a.sql.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ]);
+                let fname = format!("{}_rwj_{short}_{}", t.table, &hash[..12]);
+                let fn_qname = qn(&junction.module, &fname);
+                let ddl = format!(
+                    "CREATE OR REPLACE FUNCTION {fn_qname}()\n\
+                     RETURNS trigger LANGUAGE plpgsql AS $$\n\
+                     DECLARE\n\
+                     \t{globals_arg} jsonb := nullif(current_setting('pylon.globals', true), '')::jsonb;\n\
+                     BEGIN\n\
+                     \tUPDATE {owner_qname} AS \"_pylon_target\" SET\n\
+                     {sets}\n\
+                     \tFROM (\n\
+                     \t\tSELECT {owner_alias}.\"id\" AS \"id\",\n\
+                     {values}\n\
+                     \t\tFROM {owner_qname} AS {owner_alias}\n\
+                     \t\tWHERE {owner_alias}.\"id\" IN ({sources})\n\
+                     \t) AS \"_pylon_values\"\n\
+                     \tWHERE \"_pylon_target\".\"id\" = \"_pylon_values\".\"id\"\n\
+                     \t  AND ({stored}) IS DISTINCT FROM ({computed});\n\
+                     \tRETURN NULL;\n\
+                     END;\n\
+                     $$;\n\n\
+                     CREATE OR REPLACE TRIGGER {}\n\
+                     AFTER {event} ON {junction_qname}\n\
+                     {referencing}\n\
+                     FOR EACH STATEMENT EXECUTE FUNCTION {fn_qname}();\n\n",
+                    qi(&fname),
+                );
+                result.push(DeletionTriggerInfo {
+                    table_module: junction.module.clone(),
+                    table_name: junction.table.clone(),
+                    trigger_name: fname,
+                    ddl,
+                });
+            }
+        }
+    }
+    result
+}
+
 /// One `CREATE FUNCTION` + `CREATE TRIGGER` pair per user-declared schema
 /// `Trigger`. Public entry point for `diff/mod.rs`, mirroring
 /// `deletion_policy_trigger_infos`/`signal_trigger_infos` — the single
@@ -1941,6 +2130,7 @@ fn rewrite_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTrigge
 /// with any row count (0, 1, or many), matching "fire and forget" exactly.
 pub fn user_trigger_infos(schema: &SchemaDescriptor) -> Result<Vec<DeletionTriggerInfo>, PyQLError> {
     let mut result = rewrite_trigger_infos(schema)?;
+    result.extend(rewrite_junction_trigger_infos(schema));
     for t in &schema.types {
         if t.abstract_ || t.junction {
             continue;
