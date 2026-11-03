@@ -814,13 +814,16 @@ def test_a_rewrite_aggregating_a_multi_links_property_stores_a_flat_array(live_p
         class Listing:
             name: pylon.Str
             prices: pylon.MultiLink[ListingPrice]
-            currencies: pylon.Property[
-                pylon.Array[Currency],
-                pylon.Rewrite(
-                    pylon.On.Insert | pylon.On.Update,
-                    'std::array_agg((select distinct (.prices.currency)))',
-                ),
-            ] | None
+            currencies: (
+                pylon.Property[
+                    pylon.Array[Currency],
+                    pylon.Rewrite(
+                        pylon.On.Insert | pylon.On.Update,
+                        'std::array_agg((select distinct (.prices.currency)))',
+                    ),
+                ]
+                | None
+            )
 
         schema = _build_schema(*snapshot())
         await live_pool.batch_execute(export_schema(schema))
