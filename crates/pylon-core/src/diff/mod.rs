@@ -1968,6 +1968,249 @@ fn enum_target(schema: &SchemaDescriptor, pg_type: &str) -> bool {
         .any(|e| bare == qn(&e.module, &e.name) || bare == qi(&e.name))
 }
 
+/// The suffix the enum being replaced is renamed to while its rebuild is in
+/// flight. Renaming the old type *away* — rather than building the
+/// replacement under a temporary name — is what lets everything else stay
+/// oblivious: from the `CREATE TYPE` on, the type's real name is the new
+/// one, so a composite, function or view rebuilt later in this same diff
+/// binds to it without any of them needing to know a rebuild happened.
+const OLD_ENUM_SUFFIX: &str = "__pylon_old";
+
+/// Whether `existing` is a leading run of `target` — the one enum change
+/// PostgreSQL can make in place, with `ALTER TYPE … ADD VALUE`.
+///
+/// Anything else (a member removed, or the same members in a new order)
+/// needs the type rebuilt: there is no `DROP VALUE`, and `ADD VALUE`
+/// appends, so declared order is only reachable by building the type afresh.
+/// Order is part of the type's meaning, not cosmetic — `ORDER BY` on an enum
+/// column sorts by `pg_enum.enumsortorder`.
+fn enum_members_appended(existing: &[String], target: &[String]) -> bool {
+    existing.len() <= target.len() && existing == &target[..existing.len()]
+}
+
+/// Every column whose type is `enum_ref` or an array of it, as
+/// `(module, table, column, is_array)`.
+fn enum_columns(target: &SchemaDescriptor, enum_ref: &str) -> Vec<(String, String, String, bool)> {
+    let mut out = Vec::new();
+    for td in &target.types {
+        if td.abstract_ {
+            continue;
+        }
+        for p in &td.properties {
+            let base = p.pg_type.strip_suffix("[]").unwrap_or(&p.pg_type);
+            if base == enum_ref {
+                out.push((
+                    td.module.clone(),
+                    td.table.clone(),
+                    p.name.clone(),
+                    p.pg_type.ends_with("[]"),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// How an enum column reaches the rebuilt type: through `text`, since
+/// PostgreSQL has no enum-to-enum cast.
+///
+/// This is only the *default*. A row holding a member the new type no longer
+/// has fails on it — `invalid input value for enum "X": "Membership"` — which
+/// is the correct outcome for a mapping no schema can state: the migration
+/// stops instead of inventing one. The interactive caller offers this as a
+/// `RequiredInput` so the mapping can be supplied instead, e.g.
+/// `CASE WHEN col::text = 'Membership' THEN 'Member' ELSE col::text END::T`.
+///
+/// Note for the array form: `ALTER COLUMN … TYPE … USING` rejects a subquery
+/// outright ("cannot use subquery in transform expression"), so an override
+/// cannot `unnest`/`array_agg` its way across the elements. `array_replace`
+/// on the `text[]` is the subquery-free form, and nests for several values:
+/// `array_replace(col::text[], 'Membership', 'Member')::T[]`.
+fn enum_conversion_expr(col: &str, enum_ref: &str, is_array: bool) -> String {
+    if is_array {
+        format!("{}::text[]::{enum_ref}[]", qi(col))
+    } else {
+        format!("{}::text::{enum_ref}", qi(col))
+    }
+}
+
+/// Whether a declared function names `enum_ref` in its *signature* — a
+/// parameter or a scalar return.
+///
+/// Only the signature counts: that is all PostgreSQL records a dependency
+/// for, and such a function blocks `DROP TYPE` on the old enum, so it has to
+/// come down and be rebuilt. A body that merely mentions the type carries no
+/// catalog dependency and keeps working against the rebuilt one (verified:
+/// a `plpgsql` body casting to the type survives the rebuild untouched).
+fn function_signature_names_type(fd: &crate::schema::FunctionDescriptor, enum_ref: &str) -> bool {
+    let names = |t: &str| t.strip_suffix("[]").unwrap_or(t) == enum_ref;
+    fd.params.iter().any(|p| names(&p.pg_type)) || (!fd.return_is_object && names(&fd.return_pg_type))
+}
+
+/// Rebuild one enum whose members were removed or reordered, returning the
+/// statements, the conversion expressions the caller must resolve, and — when
+/// a composite holds the enum — the `DROP TYPE` that has to wait for Phase
+/// 3.6 to rebuild it.
+///
+/// PostgreSQL has no `ALTER TYPE … DROP VALUE`, and `ADD VALUE` only
+/// appends, so the type is built afresh and every column carrying it is
+/// converted across. The order below is not arbitrary; each step exists
+/// because the database refuses the next one without it:
+///
+/// 1. **Views come down first.** "cannot alter type of a column used by a
+///    view or rule" — an interface view selects the column straight out of
+///    the implementor's table. Phases 10/10.5 put them back.
+/// 2. **The old type is renamed away, and the new one takes the real name.**
+///    This is the pivot the whole sequence turns on: everything rebuilt
+///    after this point — the composites in Phase 3.6, the functions in
+///    Phases 3.5/11, the views in Phase 10, every column DDL in Phase 4/5 —
+///    spells this enum by its declared name, and so binds to the new type
+///    with no special casing anywhere. Building the replacement under a
+///    temporary name instead would bind all of them to the type about to be
+///    dropped.
+/// 3. **Functions depending on the renamed type are dropped**, by catalog
+///    lookup rather than by reconstructing signatures: a Pylon function's
+///    parameter list depends on whether its body reads a session global
+///    (see `ir::GLOBALS_ARG`), so the name alone does not give the
+///    signature `DROP FUNCTION` needs, and overloads would each need their
+///    own. `pg_depend` already knows exactly which ones there are.
+/// 4. **Each column drops its DEFAULT, converts, then takes the new
+///    DEFAULT.** The drop is not optional: "default for column s cannot be
+///    cast automatically to type …" fires before any view error, because
+///    the old default is an expression of the old type.
+/// 5. **The old type is dropped** once nothing points at it — immediately,
+///    or after Phase 3.6 when a composite holds it.
+///
+/// Indexes, CHECK constraints and primary keys need no handling: `ALTER
+/// COLUMN … TYPE` rebuilds and revalidates them itself (verified).
+#[allow(clippy::too_many_arguments)]
+fn emit_enum_rebuild(
+    e: &crate::schema::EnumDescriptor,
+    enum_ref: &str,
+    columns: &[(String, String, String, bool)],
+    target: &SchemaDescriptor,
+    target_views: &[crate::export::GeneratedView],
+    existing_views: &HashMap<(&str, &str), &str>,
+    defer_drop: bool,
+    torn_down_views: &mut HashSet<(String, String)>,
+    torn_down_functions: &mut HashSet<(String, String)>,
+) -> (Vec<DiffOp>, Vec<RequiredInput>, Option<String>) {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut inputs: Vec<RequiredInput> = Vec::new();
+    let old_ref = qn(&e.module, &format!("{}{}", e.name, OLD_ENUM_SUFFIX));
+
+    // 1. views over every table holding one of these columns
+    let mut seen_tables: HashSet<(&str, &str)> = HashSet::new();
+    for (module, table, _, _) in columns {
+        if !seen_tables.insert((module.as_str(), table.as_str())) {
+            continue;
+        }
+        ops.extend(view_teardown(
+            target_views,
+            existing_views,
+            module,
+            table,
+            torn_down_views,
+        ));
+    }
+
+    // 2. the rename, then the replacement under the declared name
+    push_tx(
+        &mut ops,
+        format!(
+            "ALTER TYPE {enum_ref} RENAME TO {};",
+            qi(&format!("{}{}", e.name, OLD_ENUM_SUFFIX))
+        ),
+    );
+    let members: Vec<String> = e
+        .members
+        .iter()
+        .map(|m| format!("'{}'", m.replace('\'', "''")))
+        .collect();
+    push_tx(
+        &mut ops,
+        format!("CREATE TYPE {enum_ref} AS ENUM ({});", members.join(", ")),
+    );
+
+    // 3. functions whose signature carried the type
+    for fd in &target.functions {
+        if function_signature_names_type(fd, enum_ref) {
+            torn_down_functions.insert((fd.module.clone(), fd.name.clone()));
+        }
+    }
+    push_tx(
+        &mut ops,
+        format!(
+            "DO $$ DECLARE r record; BEGIN \
+             FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_depend d \
+             JOIN pg_proc p ON p.oid = d.objid \
+             WHERE d.refobjid = '{old_ref}'::regtype AND d.classid = 'pg_proc'::regclass \
+             LOOP EXECUTE 'DROP FUNCTION ' || r.sig || ' CASCADE'; END LOOP; END $$;"
+        ),
+    );
+
+    // 4. the columns
+    for (module, table, column, is_array) in columns {
+        let table_ref = qn(module, table);
+        push_tx(
+            &mut ops,
+            format!("ALTER TABLE {table_ref} ALTER COLUMN {} DROP DEFAULT;", qi(column)),
+        );
+        let placeholder = format!("enum_cast__{module}__{table}__{column}");
+        let col_type = if *is_array {
+            format!("{enum_ref}[]")
+        } else {
+            enum_ref.to_string()
+        };
+        push_tx(
+            &mut ops,
+            format!(
+                "ALTER TABLE {table_ref} ALTER COLUMN {} TYPE {col_type} USING \\({placeholder});",
+                qi(column)
+            ),
+        );
+        let owner = target
+            .types
+            .iter()
+            .find(|td| td.module == *module && td.table == *table);
+        inputs.push(RequiredInput {
+            placeholder: placeholder.clone(),
+            prompt: format!(
+                "Please specify how property '{column}' converts to the rebuilt scalar type '{}::{}'",
+                e.module, e.name
+            ),
+            default_expr: enum_conversion_expr(column, enum_ref, *is_array),
+            type_name: match owner {
+                Some(td) => format!("{}::{}", td.module, td.name),
+                None => format!("{module}::{table}"),
+            },
+        });
+        // The new DEFAULT, from the declaration rather than from what the
+        // column had: a rebuild is also the moment a default naming a dropped
+        // member would have to change.
+        if let Some(prop) = owner.and_then(|td| td.properties.iter().find(|p| p.name == *column))
+            && let Some(default) = resolve_default(prop, target)
+        {
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER TABLE {table_ref} ALTER COLUMN {} SET DEFAULT {default};",
+                    qi(column)
+                ),
+            );
+        }
+    }
+
+    // 5. the old type
+    let drop_sql = format!("DROP TYPE {old_ref};");
+    if defer_drop {
+        (ops, inputs, Some(drop_sql))
+    } else {
+        push_tx(&mut ops, drop_sql);
+        (ops, inputs, None)
+    }
+}
+
 fn qn(schema: &str, name: &str) -> String {
     format!("{}.{}", pg_schema(schema), qi(name))
 }
@@ -2195,8 +2438,35 @@ fn diff_inner(
         }
     }
 
+    // Composite types this schema wants. Needed as early as Phase 2.2, which
+    // has to know whether a composite holds an enum it is about to rebuild;
+    // Phase 3.6 does the rebuilding and reuses both of these as-is.
+    let target_tuples = target_tuple_types(target);
+    let target_tuple_refs: Vec<(String, &crate::schema::tuple_type::TupleType)> = target_tuples
+        .iter()
+        .map(|t| (crate::schema::tuple_type::type_ref(&t.module, &t.name), t))
+        .collect();
+
+    // Interface views taken down to get at a column underneath them — by a
+    // table phase that drops or retypes one, or by an enum rebuild that
+    // retypes one. Phases 10/10.5 have to rebuild every one of these even
+    // when its own definition is unchanged — otherwise the migration leaves
+    // the interface without a relation at all.
+    let mut torn_down_views: HashSet<(String, String)> = HashSet::new();
+    // The same problem one object over: a function with a rebuilt enum in
+    // its signature has to be dropped before the old type can go, and
+    // Phases 3.5/11 only re-emit a function whose DDL hash changed — which a
+    // rebuild does not change. Without this the migration would drop a
+    // function and never put it back.
+    let mut torn_down_functions: HashSet<(String, String)> = HashSet::new();
+    // Composites Phase 3.6 must rebuild even though their own declaration is
+    // unchanged, and the `DROP TYPE`s that have to wait until it has.
+    let mut forced_composite_rebuilds: HashSet<String> = HashSet::new();
+    let mut deferred_enum_drops: Vec<String> = Vec::new();
+
     // ── Phase 2: enums (described as "scalar type", matching how a custom
     // scalar domain is described — see `verbosename_scalar`) ─────────────────
+    let mut enum_rebuilds: Vec<&crate::schema::EnumDescriptor> = Vec::new();
     for e in &target.enums {
         match cur_enums.get(&(e.module.as_str(), e.name.as_str())) {
             None => {
@@ -2221,28 +2491,76 @@ fn diff_inner(
                     },
                 );
             }
-            Some(existing) => {
-                let existing_set: HashSet<&str> = existing.members.iter().map(|m| m.as_str()).collect();
-                for member in &e.members {
-                    if !existing_set.contains(member.as_str()) {
-                        steps.push(
-                            OpKey::Scalar(e.module.clone(), e.name.clone()),
-                            Verb::Alter,
-                            verbosename_scalar(&e.module, &e.name),
-                            DiffOp {
-                                sql: format!(
-                                    "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
-                                    pg_schema(&e.module),
-                                    qi(&e.name),
-                                    member.replace('\'', "''")
-                                ),
-                                non_transactional: false,
-                            },
-                        );
-                    }
+            // Appending is the one change PostgreSQL makes in place.
+            Some(existing) if enum_members_appended(&existing.members, &e.members) => {
+                for member in &e.members[existing.members.len()..] {
+                    steps.push(
+                        OpKey::Scalar(e.module.clone(), e.name.clone()),
+                        Verb::Alter,
+                        verbosename_scalar(&e.module, &e.name),
+                        DiffOp {
+                            sql: format!(
+                                "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}';",
+                                pg_schema(&e.module),
+                                qi(&e.name),
+                                member.replace('\'', "''")
+                            ),
+                            non_transactional: false,
+                        },
+                    );
                 }
             }
+            // A member removed, or the members reordered: the type has to be
+            // rebuilt. See `emit_enum_rebuild`.
+            Some(_) => enum_rebuilds.push(e),
         }
+    }
+
+    // ── Phase 2.2: rebuild enums that lost a member or changed order ─────────
+    for e in enum_rebuilds {
+        let enum_ref = qn(&e.module, &e.name);
+        let columns = enum_columns(target, &enum_ref);
+
+        // A composite holding this enum spells the attribute with the enum's
+        // own name, which does not change across a rebuild — so
+        // `composite_changed` sees nothing and Phase 3.6 would leave the
+        // attribute pointing at the type about to be dropped. Force those
+        // rebuilds, and hold this enum's `DROP TYPE` back until after them.
+        //
+        // Only composites the database actually has: one this diff is about to
+        // create cannot be holding the old type, and forcing it would have
+        // Phase 3.6 build it under a replacement name that nothing renames.
+        let held_by: Vec<String> = target_tuple_refs
+            .iter()
+            .filter(|(_, t)| {
+                cur_composites.contains_key(&(t.module.as_str(), t.name.as_str()))
+                    && t.attributes.iter().any(|a| attribute_base_type(a) == enum_ref)
+            })
+            .map(|(tref, _)| tref.clone())
+            .collect();
+
+        let (ops, inputs, deferred_drop) = emit_enum_rebuild(
+            e,
+            &enum_ref,
+            &columns,
+            target,
+            &target_generated_views,
+            &cur_views,
+            !held_by.is_empty(),
+            &mut torn_down_views,
+            &mut torn_down_functions,
+        );
+        forced_composite_rebuilds.extend(held_by);
+        if let Some(sql) = deferred_drop {
+            deferred_enum_drops.push(sql);
+        }
+        steps.extend_with_input(
+            OpKey::Scalar(e.module.clone(), e.name.clone()),
+            Verb::Alter,
+            verbosename_scalar(&e.module, &e.name),
+            ops,
+            inputs,
+        );
     }
 
     // ── Phase 2.5: sequences (for sequence scalars — folded into the same
@@ -2351,25 +2669,21 @@ fn diff_inner(
 
     // ── Phase 3.6: composite types for tuples (before tables, which declare
     // columns of them) ───────────────────────────────────────────────────────
-    let target_tuples = target_tuple_types(target);
-    let tuple_refs: Vec<(String, &crate::schema::tuple_type::TupleType)> = target_tuples
-        .iter()
-        .map(|t| (crate::schema::tuple_type::type_ref(&t.module, &t.name), t))
-        .collect();
+    let tuple_refs: &[(String, &crate::schema::tuple_type::TupleType)] = &target_tuple_refs;
 
     // A type the database doesn't have yet is simply created. One it has with
     // different attributes has to be *rebuilt*: PostgreSQL can append and
     // drop attributes but cannot insert one in the middle, and a tuple's
     // members are read by position, so attribute order is part of the type.
     let mut rebuild: HashSet<String> = HashSet::new();
-    for (tref, t) in &tuple_refs {
+    for (tref, t) in tuple_refs {
         match cur_composites.get(&(t.module.as_str(), t.name.as_str())) {
             None => steps.push(
                 OpKey::TupleType(t.module.clone(), t.name.clone()),
                 Verb::Create,
                 verbosename_tuple_type(t),
                 DiffOp {
-                    sql: create_composite_sql(t, tref, &rebuild, &tuple_refs),
+                    sql: create_composite_sql(t, tref, &rebuild, tuple_refs),
                     non_transactional: false,
                 },
             ),
@@ -2379,6 +2693,13 @@ fn diff_inner(
             Some(_) => {}
         }
     }
+    // The ones Phase 2.2 forced. A composite whose attribute is an enum being
+    // rebuilt reads as unchanged above — the attribute names the enum, and
+    // that name is the same on both sides of a rebuild — but still points at
+    // the type the rebuild is about to drop. Added after the loop, not as its
+    // seed, so that a composite being *created* here is unaffected: it does
+    // not exist yet, so it cannot be holding the old enum.
+    rebuild.extend(forced_composite_rebuilds);
     // A type holding a rebuilt one is rebuilt too: its attribute points at
     // the type that is about to be dropped, so it cannot outlive it.
     loop {
@@ -2414,7 +2735,7 @@ fn diff_inner(
         for (_, t) in &rebuilt {
             push_tx(
                 &mut ops,
-                create_composite_sql(t, &new_type_ref(t), &rebuild, &tuple_refs),
+                create_composite_sql(t, &new_type_ref(t), &rebuild, tuple_refs),
             );
         }
         // 2. every column that holds one of them.
@@ -2456,8 +2777,25 @@ fn diff_inner(
                 format!("ALTER TYPE {} RENAME TO {};", new_type_ref(t), qi(&t.name)),
             );
         }
+        // 5. an enum rebuild that was waiting on this: its old type could not
+        //    be dropped while a composite attribute still pointed at it.
+        for sql in deferred_enum_drops.drain(..) {
+            push_tx(&mut ops, sql);
+        }
         let described: Vec<String> = rebuilt.iter().map(|(_, t)| verbosename_tuple_type(t)).collect();
         steps.extend(OpKey::TupleTypeRebuild, Verb::Alter, described.join(", "), ops);
+    }
+    // A deferred drop with no composite rebuild to attach to would leave the
+    // renamed-away type behind, which the next diff would then try to drop as
+    // a stray. Phase 2.2 only defers when it has forced a rebuild, so this is
+    // unreachable — but silently leaking the type would be the worst way to
+    // find out otherwise.
+    if !deferred_enum_drops.is_empty() {
+        return Err(format!(
+            "internal error: {} enum type drop(s) were deferred to the composite-type \
+             rebuild, which did not run",
+            deferred_enum_drops.len()
+        ));
     }
 
     // ── Phase 3.5: scalar functions (before tables — table DEFAULTs may call them) ──
@@ -2465,10 +2803,11 @@ fn diff_inner(
     for (module, name, ddl) in scalar_fn_ddls {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
-            cur_functions
-                .get(&(module.as_str(), name.as_str()))
-                .map(|&h| h != hash)
-                .unwrap_or(true)
+            torn_down_functions.contains(&(module.clone(), name.clone()))
+                || cur_functions
+                    .get(&(module.as_str(), name.as_str()))
+                    .map(|&h| h != hash)
+                    .unwrap_or(true)
         } else {
             true
         };
@@ -2520,12 +2859,6 @@ fn diff_inner(
 
     // ── Phase 4 & 5: tables (create new or alter existing) ───────────────────
     let sort_order = topo_sort_types(&target.types, &polymorphic);
-
-    // Interface views taken down by a table phase because they select a
-    // column it drops or retypes. Phases 10/10.5 have to rebuild every one
-    // of these even when its own definition is unchanged — otherwise the
-    // migration leaves the interface without a relation at all.
-    let mut torn_down_views: HashSet<(String, String)> = HashSet::new();
 
     // Track which tables are created in this diff (needed for CONCURRENTLY decision).
     let mut new_tables: HashSet<(String, String)> = HashSet::new();
@@ -2944,10 +3277,11 @@ fn diff_inner(
     for (module, name, ddl) in obj_fn_ddls {
         let emit = if for_migration {
             let hash = ddl_hash(&ddl);
-            cur_functions
-                .get(&(module.as_str(), name.as_str()))
-                .map(|&h| h != hash)
-                .unwrap_or(true)
+            torn_down_functions.contains(&(module.clone(), name.clone()))
+                || cur_functions
+                    .get(&(module.as_str(), name.as_str()))
+                    .map(|&h| h != hash)
+                    .unwrap_or(true)
         } else {
             true
         };
@@ -6434,6 +6768,364 @@ mod tests {
             "a banned rename candidate must not be re-proposed"
         );
     }
+
+    // ── Enum rebuilds ───────────────────────────────────────────────────────
+
+    /// A schema with one enum and one type holding it, as `prop_type` (so a
+    /// caller can ask for the array form).
+    fn enum_schema(members: &[&str], prop_type: &str) -> SchemaDescriptor {
+        let mut holder = simple_type("default", "Entry", "Entry");
+        holder.properties = vec![prop("id", "uuid", false), prop("status", prop_type, true)];
+        SchemaDescriptor {
+            types: vec![holder],
+            enums: vec![EnumDescriptor {
+                name: "Status".into(),
+                module: "default".into(),
+                members: members.iter().map(|m| m.to_string()).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn sql_of(ops: &[DiffOp]) -> String {
+        ops.iter().map(|op| op.sql.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Byte offset of `needle`, or a panic naming the SQL that was produced.
+    fn at(joined: &str, needle: &str) -> usize {
+        joined
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}; got:\n{joined}"))
+    }
+
+    #[test]
+    fn test_enum_gaining_members_still_alters_in_place() {
+        let before = enum_schema(&["Active", "Inactive"], "\"public\".\"Status\"");
+        let after = enum_schema(&["Active", "Inactive", "Pending", "Closed"], "\"public\".\"Status\"");
+
+        let joined = sql_of(&diff_schema_ops(&after, &schema_to_db_state(&before)).unwrap());
+        assert!(
+            joined.contains("ALTER TYPE \"public\".\"Status\" ADD VALUE IF NOT EXISTS 'Pending';"),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("ALTER TYPE \"public\".\"Status\" ADD VALUE IF NOT EXISTS 'Closed';"),
+            "got:\n{joined}"
+        );
+        // Appending is the case PostgreSQL does in place — nothing is rebuilt.
+        assert!(!joined.contains("RENAME TO \"Status__pylon_old\""), "got:\n{joined}");
+        assert!(!joined.contains("DROP TYPE"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_enum_losing_a_member_rebuilds_the_type_in_order() {
+        // The jaldis case: six values added and three dropped in one edit.
+        // Before this, the diff emitted only the ADD VALUEs and left the
+        // database holding members the schema no longer declared.
+        let before = enum_schema(
+            &["Collaboration", "Communication", "Membership"],
+            "\"public\".\"Status\"",
+        );
+        let after = enum_schema(&["Member", "Partner", "Supplier"], "\"public\".\"Status\"");
+
+        let joined = sql_of(&diff_schema_ops(&after, &schema_to_db_state(&before)).unwrap());
+
+        let rename = at(
+            &joined,
+            "ALTER TYPE \"public\".\"Status\" RENAME TO \"Status__pylon_old\";",
+        );
+        let create = at(
+            &joined,
+            "CREATE TYPE \"public\".\"Status\" AS ENUM ('Member', 'Partner', 'Supplier');",
+        );
+        let drop_default = at(
+            &joined,
+            "ALTER TABLE \"public\".\"Entry\" ALTER COLUMN \"status\" DROP DEFAULT;",
+        );
+        let convert = at(
+            &joined,
+            "ALTER TABLE \"public\".\"Entry\" ALTER COLUMN \"status\" TYPE \"public\".\"Status\" USING",
+        );
+        let drop_old = at(&joined, "DROP TYPE \"public\".\"Status__pylon_old\";");
+
+        assert!(
+            rename < create && create < drop_default && drop_default < convert && convert < drop_old,
+            "statements out of order; got:\n{joined}"
+        );
+        // ADD VALUE cannot express this, so it must not appear at all.
+        assert!(!joined.contains("ADD VALUE"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn test_enum_reordering_members_rebuilds_the_type() {
+        // Order is part of the type's meaning: `ORDER BY` on an enum column
+        // sorts by `pg_enum.enumsortorder`, and ADD VALUE only appends — so a
+        // reorder is only reachable by building the type afresh.
+        let before = enum_schema(&["Active", "Inactive"], "\"public\".\"Status\"");
+        let after = enum_schema(&["Inactive", "Active"], "\"public\".\"Status\"");
+
+        let joined = sql_of(&diff_schema_ops(&after, &schema_to_db_state(&before)).unwrap());
+        assert!(
+            joined.contains("CREATE TYPE \"public\".\"Status\" AS ENUM ('Inactive', 'Active');"),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("DROP TYPE \"public\".\"Status__pylon_old\";"),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_enum_rebuild_converts_an_array_column_through_a_text_array() {
+        let before = enum_schema(&["Active", "Inactive", "Gone"], "\"public\".\"Status\"[]");
+        let after = enum_schema(&["Active", "Inactive"], "\"public\".\"Status\"[]");
+
+        let joined = sql_of(&diff_schema_ops(&after, &schema_to_db_state(&before)).unwrap());
+        assert!(
+            joined.contains(
+                "ALTER COLUMN \"status\" TYPE \"public\".\"Status\"[] \
+                 USING \"status\"::text[]::\"public\".\"Status\"[];"
+            ),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_enum_rebuild_offers_the_conversion_as_a_required_input() {
+        // The one thing a schema cannot state is what a dropped member's rows
+        // should become, so the diff asks instead of guessing — the same
+        // mechanism a property's type change already uses.
+        let before = enum_schema(&["Active", "Inactive", "Membership"], "\"public\".\"Status\"");
+        let after = enum_schema(&["Active", "Inactive"], "\"public\".\"Status\"");
+
+        let steps = diff_schema_steps(&after, &schema_to_db_state(&before), &HashMap::new()).unwrap();
+        let step = steps
+            .iter()
+            .find(|s| s.object_desc == "scalar type 'default::Status'")
+            .unwrap_or_else(|| panic!("no step for the enum; got: {:?}", steps));
+
+        assert_eq!(step.required_input.len(), 1, "got: {:?}", step.required_input);
+        let input = &step.required_input[0];
+        assert_eq!(input.default_expr, "\"status\"::text::\"public\".\"Status\"");
+        assert_eq!(input.type_name, "default::Entry");
+        assert!(input.prompt.contains("'status'"), "got: {}", input.prompt);
+
+        // Unresolved, the step still carries the placeholder; resolved with no
+        // override, it falls back to the cast through text.
+        assert!(
+            step.ddl
+                .iter()
+                .any(|op| op.sql.contains(&format!("\\({})", input.placeholder))),
+            "got: {:?}",
+            step.ddl
+        );
+        let resolved = sql_of(&step.resolved_ddl(&HashMap::new()));
+        assert!(
+            resolved.contains("USING \"status\"::text::\"public\".\"Status\";"),
+            "got:\n{resolved}"
+        );
+
+        // And an override is what carries a real mapping for the dropped
+        // member, which is the whole point of asking.
+        let mapped = step.resolved_ddl(&HashMap::from([(
+            input.placeholder.clone(),
+            "(CASE WHEN \"status\"::text = 'Membership' THEN 'Active' ELSE \"status\"::text END)::\"public\".\"Status\""
+                .to_string(),
+        )]));
+        assert!(
+            sql_of(&mapped).contains("THEN 'Active' ELSE \"status\"::text END)"),
+            "got:\n{}",
+            sql_of(&mapped)
+        );
+    }
+
+    #[test]
+    fn test_enum_rebuild_restores_the_column_default() {
+        // The DROP DEFAULT is forced ("default for column … cannot be cast
+        // automatically"), so the rebuild owes the column its default back —
+        // taken from the declaration, since a default naming a dropped member
+        // is exactly what a rebuild has to change.
+        let before = enum_schema(&["Active", "Inactive", "Gone"], "\"public\".\"Status\"");
+        let mut after = enum_schema(&["Active", "Inactive"], "\"public\".\"Status\"");
+        after.types[0].properties[1].default_sql = Some("'Active'::\"public\".\"Status\"".into());
+
+        let joined = sql_of(&diff_schema_ops(&after, &schema_to_db_state(&before)).unwrap());
+        let drop_default = at(
+            &joined,
+            "ALTER TABLE \"public\".\"Entry\" ALTER COLUMN \"status\" DROP DEFAULT;",
+        );
+        let set_default = at(
+            &joined,
+            "ALTER TABLE \"public\".\"Entry\" ALTER COLUMN \"status\" \
+             SET DEFAULT 'Active'::\"public\".\"Status\";",
+        );
+        let convert = at(&joined, "ALTER COLUMN \"status\" TYPE \"public\".\"Status\" USING");
+        assert!(
+            drop_default < convert && convert < set_default,
+            "the default has to come back after the conversion; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_enum_rebuild_takes_down_and_recreates_a_dependent_interface_view() {
+        // "cannot alter type of a column used by a view or rule" — an
+        // interface view selects the column straight out of the implementor's
+        // table, so the rebuild cannot start until the view is gone, and must
+        // not leave the interface without a relation afterward.
+        let build = |members: &[&str]| {
+            let mut account = simple_type("default", "Account", "Account");
+            account.abstract_ = true;
+            account.materialized = true;
+            account.properties = vec![prop("id", "uuid", false), prop("status", "\"public\".\"Status\"", true)];
+
+            let mut individual = simple_type("default", "Individual", "Individual");
+            individual.interfaces = vec!["default::Account".into()];
+            individual.properties = vec![prop("id", "uuid", false), prop("status", "\"public\".\"Status\"", true)];
+
+            SchemaDescriptor {
+                types: vec![account, individual],
+                enums: vec![EnumDescriptor {
+                    name: "Status".into(),
+                    module: "default".into(),
+                    members: members.iter().map(|m| m.to_string()).collect(),
+                }],
+                ..Default::default()
+            }
+        };
+        let before = build(&["Active", "Inactive", "Gone"]);
+        let after = build(&["Active", "Inactive"]);
+
+        // The view's SELECT text never mentions column types, so its hash is
+        // unchanged by this migration — the case Phase 10 would otherwise skip.
+        let state = schema_to_db_state(&before);
+        assert!(
+            state.views.iter().any(|v| v.name == "Account"),
+            "fixture should have produced the interface view"
+        );
+
+        let joined = sql_of(&diff_schema_ops(&after, &state).unwrap());
+        let drop_view = at(&joined, "DROP VIEW IF EXISTS \"public\".\"Account\";");
+        let convert = at(&joined, "ALTER COLUMN \"status\" TYPE \"public\".\"Status\" USING");
+        let recreate = at(&joined, "CREATE VIEW \"public\".\"Account\"");
+        assert!(
+            drop_view < convert && convert < recreate,
+            "the view must come down before the conversion and go back after; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_enum_rebuild_drops_and_recreates_a_function_taking_the_enum() {
+        // A function with the enum in its signature carries a catalog
+        // dependency and blocks DROP TYPE. Phases 3.5/11 only re-emit a
+        // function whose DDL hash changed — which a rebuild does not change —
+        // so without `torn_down_functions` this dropped it for good.
+        use crate::schema::{FunctionDescriptor, FunctionParamDescriptor};
+
+        let build = |members: &[&str]| {
+            let mut s = enum_schema(members, "\"public\".\"Status\"");
+            s.functions = vec![FunctionDescriptor {
+                name: "label".into(),
+                module: "default".into(),
+                params: vec![FunctionParamDescriptor {
+                    name: "s".into(),
+                    pg_type: "\"public\".\"Status\"".into(),
+                }],
+                return_pg_type: "text".into(),
+                return_is_object: false,
+                return_is_set: false,
+                return_is_polymorphic: false,
+                volatility: "immutable".into(),
+                body: "<str>s".into(),
+            }];
+            s
+        };
+        let before = build(&["Active", "Inactive", "Gone"]);
+        let after = build(&["Active", "Inactive"]);
+
+        let state = schema_to_db_state(&before);
+        assert!(
+            state.functions.iter().any(|f| f.name == "label"),
+            "fixture should have produced the function"
+        );
+
+        let joined = sql_of(&diff_schema_ops(&after, &state).unwrap());
+        // Dropped by catalog lookup, not by a reconstructed signature: a
+        // body reading a session global changes the parameter list, and
+        // overloads would each need their own statement.
+        let drop_fns = at(
+            &joined,
+            "WHERE d.refobjid = '\"public\".\"Status__pylon_old\"'::regtype",
+        );
+        let drop_old = at(&joined, "DROP TYPE \"public\".\"Status__pylon_old\";");
+        let recreate = at(&joined, "FUNCTION \"public\".\"label\"");
+        assert!(
+            drop_fns < drop_old && drop_old < recreate,
+            "the function must go before the type and come back after; got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_enum_rebuild_forces_a_composite_rebuild_and_defers_the_old_type_drop() {
+        // A composite holding the enum spells the attribute with the enum's
+        // own name, which is identical on both sides of a rebuild — so
+        // `composite_changed` sees nothing, yet the attribute still points at
+        // the type about to be dropped ("column a of composite type … depends
+        // on type …"). The drop has to wait for Phase 3.6.
+        use crate::schema::{NamedTupleDescriptor, TupleMemberDescriptor, TupleMemberKind};
+
+        let build = |members: &[&str]| {
+            let mut holder = simple_type("default", "Entry", "Entry");
+            holder.properties = vec![prop("id", "uuid", false), prop("pair", "__nt__:default::Pair", true)];
+            holder.properties[1].tuple_members = Some(vec![TupleMemberDescriptor {
+                name: Some("status".into()),
+                kind: TupleMemberKind::Enum {
+                    module: "default".into(),
+                    name: "Status".into(),
+                },
+            }]);
+            SchemaDescriptor {
+                types: vec![holder],
+                enums: vec![EnumDescriptor {
+                    name: "Status".into(),
+                    module: "default".into(),
+                    members: members.iter().map(|m| m.to_string()).collect(),
+                }],
+                named_tuples: vec![NamedTupleDescriptor {
+                    name: "Pair".into(),
+                    module: "default".into(),
+                    members: vec![TupleMemberDescriptor {
+                        name: Some("status".into()),
+                        kind: TupleMemberKind::Enum {
+                            module: "default".into(),
+                            name: "Status".into(),
+                        },
+                    }],
+                }],
+                ..Default::default()
+            }
+        };
+        let before = build(&["Active", "Inactive", "Gone"]);
+        let after = build(&["Active", "Inactive"]);
+
+        let state = schema_to_db_state(&before);
+        assert!(
+            state.composites.iter().any(|c| c.name.starts_with("Pair")),
+            "fixture should have produced the composite; got: {:?}",
+            state.composites
+        );
+
+        let joined = sql_of(&diff_schema_ops(&after, &state).unwrap());
+        let create_new = at(
+            &joined,
+            "CREATE TYPE \"public\".\"Status\" AS ENUM ('Active', 'Inactive');",
+        );
+        let composite_rebuild = at(&joined, "__new\" AS (");
+        let drop_old = at(&joined, "DROP TYPE \"public\".\"Status__pylon_old\";");
+        assert!(
+            create_new < composite_rebuild && composite_rebuild < drop_old,
+            "the composite must be rebuilt before the old enum is dropped; got:\n{joined}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6924,5 +7616,359 @@ mod tuple_type_live_tests {
         );
 
         pool.batch_execute(&format!("DROP TYPE \"{tuple}_t\";")).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod enum_rebuild_live_tests {
+    //! The enum rebuild, executed rather than asserted. PostgreSQL has no
+    //! `ALTER TYPE … DROP VALUE`, so this sequence is the only way to reach a
+    //! shrunk or reordered enum — and every statement in it exists because
+    //! the database refuses the next one without it. A string comparison
+    //! cannot tell whether that ordering is actually right.
+    use super::*;
+    use crate::schema::{EnumDescriptor, PropertyDescriptor};
+    use pylon_pgcon::PgPool;
+
+    fn test_dsn() -> String {
+        std::env::var("PYLON_PGCON_TEST_DSN").expect("PYLON_PGCON_TEST_DSN must be set to run live-Postgres tests")
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        format!("{prefix}_{nanos}")
+    }
+
+    fn prop(name: &str, pg_type: &str) -> PropertyDescriptor {
+        PropertyDescriptor {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: true,
+            default_sql: None,
+            default_pyql: None,
+            description: None,
+            check_constraints: vec![],
+            is_exclusive: false,
+            is_pk: false,
+            is_readonly: false,
+            rewrites: vec![],
+            tuple_members: None,
+            column_type: None,
+        }
+    }
+
+    /// A schema with one enum and one table holding it twice — once plainly,
+    /// once as an array, since the two convert through different expressions.
+    fn schema_with(table: &str, enum_name: &str, members: &[&str]) -> SchemaDescriptor {
+        let enum_ref = format!("\"public\".\"{enum_name}\"");
+        SchemaDescriptor {
+            types: vec![TypeDescriptor {
+                name: table.into(),
+                module: "default".into(),
+                table: table.into(),
+                abstract_: false,
+                materialized: false,
+                description: None,
+                parents: vec![],
+                interfaces: vec![],
+                bases: vec![],
+                properties: vec![
+                    prop("n", "int8"),
+                    prop("one", &enum_ref),
+                    prop("many", &format!("{enum_ref}[]")),
+                ],
+                links: vec![],
+                multilinks: vec![],
+                computed: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                partition: None,
+                vector_indexes: vec![],
+                search_indexes: vec![],
+                triggers: vec![],
+                junction: false,
+                signals: vec![],
+            }],
+            enums: vec![EnumDescriptor {
+                name: enum_name.into(),
+                module: "default".into(),
+                members: members.iter().map(|m| m.to_string()).collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Create the "before" database by hand: the enum as it was, a table
+    /// holding it, an index and a CHECK over the column, and a default.
+    async fn setup(pool: &PgPool, table: &str, enum_name: &str, members: &[&str]) {
+        let values = members.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", ");
+        pool.batch_execute(&format!(
+            "CREATE TYPE \"{enum_name}\" AS ENUM ({values});
+             CREATE TABLE \"{table}\" (
+                 \"n\" int8,
+                 \"one\" \"{enum_name}\" DEFAULT '{}',
+                 \"many\" \"{enum_name}\"[]
+             );
+             CREATE INDEX \"{table}_one_idx\" ON \"{table}\" (\"one\");
+             ALTER TABLE \"{table}\" ADD CONSTRAINT \"{table}_chk\" CHECK (\"n\" > 0);",
+            members[0]
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn teardown(pool: &PgPool, table: &str, enum_name: &str) {
+        let _ = pool
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS \"{table}\" CASCADE;
+                 DROP TYPE IF EXISTS \"{enum_name}\" CASCADE;
+                 DROP TYPE IF EXISTS \"{enum_name}__pylon_old\" CASCADE;"
+            ))
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn the_generated_rebuild_runs_and_preserves_every_row() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let table = unique_name("enum_holder");
+        let enum_name = unique_name("Status");
+        teardown(&pool, &table, &enum_name).await;
+        setup(&pool, &table, &enum_name, &["Active", "Inactive", "Gone"]).await;
+
+        pool.batch_execute(&format!(
+            "INSERT INTO \"{table}\" VALUES
+                 (1, 'Active', ARRAY['Active','Inactive']::\"{enum_name}\"[]),
+                 (2, 'Inactive', NULL),
+                 (3, NULL, NULL);"
+        ))
+        .await
+        .unwrap();
+
+        // Drop 'Gone' (no row holds it) *and* reverse the surviving two, so
+        // this covers both halves of what ADD VALUE cannot express.
+        let before = schema_with(&table, &enum_name, &["Active", "Inactive", "Gone"]);
+        let after = schema_with(&table, &enum_name, &["Inactive", "Active"]);
+        let ops = diff_schema(&after, &schema_to_db_state(&before)).unwrap();
+        for sql in &ops {
+            pool.batch_execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("the diff emitted DDL that does not run: {e}\n{sql}"));
+        }
+
+        // Rows intact, including the array and the NULLs.
+        let rows = pool
+            .query_typed(
+                &format!(
+                    "SELECT (\"n\"::text, coalesce(\"one\"::text, '-'),
+                             coalesce(array_to_string(\"many\", ','), '-')) AS result
+                     FROM \"{table}\" ORDER BY \"n\""
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3, "rows were lost: {rows:?}");
+        let flat = format!("{rows:?}");
+        for expected in ["Active", "Inactive", "Active,Inactive"] {
+            assert!(flat.contains(expected), "expected {expected:?} in {flat}");
+        }
+
+        // Declared order is now the physical order — which is what `ORDER BY`
+        // on an enum column sorts by.
+        let order = pool
+            .query_typed(
+                &format!(
+                    "SELECT (string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)) AS result
+                     FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+                     WHERE t.typname = '{enum_name}'"
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            format!("{order:?}").contains("Inactive,Active"),
+            "declared order should be the physical order; got {order:?}"
+        );
+
+        // The index, the CHECK and the default all came through.
+        let survived = pool
+            .query_typed(
+                &format!(
+                    "SELECT (
+                         (SELECT count(*)::text FROM pg_indexes
+                          WHERE tablename = '{table}' AND indexname = '{table}_one_idx'),
+                         (SELECT count(*)::text FROM pg_constraint
+                          WHERE conrelid = '\"{table}\"'::regclass AND conname = '{table}_chk'),
+                         (SELECT count(*)::text FROM pg_attrdef
+                          WHERE adrelid = '\"{table}\"'::regclass)
+                     ) AS result"
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        let survived = format!("{survived:?}");
+        assert!(
+            survived.matches('1').count() >= 2,
+            "the index and CHECK should survive the rebuild; got {survived}"
+        );
+
+        teardown(&pool, &table, &enum_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn the_rebuild_also_applies_inside_one_transaction() {
+        // `watch` runs the whole diff in a single transaction, so the rebuild
+        // has to hold together there too. Not obvious: the neighbouring
+        // `ALTER TYPE … ADD VALUE` path spent years unable to use a value in
+        // the transaction that added it, and a type *created* in one has no
+        // such restriction — which is the difference this leans on.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let table = unique_name("enum_tx");
+        let enum_name = unique_name("Status");
+        teardown(&pool, &table, &enum_name).await;
+        setup(&pool, &table, &enum_name, &["Active", "Inactive", "Gone"]).await;
+        pool.batch_execute(&format!("INSERT INTO \"{table}\" VALUES (1, 'Active', NULL);"))
+            .await
+            .unwrap();
+
+        let before = schema_with(&table, &enum_name, &["Active", "Inactive", "Gone"]);
+        let after = schema_with(&table, &enum_name, &["Inactive", "Active"]);
+        let ops = diff_schema(&after, &schema_to_db_state(&before)).unwrap();
+
+        pool.batch_execute(&format!("BEGIN;\n{}\nCOMMIT;", ops.join("\n")))
+            .await
+            .unwrap_or_else(|e| panic!("the rebuild does not survive one transaction: {e}"));
+
+        // The row came across, and a fresh insert takes the rebuilt default.
+        pool.batch_execute(&format!("INSERT INTO \"{table}\" (\"n\") VALUES (2);"))
+            .await
+            .unwrap();
+        let rows = pool
+            .query_typed(
+                &format!("SELECT (\"n\"::text, \"one\"::text) AS result FROM \"{table}\" ORDER BY \"n\""),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "got {rows:?}");
+        assert!(format!("{rows:?}").contains("Active"), "got {rows:?}");
+
+        teardown(&pool, &table, &enum_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_row_holding_a_dropped_member_stops_the_migration() {
+        // The mapping for a dropped member's rows is the one thing a schema
+        // cannot state, so the default conversion must *fail* rather than
+        // invent one — naming the value, so the error says what to do.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let table = unique_name("enum_legacy");
+        let enum_name = unique_name("Status");
+        teardown(&pool, &table, &enum_name).await;
+        setup(&pool, &table, &enum_name, &["Active", "Membership"]).await;
+
+        pool.batch_execute(&format!("INSERT INTO \"{table}\" VALUES (1, 'Membership', NULL);"))
+            .await
+            .unwrap();
+
+        let before = schema_with(&table, &enum_name, &["Active", "Membership"]);
+        let after = schema_with(&table, &enum_name, &["Active", "Member"]);
+        let ops = diff_schema(&after, &schema_to_db_state(&before)).unwrap();
+
+        let mut failure = None;
+        for sql in &ops {
+            if let Err(e) = pool.batch_execute(sql).await {
+                failure = Some(e.to_string());
+                break;
+            }
+        }
+        let failure = failure.expect("the migration should have refused the legacy row");
+        assert!(
+            failure.contains("Membership"),
+            "the error must name the value that has nowhere to go; got: {failure}"
+        );
+
+        teardown(&pool, &table, &enum_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn an_override_maps_the_dropped_members_rows() {
+        // And with the mapping supplied — what `migration create` prompts for
+        // — the same rebuild carries the legacy rows across.
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        let table = unique_name("enum_mapped");
+        let enum_name = unique_name("Status");
+        teardown(&pool, &table, &enum_name).await;
+        setup(&pool, &table, &enum_name, &["Active", "Membership"]).await;
+
+        pool.batch_execute(&format!(
+            "INSERT INTO \"{table}\" VALUES
+                 (1, 'Membership', ARRAY['Membership','Active']::\"{enum_name}\"[]);"
+        ))
+        .await
+        .unwrap();
+
+        let before = schema_with(&table, &enum_name, &["Active", "Membership"]);
+        let after = schema_with(&table, &enum_name, &["Active", "Member"]);
+        let steps = diff_schema_steps(&after, &schema_to_db_state(&before), &HashMap::new()).unwrap();
+
+        // One override per column: the scalar takes a CASE, the array takes
+        // `array_replace` — a USING expression cannot contain a subquery, so
+        // unnest/array_agg is not available there.
+        let enum_ref = format!("\"public\".\"{enum_name}\"");
+        let mut overrides: HashMap<String, String> = HashMap::new();
+        for step in &steps {
+            for input in &step.required_input {
+                let expr = if input.placeholder.ends_with("many") {
+                    format!("array_replace(\"many\"::text[], 'Membership', 'Member')::{enum_ref}[]")
+                } else {
+                    format!(
+                        "(CASE WHEN \"one\"::text = 'Membership' THEN 'Member' \
+                         ELSE \"one\"::text END)::{enum_ref}"
+                    )
+                };
+                overrides.insert(input.placeholder.clone(), expr);
+            }
+        }
+        assert_eq!(overrides.len(), 2, "both columns should be offered: {overrides:?}");
+
+        for step in &steps {
+            for op in step.resolved_ddl(&overrides) {
+                pool.batch_execute(&op.sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("the resolved DDL does not run: {e}\n{}", op.sql));
+            }
+        }
+
+        let rows = pool
+            .query_typed(
+                &format!("SELECT (\"one\"::text, array_to_string(\"many\", ',')) AS result FROM \"{table}\""),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        let flat = format!("{rows:?}");
+        assert!(
+            flat.contains("Member"),
+            "the mapping should have been applied; got {flat}"
+        );
+        assert!(
+            !flat.contains("Membership"),
+            "no row should still read as the dropped member; got {flat}"
+        );
+
+        teardown(&pool, &table, &enum_name).await;
     }
 }

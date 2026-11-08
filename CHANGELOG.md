@@ -4,6 +4,55 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.10.0
+
+### Migrations
+
+* Removing a scalar type's enum members, or reordering them, now migrates.
+  Only appended members were ever emitted — as `ALTER TYPE … ADD VALUE` —
+  and members the declaration had *dropped* were never looked at: no DDL, no
+  warning, no error. An edit that added six members and removed three
+  produced a migration that added the six, and the database kept all three
+  of the old ones. Nothing reported the difference again, because the
+  declared schema recorded for the migration said the type had six members
+  while the type in the database had nine, and the next `migration create`
+  compared against the record. Rows holding a dropped member stayed
+  readable but unnameable: no PyQL expression could match one, since the
+  member no longer existed to write, and reading one back through the
+  Python client raised `ValueError` as a value that is no member of its
+  enum. Both halves of this are now migrated, by rebuilding the type —
+  PostgreSQL has no `ALTER TYPE … DROP VALUE`, and `ADD VALUE` only
+  appends, so a shrunk or reordered enum is only reachable by building it
+  afresh and carrying every column across. Each piece of the sequence is
+  there because the database refuses the next step without it: interface
+  views selecting an affected column come down first and are rebuilt after,
+  functions carrying the type in their signature are dropped and recreated,
+  each column surrenders its `DEFAULT` before converting and takes the
+  declared one after, and a composite type holding the enum is rebuilt
+  before the old type is dropped. Indexes, `CHECK` constraints and primary
+  keys need no handling — retyping a column rebuilds and revalidates them.
+* A scalar type's declared member order is now the order the database has.
+  `ADD VALUE` appends, so every member ever added landed at the end no
+  matter where the declaration put it, and `ORDER BY` on a property of that
+  type sorted by the order they happened to be added in. A reordered
+  declaration also used to emit nothing at all, being compared as a set.
+* `migration create` asks how a dropped member's rows should convert. The
+  mapping is the one thing a schema cannot state, so it is offered the way
+  a property's type change already is: with a default — the conversion
+  through `text` that every enum column needs anyway — and a prompt to
+  replace it, e.g. `(CASE WHEN .status = 'Membership' THEN 'Member' ELSE
+  .status END)`. Left at the default, the migration *stops* on the first
+  row holding a dropped member and names the value, rather than inventing a
+  mapping or discarding the row. For an array-typed property the override
+  has to be subquery-free — `ALTER COLUMN … TYPE … USING` rejects a
+  subquery outright, so `unnest`/`array_agg` is not available there and
+  `array_replace` over the `text[]` is the form that works, nesting for
+  several values.
+* `migration squash` still refuses a range in which a scalar type loses an
+  enum member, and its advice to keep those migrations unsquashed now holds:
+  the rebuild carries a conversion expression that only the person making
+  the change can supply, which no diff of two database states can recover.
+
 ## 0.9.1 — 2026-11-03
 
 ### Writing
