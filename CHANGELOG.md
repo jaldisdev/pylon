@@ -4,6 +4,36 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.11.0
+
+### Migrations
+
+* A property that carries a check constraint can now change type. The
+  generated migration put `ALTER COLUMN … TYPE` ahead of the `DROP
+  CONSTRAINT` that removes the old check, and PostgreSQL re-validates every
+  constraint on a column as part of changing its type — against the new
+  type. A `MaxLen(16)` on a `str` property compiles to `char_length(…) <=
+  16`, so turning that property into an enum produced a migration that
+  failed with "function char_length(…) does not exist" and could not be
+  applied at all: not to a populated table, not to an empty one. Since a
+  length limit is the ordinary way to declare a string property, every
+  text-to-enum change needed the statements reordered by hand and the
+  migration rehashed. Every check on the table now comes off before the
+  first type change and the ones the schema still declares go back on after
+  — all of them, not only the checks naming the column being retyped, since
+  a type-level `Expression` constraint can read any column and a
+  property-level one keeps the old column's name across a rename. The enum
+  rebuild path had the same flaw for a check written over the type being
+  rebuilt.
+* The migration engine now reads a database's table check constraints when
+  it compares against the database directly, which it never did. Against a
+  live database every declared check looked missing, so `pylon watch` tried
+  to add constraints the table already carried — an error — on any schema
+  declaring a `MaxLen`, `MinValue`, `Regexp`, `OneOf` or `Expression`
+  constraint, and a check the schema had stopped declaring could never be
+  dropped. `migration create` was unaffected: it compares against the
+  schema recorded with the previous migration, which did record them.
+
 ## 0.10.0 — 2026-11-09
 
 ### Migrations

@@ -278,6 +278,26 @@ const TRIGGERS_SQL: &str = r#"
     ORDER BY n.nspname, c.relname, t.tgname
 "#;
 
+// Table CHECK constraints, which went unrecorded entirely: `DbTable.checks`
+// was left empty, so against a live database Phase 6c saw every declared
+// check as missing and re-added it (`ADD CONSTRAINT` on a name already there
+// is an error, so `watch` failed outright on any schema using `MaxLen` and
+// friends), and Phase 11.9 could never drop a stale one.
+//
+// `contype = 'c'` only: PostgreSQL 17 began cataloguing `NOT NULL` as a
+// constraint of its own (`contype = 'n'`), and nullability is compared
+// through `DbColumn.nullable`.
+const CHECKS_SQL: &str = r#"
+    SELECT (con.conname, n.nspname, c.relname) AS result
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE con.contype = 'c'
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+    ORDER BY n.nspname, c.relname, con.conname
+"#;
+
 const EXTENSIONS_SQL: &str = r#"
     SELECT extname AS result
     FROM pg_extension
@@ -558,6 +578,19 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
             continue;
         };
         state.add_trigger(&pg_to_module(&pg_schema), &table_name, &tgname);
+    }
+
+    // Table CHECK constraints
+    for row in query(pool, CHECKS_SQL, std::slice::from_ref(&object_excludes)).await? {
+        let Some([conname, pg_schema, table_name]) = fields::<3>(row) else {
+            continue;
+        };
+        let (Some(conname), Some(pg_schema), Some(table_name)) =
+            (as_str(conname), as_str(pg_schema), as_str(table_name))
+        else {
+            continue;
+        };
+        state.add_check(&pg_to_module(&pg_schema), &table_name, &conname);
     }
 
     // Installed extensions (no excludes — this list is small and deliberate).

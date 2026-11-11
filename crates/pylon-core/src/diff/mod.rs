@@ -813,6 +813,15 @@ impl DbState {
             t.triggers.push(trigger_name.to_string());
         }
     }
+
+    /// Add a CHECK constraint name to an existing table entry.
+    pub fn add_check(&mut self, module: &str, table: &str, constraint_name: &str) {
+        if let Some(t) = self.tables.iter_mut().find(|t| t.schema == module && t.name == table) {
+            t.checks.push(DbCheck {
+                constraint_name: constraint_name.to_string(),
+            });
+        }
+    }
 }
 
 /// Every trigger name a table (or its junction tables) should have once
@@ -1110,6 +1119,49 @@ fn is_generated_check_name(name: &str) -> bool {
     match rest.rsplit_once('_') {
         Some((prefix, hash)) => !prefix.is_empty() && hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()),
         None => false,
+    }
+}
+
+/// `DROP CONSTRAINT` for every Pylon-named CHECK the database has on
+/// `(module, table)`, recording each in `dropped` so that Phase 6c puts back
+/// the ones the schema still declares and Phase 11.9 does not drop them a
+/// second time.
+///
+/// `ALTER COLUMN … TYPE` re-validates every constraint on the table against
+/// the *new* type, so a check whose predicate calls a type-specific function
+/// on the column being retyped makes the statement fail outright: a
+/// `MaxLen(16)` compiled to `char_length("platform") <= 16` becomes
+/// `char_length(access."ClientPlatform")` the moment that property turns into
+/// an enum, and no such function exists. The migration could not be applied
+/// at all — not to a populated table, not to an empty one — so every column
+/// type change takes the table's checks off ahead of itself.
+///
+/// All of them, not only the ones naming the column being retyped: a
+/// `DbCheck` carries nothing but its name, so a type-level `Expression`
+/// constraint (named `{table}_{hash}_check`) says nothing about which columns
+/// it reads, and a property-level one keeps the old column's name across a
+/// rename. Putting back a check that would have survived untouched costs one
+/// more scan of a table the type change is already rewriting.
+fn drop_generated_checks(
+    module: &str,
+    table: &str,
+    existing: &DbTable,
+    ops: &mut Vec<DiffOp>,
+    dropped: &mut HashSet<(String, String, String)>,
+) {
+    for check in &existing.checks {
+        if !is_generated_check_name(&check.constraint_name) {
+            continue;
+        }
+        push_tx(
+            ops,
+            format!(
+                "ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};",
+                qn(module, table),
+                qi(&check.constraint_name)
+            ),
+        );
+        dropped.insert((module.to_string(), table.to_string(), check.constraint_name.clone()));
     }
 }
 
@@ -2094,6 +2146,8 @@ fn emit_enum_rebuild(
     defer_drop: bool,
     torn_down_views: &mut HashSet<(String, String)>,
     torn_down_functions: &mut HashSet<(String, String)>,
+    cur_tables: &HashMap<(&str, &str), &DbTable>,
+    dropped_checks: &mut HashSet<(String, String, String)>,
 ) -> (Vec<DiffOp>, Vec<RequiredInput>, Option<String>) {
     let mut ops: Vec<DiffOp> = Vec::new();
     let mut inputs: Vec<RequiredInput> = Vec::new();
@@ -2101,10 +2155,12 @@ fn emit_enum_rebuild(
 
     // 1. views over every table holding one of these columns
     let mut seen_tables: HashSet<(&str, &str)> = HashSet::new();
+    let mut tables: Vec<(&str, &str)> = Vec::new();
     for (module, table, _, _) in columns {
         if !seen_tables.insert((module.as_str(), table.as_str())) {
             continue;
         }
+        tables.push((module.as_str(), table.as_str()));
         ops.extend(view_teardown(
             target_views,
             existing_views,
@@ -2149,7 +2205,17 @@ fn emit_enum_rebuild(
         ),
     );
 
-    // 4. the columns
+    // 4. the checks on those tables, which the column type changes below
+    //    would otherwise re-validate against the rebuilt type — see
+    //    `drop_generated_checks`. A predicate over an enum is bound to the
+    //    type it was written against, which step 2 has just renamed away.
+    for (module, table) in &tables {
+        if let Some(existing) = cur_tables.get(&(*module, *table)) {
+            drop_generated_checks(module, table, existing, &mut ops, dropped_checks);
+        }
+    }
+
+    // 5. the columns
     for (module, table, column, is_array) in columns {
         let table_ref = qn(module, table);
         push_tx(
@@ -2201,7 +2267,7 @@ fn emit_enum_rebuild(
         }
     }
 
-    // 5. the old type
+    // 6. the old type
     let drop_sql = format!("DROP TYPE {old_ref};");
     if defer_drop {
         (ops, inputs, Some(drop_sql))
@@ -2463,6 +2529,11 @@ fn diff_inner(
     // unchanged, and the `DROP TYPE`s that have to wait until it has.
     let mut forced_composite_rebuilds: HashSet<String> = HashSet::new();
     let mut deferred_enum_drops: Vec<String> = Vec::new();
+    // CHECK constraints a column type change had to take off the table ahead
+    // of itself — see `drop_generated_checks`. Phase 6c re-adds the ones the
+    // schema still declares (it would otherwise see them in the introspected
+    // state and skip them), and Phase 11.9 leaves them alone.
+    let mut dropped_checks: HashSet<(String, String, String)> = HashSet::new();
 
     // ── Phase 2: enums (described as "scalar type", matching how a custom
     // scalar domain is described — see `verbosename_scalar`) ─────────────────
@@ -2549,6 +2620,8 @@ fn diff_inner(
             !held_by.is_empty(),
             &mut torn_down_views,
             &mut torn_down_functions,
+            &cur_tables,
+            &mut dropped_checks,
         );
         forced_composite_rebuilds.extend(held_by);
         if let Some(sql) = deferred_drop {
@@ -2888,8 +2961,16 @@ fn diff_inner(
                     .unwrap_or_default();
                 let mut local: Vec<DiffOp> = Vec::new();
                 let mut inputs: Vec<RequiredInput> = Vec::new();
-                let blocks_views =
-                    emit_column_diff(td, existing, &mut local, for_migration, &fill_cols, target, &mut inputs);
+                let blocks_views = emit_column_diff(
+                    td,
+                    existing,
+                    &mut local,
+                    for_migration,
+                    &fill_cols,
+                    target,
+                    &mut inputs,
+                    &mut dropped_checks,
+                );
                 if blocks_views {
                     let teardown = view_teardown(
                         &target_generated_views,
@@ -2975,10 +3056,14 @@ fn diff_inner(
     // `Expression` enforcement at all — a 200-character value went straight
     // into a `MaxLen(24)` column.
     for (module, table, cname, ddl) in crate::export::check_constraints(target).map_err(|e| e.to_string())? {
+        // One a column type change dropped is in the introspected state but
+        // no longer in the database by the time this step runs, so it counts
+        // as missing (see `drop_generated_checks`).
         let already_there = cur_tables
             .get(&(module.as_str(), table.as_str()))
             .map(|t| t.checks.iter().any(|c| c.constraint_name == cname))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && !dropped_checks.contains(&(module.clone(), table.clone(), cname.clone()));
         if already_there {
             continue;
         }
@@ -3662,7 +3747,7 @@ fn diff_inner(
                 cur_table.name.clone(),
                 check.constraint_name.clone(),
             );
-            if expected_checks.contains(&key) {
+            if expected_checks.contains(&key) || dropped_checks.contains(&key) {
                 continue;
             }
             steps.extend(
@@ -4037,6 +4122,7 @@ fn cache_invalidate_trigger_sql(qualified_table: &str) -> String {
 /// takes the interface views over this table down ahead of `ops` (see
 /// `view_teardown`) and leaves the rest alone.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 fn emit_column_diff(
     td: &TypeDescriptor,
     existing: &DbTable,
@@ -4045,6 +4131,7 @@ fn emit_column_diff(
     fill_cols: &HashSet<String>,
     schema: &SchemaDescriptor,
     required_input: &mut Vec<RequiredInput>,
+    dropped_checks: &mut HashSet<(String, String, String)>,
 ) -> bool {
     let existing_col_map: HashMap<&str, &DbColumn> = existing.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut blocks_dependent_views = false;
@@ -4122,6 +4209,7 @@ fn emit_column_diff(
         // column; the caller takes those views down ahead of everything
         // here and has Phase 10 rebuild them.
         blocks_dependent_views = true;
+        drop_generated_checks(&td.module, &td.table, existing, ops, dropped_checks);
         for (col, target_type, has_default, to_tuple) in &type_changes {
             // Postgres checks the *existing* DEFAULT against the new type
             // before any `SET DEFAULT` further down can replace it, and
@@ -5901,6 +5989,141 @@ mod tests {
         assert!(
             !joined.contains("a_hand_written_check"),
             "a constraint Pylon did not name is left alone:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn test_a_retyped_column_loses_its_checks_before_the_type_changes() {
+        // A `MaxLen(16)` `str` property becoming an enum. PostgreSQL
+        // re-validates every constraint on a column as part of changing its
+        // type, so `char_length("platform") <= 16` — written over `text` —
+        // is evaluated against the enum and the whole migration fails with
+        // "function char_length(public.ClientPlatform) does not exist". The
+        // drop used to be grouped with Phase 11.9's and emitted after.
+        let mut release = simple_type("default", "ClientRelease", "ClientRelease");
+        release.properties = vec![
+            prop("id", "uuid", false),
+            prop("platform", "public.\"ClientPlatform\"", false),
+        ];
+        let schema = SchemaDescriptor {
+            types: vec![release],
+            enums: vec![EnumDescriptor {
+                name: "ClientPlatform".into(),
+                module: "default".into(),
+                members: vec!["Android".into(), "IOS".into()],
+            }],
+            ..SchemaDescriptor::default()
+        };
+        let state = DbState {
+            tables: vec![DbTable {
+                schema: "default".into(),
+                name: "ClientRelease".into(),
+                columns: vec![
+                    DbColumn {
+                        name: "id".into(),
+                        pg_type: "uuid".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: None,
+                    },
+                    DbColumn {
+                        name: "platform".into(),
+                        pg_type: "text".into(),
+                        nullable: false,
+                        is_generated: false,
+                        column_default: None,
+                    },
+                ],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![DbCheck {
+                    constraint_name: "ClientRelease_platform_1ba6036d_check".into(),
+                }],
+                triggers: vec![],
+            }],
+            ..DbState::default()
+        };
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let sqls: Vec<&str> = ops.iter().map(|op| op.sql.as_str()).collect();
+        let drop_at = sqls
+            .iter()
+            .position(|sql| sql.contains("DROP CONSTRAINT IF EXISTS \"ClientRelease_platform_1ba6036d_check\""))
+            .unwrap_or_else(|| panic!("the stale check is never dropped:\n{}", sqls.join("\n")));
+        let retype_at = sqls
+            .iter()
+            .position(|sql| sql.contains("ALTER COLUMN \"platform\" TYPE"))
+            .unwrap_or_else(|| panic!("the column is never retyped:\n{}", sqls.join("\n")));
+        assert!(
+            drop_at < retype_at,
+            "the check has to come off before the type changes:\n{}",
+            sqls.join("\n")
+        );
+        assert_eq!(
+            sqls.iter()
+                .filter(|sql| sql.contains("\"ClientRelease_platform_1ba6036d_check\""))
+                .count(),
+            1,
+            "Phase 11.9 should not drop it a second time:\n{}",
+            sqls.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_a_check_dropped_for_a_retype_is_added_back_afterwards() {
+        // The check is on `name` and the type change is on `code`, so the
+        // schema still declares it — dropping every check on the table (the
+        // name is all a `DbCheck` carries, so there is no telling which
+        // columns a predicate reads) only works if the survivors go back on.
+        let mut person = simple_type("default", "Person", "Person");
+        let mut name = prop("name", "text", true);
+        name.check_constraints = vec!["char_length(\"name\") <= 16".into()];
+        person.properties = vec![prop("id", "uuid", false), name, prop("code", "int8", true)];
+        let schema = SchemaDescriptor {
+            types: vec![person],
+            ..SchemaDescriptor::default()
+        };
+        let col = |name: &str, pg_type: &str| DbColumn {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            nullable: true,
+            is_generated: false,
+            column_default: None,
+        };
+        // The name the differ's own emitter would have given it, so that the
+        // re-add is recognisably the same constraint rather than a second one.
+        let cname = crate::export::check_constraints(&schema).unwrap()[0].2.clone();
+        let state = DbState {
+            tables: vec![DbTable {
+                schema: "default".into(),
+                name: "Person".into(),
+                columns: vec![col("id", "uuid"), col("name", "text"), col("code", "text")],
+                foreign_keys: vec![],
+                indexes: vec![],
+                checks: vec![DbCheck {
+                    constraint_name: cname.clone(),
+                }],
+                triggers: vec![],
+            }],
+            ..DbState::default()
+        };
+        let ops = diff_schema_ops(&schema, &state).unwrap();
+        let sqls: Vec<&str> = ops.iter().map(|op| op.sql.as_str()).collect();
+        let joined = sqls.join("\n");
+        let drop_at = sqls
+            .iter()
+            .position(|sql| sql.contains(&format!("DROP CONSTRAINT IF EXISTS \"{cname}\"")))
+            .unwrap_or_else(|| panic!("the check is never dropped:\n{joined}"));
+        let add_at = sqls
+            .iter()
+            .position(|sql| sql.contains(&format!("ADD CONSTRAINT \"{cname}\"")))
+            .unwrap_or_else(|| panic!("the check is never put back:\n{joined}"));
+        let retype_at = sqls
+            .iter()
+            .position(|sql| sql.contains("ALTER COLUMN \"code\" TYPE"))
+            .unwrap_or_else(|| panic!("the column is never retyped:\n{joined}"));
+        assert!(
+            drop_at < retype_at && retype_at < add_at,
+            "drop, retype, re-add — in that order:\n{joined}"
         );
     }
 

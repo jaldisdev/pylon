@@ -46,8 +46,8 @@ use pylon_core::diff::{
 use pylon_core::export::export_schema;
 use pylon_core::query;
 use pylon_core::schema::{
-    IndexDescriptor, PropertyDescriptor, SchemaDescriptor, SignalEntry, TriggerDescriptor, TypeConstraint,
-    TypeDescriptor,
+    EnumDescriptor, IndexDescriptor, PropertyDescriptor, SchemaDescriptor, SignalEntry, TriggerDescriptor,
+    TypeConstraint, TypeDescriptor,
 };
 use pylon_pgcon::ExtensionOids;
 use pylon_value::DecodedValue;
@@ -753,6 +753,149 @@ async fn an_export_installed_exclusive_index_carries_the_diffs_name() {
     assert!(
         proposed.is_empty(),
         "the index is already there; nothing to propose, got {proposed:?}"
+    );
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}
+
+/// A `MaxLen`-carrying `str` property turning into an enum — the shape the
+/// jaldis schema uses for every string property, so this was every text →
+/// enum change in that codebase.
+///
+/// `ALTER COLUMN … TYPE` re-validates the column's constraints against the
+/// *new* type, and the length check is written over `text`, so the migration
+/// failed outright with "function char_length(…ClientPlatform) does not
+/// exist" — on a populated table and on an empty one alike, which is why no
+/// amount of shadow-database verification would have surfaced it. Only an
+/// apply against a real Postgres shows it: the statement order looks
+/// perfectly reasonable as text.
+///
+/// `note` keeps its own check across the migration, so this also pins the
+/// other half — every check comes off the table, and the ones the schema
+/// still declares have to be back on it by the end.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_checked_text_column_can_become_an_enum() {
+    let module = unique_module("live_migdiff_enumcast");
+
+    let checked = |name: &str, len: u32| PropertyDescriptor {
+        check_constraints: vec![format!("char_length(\"{name}\") <= {len}")],
+        ..text_prop(name)
+    };
+    let v1 = SchemaDescriptor {
+        types: vec![TypeDescriptor {
+            name: "ClientRelease".into(),
+            module: module.clone(),
+            table: "ClientRelease".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![id_prop(), checked("platform", 16), checked("note", 8)],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }],
+        ..Default::default()
+    };
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(&v1).unwrap()).await.unwrap();
+
+    let insert = query::compile(
+        &format!("insert {module}::ClientRelease {{ platform := 'Android', note := 'ship it' }}"),
+        &v1,
+    )
+    .unwrap();
+    assert_eq!(pool.execute_typed(&insert.sql, &[]).await.unwrap(), 1);
+
+    // v2: `platform` becomes a new enum, `note` is untouched.
+    let mut v2 = v1.clone();
+    v2.enums = vec![EnumDescriptor {
+        name: "ClientPlatform".into(),
+        module: module.clone(),
+        members: vec!["Android".into(), "IOS".into(), "Windows".into()],
+    }];
+    v2.types[0].properties[1] = PropertyDescriptor {
+        pg_type: format!("\"{module}\".\"ClientPlatform\""),
+        check_constraints: vec![],
+        ..text_prop("platform")
+    };
+
+    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    let steps = diff_schema_steps(&v2, &live, &HashMap::new()).unwrap();
+    for step in &steps {
+        for op in step.resolved_ddl(&HashMap::new()) {
+            pool.batch_execute(&op.sql)
+                .await
+                .unwrap_or_else(|e| panic!("applying `{}` failed: {e}", op.sql));
+        }
+    }
+
+    let select = query::compile(&format!("select {module}::ClientRelease {{ note }}"), &v2).unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the existing row should have survived, got {rows:?}");
+
+    let checks = pool
+        .query_typed(
+            &format!(
+                "SELECT (conname)::text FROM pg_constraint \
+                 WHERE conrelid = '\"{module}\".\"ClientRelease\"'::regclass AND contype = 'c' \
+                 ORDER BY conname"
+            ),
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = checks
+        .iter()
+        .map(|row| match row {
+            DecodedValue::Str(s) => s.clone(),
+            other => panic!("expected a constraint name, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("ClientRelease_note_")),
+        "the check on the untouched column has to be back on the table, got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("ClientRelease_platform_")),
+        "the length check over `text` is gone for good, got {names:?}"
+    );
+
+    // And nothing is left over: `introspect_db_state` did not record table
+    // CHECK constraints at all, so a second diff proposed adding every one of
+    // them again — `ADD CONSTRAINT` under a name the table already carries,
+    // which is an error, so `watch` could not run against any schema that
+    // declares a `MaxLen`.
+    let after = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    let again = diff_schema_steps(&v2, &after, &HashMap::new()).unwrap();
+    let residue: Vec<String> = again
+        .iter()
+        .flat_map(|s| s.resolved_ddl(&HashMap::new()))
+        .map(|op| op.sql)
+        .filter(|sql| sql.contains("CONSTRAINT"))
+        .collect();
+    assert!(
+        residue.is_empty(),
+        "an applied schema should propose no further constraint work, got {residue:?}"
     );
 
     pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
