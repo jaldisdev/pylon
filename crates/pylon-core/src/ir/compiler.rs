@@ -6349,14 +6349,13 @@ impl<'a> Compiler<'a> {
                     operand: inner,
                 })))
             }
-            IrStmt::PathSelect(ps) => {
-                // EXISTS(SELECT 1 FROM root [JOINs] WHERE filter)
-                // Reuse the path select but signal "exists" via a dedicated IR node
-                Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
-                    op: ast::UnaryOpKind::Exists,
-                    operand: IrExpr::Subquery(Box::new(IrSelect::schema_bound(ps.root, vec![], ps.filter))),
-                })))
-            }
+            // `exists (select binding.access_grants filter .account…)` — the
+            // filter reads the rows the path's joins reach, so they have to
+            // come along; the root alone leaves it naming an alias no FROM has.
+            IrStmt::PathSelect(ps) => Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
+                op: ast::UnaryOpKind::Exists,
+                operand: IrExpr::PathSubquery(Box::new(ps)),
+            }))),
             _ => Err(self.type_err("exists requires a SELECT expression")),
         }
     }

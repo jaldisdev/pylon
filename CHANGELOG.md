@@ -104,6 +104,14 @@ from the same version number.
   written by an insert into such a type — now sees the junction rows the
   statement wrote, where it read back an empty set.
 
+### Reading
+
+* `exists (select b.grants filter …)` — an `exists` over a select whose
+  subject is a path — keeps the path's joins. It kept only the first row
+  source, so the filter named a table no `FROM` held: the query compiled,
+  then failed with "missing FROM-clause entry" when it ran. Every `exists`
+  over a path that walks a link was affected, a `with` binding's included.
+
 ## 0.10.0 — 2026-11-09
 
 ### Migrations
