@@ -772,6 +772,28 @@ fn innermost_select(stmt: &Stmt) -> Option<&ast::SelectStmt> {
     }
 }
 
+/// Whether every row `stmt` yields was written by an insert, and so comes
+/// from the one table of the type it names. Update and delete instead write
+/// every table of a type with subtypes and union the rows with their
+/// `__type__`.
+fn ir_inserts(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Insert(_) => true,
+        IrStmt::For(f) => ir_inserts(&f.body),
+        _ => false,
+    }
+}
+
+/// `ir_inserts`, read off the statement before it is compiled.
+fn stmt_inserts(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Insert(_) => true,
+        Stmt::For(f) => stmt_inserts(&f.body),
+        Stmt::With(w) => stmt_inserts(&w.stmt),
+        _ => false,
+    }
+}
+
 fn cte_stmt_type(stmt: &IrStmt) -> String {
     match stmt {
         IrStmt::Insert(ins) => ins.target.type_name.clone(),
@@ -1523,6 +1545,9 @@ struct Compiler<'a> {
     /// binding as a scalar subquery, which Postgres aborts on the second row
     /// ("more than one row returned by a subquery used as an expression").
     multi_row_ctes: HashSet<String>,
+    /// CTE names bound to an insert. Its rows come from the one table it
+    /// wrote, with no `__type__` column, even when the type has subtypes.
+    insert_ctes: HashSet<String>,
     /// FOR loop variables in scope: variable name → pg_type of the scalar iterator.
     for_vars: HashMap<String, String>,
     /// For-loop variables that iterate objects, by qualified type name. The
@@ -1646,9 +1671,10 @@ struct Compiler<'a> {
     /// trigger) is simply absent from this map, and fails resolution the
     /// same way any other unknown identifier does.
     special_anchors: HashMap<String, (&'a TypeDescriptor, String)>,
-    /// Aliases besides the `special_anchors` that read one row of a single
-    /// table — a CHECK constraint's bare columns — so the row is of exactly
-    /// the type compiled against. See `is_exact_row`.
+    /// Aliases besides the `special_anchors` that read rows of a single
+    /// table — a CHECK constraint's bare columns, a select over an insert —
+    /// so each row is of exactly the type compiled against. See
+    /// `is_exact_row`.
     exact_rows: Vec<String>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
@@ -1777,6 +1803,7 @@ impl<'a> Compiler<'a> {
             group_bindings: HashMap::new(),
             cte_free_items: HashMap::new(),
             multi_row_ctes: HashSet::new(),
+            insert_ctes: HashSet::new(),
             for_vars: HashMap::new(),
             for_var_types: HashMap::new(),
             for_var_ctes: HashMap::new(),
@@ -2020,6 +2047,11 @@ impl<'a> Compiler<'a> {
         };
         if !single {
             self.multi_row_ctes.insert(name.to_string());
+        }
+        if ir_inserts(ir_stmt) {
+            self.insert_ctes.insert(name.to_string());
+        } else {
+            self.insert_ctes.remove(name);
         }
     }
 
@@ -4699,6 +4731,9 @@ impl<'a> Compiler<'a> {
         // instead of failing with "unknown type '{root_name}'".
         let root_td = self.resolve_path_root(root_name)?;
         let root_alias = self.fresh_alias();
+        if self.insert_ctes.contains(root_name) {
+            self.exact_rows.push(root_alias.clone());
+        }
         let root = IrSource {
             poly: None,
             type_name: format!("{}::{}", root_td.module, root_td.name),
@@ -7524,6 +7559,14 @@ impl<'a> Compiler<'a> {
         let (type_name, shape_elements, inner_stmt, cte_name) = self.extract_type_and_shape(result_expr)?;
         let td = self.resolve_type(&type_name)?;
         let alias = self.fresh_alias();
+        let reads_an_insert = match (&cte_name, inner_stmt) {
+            (Some(cte), _) => self.insert_ctes.contains(cte),
+            (None, Some(stmt)) => stmt_inserts(stmt),
+            (None, None) => false,
+        };
+        if reads_an_insert {
+            self.exact_rows.push(alias.clone());
+        }
         let table = match cte_name {
             Some(ref cte) => self.cte_source_table(cte),
             None => Self::subject_name(result_expr)
@@ -7661,7 +7704,7 @@ impl<'a> Compiler<'a> {
             Self::read_nested_links_from_their_ctes(dml, Some(dml_cte), &mut shape);
         }
 
-        let polymorphic = self.is_polymorphic(td);
+        let polymorphic = self.is_polymorphic(td) && !reads_an_insert;
         let (poly_implementors, poly_columns) = if polymorphic {
             let iface_qname = format!("{}::{}", td.module, td.name);
             (self.find_poly_implementors(&iface_qname), Self::poly_dml_columns(td))
@@ -18375,15 +18418,26 @@ impl<'a> Compiler<'a> {
                 let IrMultiLinkJoin::Standard { junction_table, .. } = &mut link.join else {
                     continue;
                 };
-                let Some(index) = appends.iter().position(|a| a.junction_table == *junction_table) else {
+                // Over a type with subtypes the read names every table's
+                // junction, which the fanned-out write unions back under
+                // the one name (see `emit_poly_update_multilink_ctes`).
+                let inherited = super::parse_inherited_junction(junction_table).map(|(tables, _)| tables);
+                let Some(index) = appends.iter().position(|a| match &inherited {
+                    Some(tables) => tables.iter().any(|(_, table)| *table == a.junction_table),
+                    None => a.junction_table == *junction_table,
+                }) else {
                     continue;
                 };
                 *junction_table = format!("@cte:{dml_cte}__ml_add_{index}");
                 if let IrMultiLinkValueSource::CteRef(target_cte) = &appends[index].values.source {
+                    let inserted = nested_ctes.iter().any(|c| c.name == *target_cte && ir_inserts(&c.stmt));
                     for row in &mut link.subquery.rows {
-                        if let IrRowSource::Bound { source, .. } = row {
+                        if let IrRowSource::Bound { source, shape } = row {
                             source.table = format!("@cte:{target_cte}");
                             source.poly = None;
+                            if inserted {
+                                Self::name_the_inserted_type(source, shape);
+                            }
                         }
                     }
                 }
@@ -18416,11 +18470,30 @@ impl<'a> Compiler<'a> {
             let Some(cte_name) = from_cte.get(fk_column.as_str()) else {
                 continue;
             };
+            let inserted = nested_ctes.iter().any(|c| c.name == *cte_name && ir_inserts(&c.stmt));
             for row in &mut link.subquery.rows {
-                if let IrRowSource::Bound { source, .. } = row {
+                if let IrRowSource::Bound { source, shape } = row {
                     source.table = format!("@cte:{cte_name}");
                     source.poly = None;
+                    if inserted {
+                        Self::name_the_inserted_type(source, shape);
+                    }
                 }
+            }
+        }
+    }
+
+    /// A link read moved onto a nested insert's CTE reads rows of the one
+    /// table that insert wrote, which has no `__type__` column even when the
+    /// type has subtypes. The shape was compiled against the type's union,
+    /// so its `__type__` pointer is rewritten to the type's name.
+    fn name_the_inserted_type(source: &IrSource, shape: &mut [IrShapePointer]) {
+        for pointer in shape {
+            if let IrShapePointer::Computed(p) = pointer
+                && matches!(&p.expr, IrExpr::ColumnRef { alias, column, .. }
+                    if *alias == source.alias && column == "__type__")
+            {
+                p.expr = IrExpr::Literal(IrLiteral::Str(source.type_name.clone()));
             }
         }
     }

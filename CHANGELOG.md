@@ -79,6 +79,24 @@ from the same version number.
   `insert Log { flag := __new__ is Admin }` — they tested that statement's
   type (`Log`) instead, and so were always false.
 
+### Writing
+
+* A shape over an insert into a concrete type that has subtypes runs again —
+  `select (insert Product { … }) { * }`, the same through a `with` binding
+  or a `for`, and a path such as `p.__type__` off one. Each read the
+  inserted row's type from a `__type__` column, which only the union over
+  the type and its subtypes carries, and failed with "column __type__ does
+  not exist". An insert writes the one table, so the type is now that
+  type's name. The same goes for a link read off a nested insert —
+  `company: { __type__ }` after `company := (insert Company { … })`.
+* `select (update T … set { … })` over a type with subtypes, with a nested
+  insert in its values or a multi-link change, now writes the subtypes'
+  rows too. It updated only `T`'s own table and junctions, and then failed
+  on the same missing column; the statement without a shape around it
+  always wrote both. The shape's read of the multi-link — and of one
+  written by an insert into such a type — now sees the junction rows the
+  statement wrote, where it read back an empty set.
+
 ## 0.10.0 — 2026-11-09
 
 ### Migrations

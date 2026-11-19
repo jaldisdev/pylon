@@ -581,6 +581,19 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
         // enqueue reading it would index every sibling for every id.
         let mut fanned_out = false;
         let mut cte_parts = match dml.as_ref() {
+            // Ahead of the multi-link and nested-DML arms, which write only
+            // the target's own table: a type with subtypes keeps rows in
+            // theirs too.
+            IrStmt::Update(upd) if !upd.poly_implementors.is_empty() => {
+                fanned_out = true;
+                if update_has_any_multilink(upd) {
+                    emit_poly_update_multilink_ctes(upd, DML_CTE)
+                } else {
+                    let mut parts = emit_user_cte_parts(&upd.nested_ctes);
+                    parts.extend(emit_poly_update_dml_ctes(upd, DML_CTE));
+                    parts
+                }
+            }
             IrStmt::Update(upd) if update_has_any_multilink(upd) => emit_update_multilink_ctes(upd, DML_CTE),
             IrStmt::Insert(ins) if insert_has_any_multilink(ins) => emit_insert_multilink_ctes(ins, DML_CTE),
             // Nested DML the row's values read from: hoisted ahead of the row
@@ -594,10 +607,6 @@ fn emit_bound_select(sel: &IrSelect, source: &IrSource, shape: &[IrShapePointer]
                 let mut parts = emit_user_cte_parts(&upd.nested_ctes);
                 parts.push(format!("\"_dml\" AS (\n{}\n)", emit_dml_as_cte_source(dml)));
                 parts
-            }
-            IrStmt::Update(upd) if !upd.poly_implementors.is_empty() => {
-                fanned_out = true;
-                emit_poly_update_dml_ctes(upd, "_dml")
             }
             IrStmt::Delete(del) if !del.poly_implementors.is_empty() => {
                 fanned_out = true;
@@ -972,13 +981,9 @@ fn emit_dml_as_cte_source(stmt: &IrStmt) -> String {
 // property + link FK the type declares, guaranteed present on every
 // implementor table) instead of just id.
 //
-// Not handled: a multi-link mutation (+=/-=/:=) on the interface's own
-// pointer combined with poly_implementors on the same statement — that
-// would need per-implementor junction-table CTEs too, which
-// emit_update_multilink_ctes doesn't do either today. Callers check
-// update_has_any_multilink first and keep routing that (rarer) combination
-// through the existing (equally not-poly-aware) path rather than silently
-// mishandling it here.
+// An update that also mutates a multi-link goes through
+// emit_poly_update_multilink_ctes instead, which builds each implementor's
+// junction CTEs against its own tables.
 
 fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
     let alias = &upd.target.alias;
@@ -995,8 +1000,15 @@ fn emit_poly_update_dml_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
             qi(alias),
             sets.join(", "),
         );
+        upd_sql.push_str(&nested_cte_from(&upd.nested_ctes, &sets.join(","), "\n"));
         append_filter(&mut upd_sql, &upd.filter);
-        upd_sql.push_str(&format!("\nRETURNING {}", col_list));
+        let returning = upd
+            .poly_columns
+            .iter()
+            .map(|c| format!("{}.{}", qi(alias), qi(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        upd_sql.push_str(&format!("\nRETURNING {returning}"));
         cte_parts.push(format!("\"{}\" AS (\n{}\n)", cte_name, upd_sql));
         cte_parts.extend(poly_enqueue_search_ctes(&upd.enqueue_search, imp, &cte_name));
 
@@ -1063,6 +1075,15 @@ fn emit_poly_update_multilink_ctes(upd: &IrUpdate, name: &str) -> Vec<String> {
             col_list,
             cte_name,
         ));
+    }
+    // A shape reads the junction rows this statement wrote by the name an
+    // unfanned update gives them (see `read_nested_links_from_their_ctes`).
+    for k in 0..upd.multi_link_appends.len() {
+        let branches = (0..upd.poly_implementors.len())
+            .map(|i| format!("SELECT * FROM \"{name}__u{i}__ml_add_{k}\""))
+            .collect::<Vec<_>>()
+            .join("\nUNION ALL\n");
+        cte_parts.push(format!("\"{name}__ml_add_{k}\" AS (\n{branches}\n)"));
     }
     cte_parts.push(format!("\"{}\" AS (\n{}\n)", name, union_parts.join("\nUNION ALL\n")));
     cte_parts
@@ -7328,6 +7349,84 @@ mod tests {
             &schema_with_a_subtype(),
         );
         assert!(out.sql.contains("\"__type__\" = 'default::Admin'"), "{}", out.sql);
+    }
+
+    /// An insert writes one table, which has no `__type__` column even when
+    /// its type has subtypes, so whatever reads its rows names the type.
+    #[test]
+    fn a_read_of_an_insert_into_a_type_with_subtypes_names_its_type() {
+        let schema = schema_with_a_subtype();
+        for q in [
+            "SELECT (INSERT Person { name := 'n' }) { id, name }",
+            "SELECT (INSERT Person { name := 'n' }) { * }",
+            "SELECT (INSERT Person { name := 'n' }) { id, __type__, admin := Person IS Admin }",
+            "WITH p := (INSERT Person { name := 'n' }) SELECT p { id, name }",
+            "WITH p := (INSERT Person { name := 'n' }) SELECT p.__type__",
+            "WITH p := (INSERT Person { name := 'n' }) SELECT p IS Admin",
+            "SELECT (FOR x IN {'a', 'b'} UNION (INSERT Person { name := x })) { id }",
+        ] {
+            let sql = compile_and_emit_with(q, &schema).sql;
+            assert!(!sql.contains("\"__type__\""), "{q}\n{sql}");
+            assert!(sql.contains("'default::Person'"), "{q}\n{sql}");
+        }
+        // The union of a plain select, and an update's fan-out, still carry
+        // the column.
+        for q in ["SELECT Person { id }", "SELECT (UPDATE Person SET { age := 1 }) { id }"] {
+            let sql = compile_and_emit_with(q, &schema).sql;
+            assert!(sql.contains("\"t0\".\"__type__\""), "{q}\n{sql}");
+            assert!(sql.contains("'default::Admin'::text AS \"__type__\""), "{q}\n{sql}");
+        }
+    }
+
+    /// `schema_with_a_subtype` with a `Firm` extending `Company` too, so a
+    /// nested insert of a `Company` writes a type with subtypes.
+    fn schema_with_subtyped_link_targets() -> SchemaDescriptor {
+        let mut schema = schema_with_a_subtype();
+        let mut firm = schema.types.iter().find(|t| t.name == "Company").unwrap().clone();
+        firm.name = "Firm".into();
+        firm.table = "Firm".into();
+        firm.bases = vec!["default::Company".into()];
+        schema.types.push(firm);
+        schema
+    }
+
+    #[test]
+    fn a_link_read_off_a_nested_insert_names_its_type() {
+        let sql = compile_and_emit_with(
+            "SELECT (INSERT Admin { name := 'n', company := (INSERT Company { name := 'c' }) }) \
+             { company: { name, __type__ } }",
+            &schema_with_subtyped_link_targets(),
+        )
+        .sql;
+        assert!(sql.contains("FROM \"_nested_dml_0\" AS \"t1\""), "{sql}");
+        assert!(!sql.contains("\"__type__\""), "{sql}");
+    }
+
+    /// Wrapped in a select, an update with a nested insert or a multi-link
+    /// change writes every table of a type with subtypes, as it does on its
+    /// own.
+    #[test]
+    fn a_read_update_with_nested_writes_fans_out_to_the_subtypes() {
+        let schema = schema_with_subtyped_link_targets();
+        let sql = compile_and_emit_with(
+            "SELECT (UPDATE Person SET { company := (INSERT Company { name := 'c' }) }) { company: { name } }",
+            &schema,
+        )
+        .sql;
+        assert!(sql.contains("UPDATE \"public\".\"Admin\""), "{sql}");
+        assert!(sql.contains("FROM \"_nested_dml_0\"\nRETURNING \"t2\".\"id\""), "{sql}");
+
+        let sql = compile_and_emit_with(
+            "SELECT (UPDATE Person SET { posts += (INSERT Post { title := 't' }) }) { posts: { title } }",
+            &schema,
+        )
+        .sql;
+        assert!(sql.contains("INSERT INTO \"public\".\"Admin.posts\""), "{sql}");
+        assert!(
+            sql.contains("\"_dml__ml_add_0\" AS (\nSELECT * FROM \"_dml__u0__ml_add_0\""),
+            "{sql}"
+        );
+        assert!(sql.contains("FROM \"_dml__ml_add_0\" AS \"jt\""), "{sql}");
     }
 
     #[test]
