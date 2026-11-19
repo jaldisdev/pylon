@@ -41,6 +41,7 @@ pub use compiler::default_blocker;
 pub(crate) use compiler::infer_ir_type;
 pub use compiler::inlined_pointer_defaults;
 pub use compiler::pg_type_to_pyql;
+pub(crate) use compiler::suggest_pointer_name;
 pub(crate) use compiler::types_compatible;
 pub use compiler::{GLOBALS_ARG, compile_fn_body, functions_needing_globals};
 pub use compiler::{

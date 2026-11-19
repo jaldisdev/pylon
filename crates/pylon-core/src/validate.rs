@@ -463,7 +463,89 @@ pub fn validate_schema_types(schema: &SchemaDescriptor) -> Result<(), Vec<PyQLEr
         }
     }
 
+    errors.extend(validate_index_pointers(schema));
+
     if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Every index, `Exclusive` constraint, vector index and search index names
+/// pointers the type has, and the plain and exclusive ones build.
+///
+/// The DDL writers skip an index they cannot build rather than emit half of
+/// one, so without this an index left naming a field the type no longer has
+/// disappears with no word: dropped along with the old column, never made
+/// again, and the type left unindexed.
+pub fn validate_index_pointers(schema: &SchemaDescriptor) -> Vec<PyQLError> {
+    let mut errors = Vec::new();
+    for td in &schema.types {
+        if td.abstract_ || td.junction {
+            continue;
+        }
+        let type_name = format!("{}::{}", td.module, td.name);
+        let has_pointer = |name: &str| {
+            td.properties.iter().any(|p| p.name == name)
+                || td.links.iter().any(|l| l.name == name)
+                || td.multilinks.iter().any(|m| m.name == name)
+                || td.computed.iter().any(|c| c.name == name)
+        };
+        let mut check = |what: &str, pointers: &mut dyn Iterator<Item = &str>| -> bool {
+            let mut known = true;
+            for pointer in pointers {
+                if has_pointer(pointer) {
+                    continue;
+                }
+                known = false;
+                let hint = crate::ir::suggest_pointer_name(td, pointer)
+                    .map(|s| format!(" — did you mean '{s}'?"))
+                    .unwrap_or_default();
+                errors.push(mismatch(
+                    format!("{type_name} ({what})"),
+                    format!("{what} on '{type_name}' names '{pointer}', which is not a field of this type{hint}"),
+                ));
+            }
+            known
+        };
+        let mut built = Vec::new();
+        for idx in &td.indexes {
+            if check("Index", &mut idx.pointers.iter().map(String::as_str)) {
+                built.push((
+                    "Index",
+                    crate::export::index_body_and_predicate(
+                        td,
+                        &idx.pointers,
+                        idx.expression.as_deref(),
+                        idx.unless.as_deref(),
+                        schema,
+                    ),
+                ));
+            }
+        }
+        for c in &td.constraints {
+            if let crate::schema::TypeConstraint::Exclusive { pointers, unless } = c
+                && check("Exclusive", &mut pointers.iter().map(String::as_str))
+            {
+                built.push((
+                    "Exclusive",
+                    crate::export::exclusive_body_and_predicate(td, pointers, unless.as_deref(), schema),
+                ));
+            }
+        }
+        for vi in &td.vector_indexes {
+            check("VectorIndex", &mut vi.pointers.iter().map(String::as_str));
+        }
+        for si in &td.search_indexes {
+            check("SearchIndex", &mut si.pointers.iter().map(|p| p.name.as_str()));
+        }
+        for (what, result) in built {
+            if let Err(e) = result {
+                errors.push(mismatch(
+                    format!("{type_name} ({what})"),
+                    format!("{what} on '{type_name}' cannot be built: {e}"),
+                ));
+            }
+        }
+    }
+    errors
 }
 
 #[cfg(test)]
@@ -1112,5 +1194,110 @@ mod tests {
         g.default_expr = Some("'not actually pyql, just a sql literal'".into());
         schema.globals = vec![g];
         assert!(validate_schema_types(&schema).is_ok());
+    }
+
+    // ── Index and constraint pointers ─────────────────────────────────
+
+    fn indexed(pointers: &[&str]) -> crate::schema::IndexDescriptor {
+        crate::schema::IndexDescriptor {
+            pointers: pointers.iter().map(|p| p.to_string()).collect(),
+            expression: None,
+            unique: false,
+            unless: None,
+        }
+    }
+
+    /// `Person { name, design_system: link }` — the link that replaced a
+    /// `brand` link the indexes below still name.
+    fn person_with_link() -> TypeDescriptor {
+        let mut td = person_type(vec![], vec![base_property("name", "text")]);
+        td.links = vec![LinkDescriptor {
+            name: "design_system".into(),
+            target: "default::Person".into(),
+            nullable: true,
+            through: None,
+            description: None,
+            default_pyql: None,
+            is_exclusive: false,
+            is_readonly: false,
+            rewrites: vec![],
+            on_delete: vec![],
+        }];
+        td
+    }
+
+    #[test]
+    fn an_index_on_a_field_the_type_has_passes() {
+        let mut td = person_with_link();
+        td.indexes = vec![indexed(&["design_system"]), indexed(&["design_system", "name"])];
+        assert!(validate_index_pointers(&minimal_schema(vec![td], vec![])).is_empty());
+    }
+
+    #[test]
+    fn an_index_on_a_field_the_type_no_longer_has_is_rejected() {
+        let mut td = person_with_link();
+        td.indexes = vec![indexed(&["brand", "name"]), indexed(&["brand"])];
+        let errors: Vec<String> = validate_index_pointers(&minimal_schema(vec![td], vec![]))
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(errors.len(), 2, "one per index, got {errors:#?}");
+        for e in &errors {
+            assert!(
+                e.contains("'default::Person'") && e.contains("'brand'"),
+                "should name the type and the field: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_index_field_gets_a_suggestion() {
+        let mut td = person_with_link();
+        td.indexes = vec![indexed(&["design_sytem"])];
+        let errors = validate_index_pointers(&minimal_schema(vec![td], vec![]));
+        assert!(
+            errors[0].to_string().contains("did you mean 'design_system'?"),
+            "got {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn an_exclusive_constraint_on_a_missing_field_is_rejected() {
+        let mut td = person_with_link();
+        td.constraints = vec![crate::schema::TypeConstraint::Exclusive {
+            pointers: vec!["brand".into(), "name".into()],
+            unless: None,
+        }];
+        let errors = validate_index_pointers(&minimal_schema(vec![td], vec![]));
+        assert_eq!(errors.len(), 1, "got {errors:#?}");
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("Exclusive on 'default::Person' names 'brand'")
+        );
+    }
+
+    #[test]
+    fn a_search_index_on_a_missing_field_is_rejected() {
+        let mut td = person_with_link();
+        td.search_indexes = vec![crate::schema::SearchIndexDescriptor {
+            index_name: None,
+            backend: crate::schema::SearchBackend::Postgres,
+            pointers: vec![crate::schema::SearchPointerDescriptor {
+                name: "title".into(),
+                weight: crate::schema::SearchWeight::A,
+            }],
+        }];
+        let errors = validate_index_pointers(&minimal_schema(vec![td], vec![]));
+        assert_eq!(errors.len(), 1, "got {errors:#?}");
+        assert!(errors[0].to_string().contains("names 'title'"));
+    }
+
+    #[test]
+    fn schema_validation_reports_a_stale_index() {
+        let mut td = person_with_link();
+        td.indexes = vec![indexed(&["brand"])];
+        let errors = validate_schema_types(&minimal_schema(vec![td], vec![])).unwrap_err();
+        assert!(errors.iter().any(|e| e.to_string().contains("names 'brand'")));
     }
 }

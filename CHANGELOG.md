@@ -40,6 +40,12 @@ from the same version number.
   ambiguous. Where a subquery's alias left the bare name to bind to the
   inner table instead, the result was silently wrong. A fill now names the
   row by its table.
+* An `Index`, `Exclusive`, `VectorIndex` or `SearchIndex` naming a field its
+  type does not have is now a schema error, naming the type and the field.
+  `migration create` dropped the index along with the old column and never
+  built the declared one, without a word, so a type whose link was
+  replaced kept no index on its new one. The same goes for a plain or
+  exclusive index that names real fields but cannot be built.
 
 ### Tuples
 

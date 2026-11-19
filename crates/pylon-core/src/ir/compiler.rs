@@ -1337,6 +1337,23 @@ pub fn compile_computed_in_type(
     }
 }
 
+/// The pointer of `td` closest to a name it doesn't have, for "did you mean".
+/// Only a reasonably close one: an unrelated name is not suggested just
+/// because it is the nearest of a dissimilar set.
+pub(crate) fn suggest_pointer_name(td: &TypeDescriptor, name: &str) -> Option<String> {
+    const MIN_SIMILARITY: f64 = 0.7;
+    td.properties
+        .iter()
+        .map(|p| p.name.as_str())
+        .chain(td.links.iter().map(|l| l.name.as_str()))
+        .chain(td.multilinks.iter().map(|m| m.name.as_str()))
+        .chain(td.computed.iter().map(|c| c.name.as_str()))
+        .map(|candidate| (candidate, strsim::jaro_winkler(name, candidate)))
+        .filter(|(_, score)| *score >= MIN_SIMILARITY)
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(name, _)| name.to_string())
+}
+
 /// Like `compile_expr_in_type`, but the row is named by its table's own
 /// qualified name (`"mod"."T"."col"`) rather than an alias — for a migration's
 /// fill expression, which runs as the SET of an unaliased `UPDATE` or as an
@@ -19270,17 +19287,7 @@ impl<'a> Compiler<'a> {
     /// suggested just because it happens to be the "closest" among an
     /// otherwise-dissimilar set of candidates.
     fn suggest_pointer_name(td: &TypeDescriptor, name: &str) -> Option<String> {
-        const MIN_SIMILARITY: f64 = 0.7;
-        td.properties
-            .iter()
-            .map(|p| p.name.as_str())
-            .chain(td.links.iter().map(|l| l.name.as_str()))
-            .chain(td.multilinks.iter().map(|m| m.name.as_str()))
-            .chain(td.computed.iter().map(|c| c.name.as_str()))
-            .map(|candidate| (candidate, strsim::jaro_winkler(name, candidate)))
-            .filter(|(_, score)| *score >= MIN_SIMILARITY)
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(name, _)| name.to_string())
+        suggest_pointer_name(td, name)
     }
 
     // ── Default returning (pk only) ────────────────────────────────────────────
