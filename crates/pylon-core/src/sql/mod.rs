@@ -16886,6 +16886,50 @@ select owner { posts := (select owner.posts.title) };",
     }
 
     #[test]
+    fn test_an_unnamed_tuple_parameter_is_matched_to_the_column_it_lands_in() {
+        // `<tuple<str, str>>` names nothing, so a caller holding the value by
+        // name can only be read by the column's names — which the client
+        // needs to know it may send them. A cast that reaches no column has
+        // nothing to match such a value against.
+        let schema = make_schema_with_a_structural_tuple_property();
+        let matched = |query: &str| {
+            let ir = ir::compile(&parse::parse(query).unwrap(), &schema).unwrap();
+            ir.param_tuple_types[0].as_ref().unwrap().matched_to_column
+        };
+        assert!(matched("INSERT Person { address := <tuple<str, str>>$a }"));
+        assert!(matched("UPDATE Person SET { address := <tuple<str, str>>$a }"));
+        assert!(matched("SELECT Person FILTER .address = <tuple<str, str>>$a"));
+        assert!(!matched("SELECT <tuple<str, str>>$a"));
+    }
+
+    #[test]
+    fn test_a_tuple_member_is_read_off_the_row_that_holds_it() {
+        // Walked as a traversal, `.address.zip` re-read the row from the
+        // type's table by id — which over a DML result is a row the same
+        // statement cannot see yet, so it read as empty.
+        let schema = make_schema_with_a_structural_tuple_property();
+        let out = compile_and_emit_with(
+            "SELECT (INSERT Person { address := (street := 'Main', zip := '1000') }) { zip := .address.zip }",
+            &schema,
+        );
+        assert!(out.sql.contains("FROM \"_dml\" AS \"t0\""), "got:\n{}", out.sql);
+        assert!(out.sql.contains("(\"t0\".\"address\").\"zip\""), "got:\n{}", out.sql);
+        assert_eq!(
+            out.sql.matches("FROM \"public\".\"Person\"").count(),
+            0,
+            "the member is on the inserted row, not a second read of the table: got:\n{}",
+            out.sql
+        );
+
+        let filtered = compile_and_emit_with("SELECT Person { address } FILTER .address.zip = '1000'", &schema);
+        assert!(
+            filtered.sql.contains("WHERE ((\"t0\".\"address\").\"zip\" = '1000')"),
+            "got:\n{}",
+            filtered.sql
+        );
+    }
+
+    #[test]
     fn test_an_array_of_tuples_parameter_is_read_element_wise() {
         let schema = make_schema_with_an_array_of_tuples_property();
         let out = compile_and_emit_with(

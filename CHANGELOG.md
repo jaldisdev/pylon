@@ -34,6 +34,34 @@ from the same version number.
   dropped. `migration create` was unaffected: it compares against the
   schema recorded with the previous migration, which did record them.
 
+### Tuples
+
+* A named-tuple property written from a parameter cast to an unnamed
+  tuple — `rgb := <tuple<int16, int16, int16>>$rgb` — now stores its
+  members. Given a list or a tuple, every member was stored as NULL with no
+  error: the value travels as a json array, and the helper that reads it
+  into the column keyed its positions `"0"`, `"1"`, `"2"`, which only an
+  unnamed tuple's members are called. Positions now fill the column's
+  members in declaration order, nested tuples and arrays of tuples
+  included, and a value with the wrong number of members is refused rather
+  than stored padded. Inserts, updates and comparisons were all affected,
+  since 0.5.0. The fix is in the `_pylon` helpers, which an existing
+  database receives on its next `pylon migration apply` — with nothing to
+  apply, too. Rows already written this way hold all-NULL tuples and have
+  to be rewritten.
+* A dict or a `@pylon.named_tuple` instance bound to that same unnamed
+  cast is read by its own member names, matched against the column's. It
+  used to be iterated, which sent a dict's *keys* as the members. Where the
+  cast reaches no column at all (`select <tuple<int16, int16, int16>>$v`)
+  there are no names to match it to, and it is refused with
+  `InvalidParameterTypeError` instead.
+* Reading a member of a tuple property — `.rgb.r` — reads it off the row in
+  hand rather than looking the row up again by id. Over the result of an
+  insert or update (`select (insert …) { r := .rgb.r }`) that second lookup
+  could not see the row the same statement had just written, so the member
+  read back empty however the tuple was written. Filters on a member lose
+  the extra self-join as well.
+
 ## 0.10.0 — 2026-11-09
 
 ### Migrations

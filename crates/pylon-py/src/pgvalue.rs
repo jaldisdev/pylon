@@ -320,6 +320,7 @@ pub(crate) fn py_params_to_cached(
                     let argument = Argument {
                         name: param_names.get(i).map(String::as_str).unwrap_or_default(),
                         value,
+                        matched_to_column: plan.matched_to_column,
                     };
                     if plan.is_array {
                         tuple_array_to_cached(value, plan, &argument)
@@ -344,6 +345,8 @@ pub(crate) fn py_params_to_cached(
 struct Argument<'a, 'py> {
     name: &'a str,
     value: &'a Bound<'py, PyAny>,
+    /// See `ParamTupleType::matched_to_column`.
+    matched_to_column: bool,
 }
 
 impl Argument<'_, '_> {
@@ -427,6 +430,31 @@ fn tuple_to_cached(
     }
     let keys: Vec<&str> = members.iter().filter_map(|m| m.key.as_deref()).collect();
     if keys.is_empty() {
+        // An all-unnamed cast has no names to read a mapping by, but the
+        // value can still name its own members: `rgb := <tuple<int16, int16,
+        // int16>>$rgb` given `{"r": …}` is meant for the property's `r`, and
+        // only the database knows the property. So it travels keyed by its
+        // own names, which `_pylon.populate_tuple` matches to the column's.
+        // Iterating it instead sent a dict's *keys* as the members. With no
+        // column to match against there is no reading it at all.
+        if let Some(entries) = self_named_members(value)? {
+            if !argument.matched_to_column {
+                return Err(argument.refuse(format!(
+                    "{} has no member names to read a value of type '{}' by; pass its members in order",
+                    describe_tuple_type(members, type_name),
+                    value.get_type().name()?,
+                )));
+            }
+            if entries.len() != members.len() {
+                return Err(argument.refuse(format!(
+                    "expected {} elements in {}, got {}",
+                    members.len(),
+                    describe_tuple_type(members, type_name),
+                    entries.len(),
+                )));
+            }
+            return Ok(DecodedValue::Object(entries));
+        }
         return Ok(DecodedValue::Composite(positional_members(
             value,
             members,
@@ -517,6 +545,45 @@ fn positional_members(
         .zip(members)
         .map(|(item, member)| member_to_cached(item, member, argument, as_composite))
         .collect()
+}
+
+/// A value that names its members itself, as `(name, value)` pairs in its
+/// own order — a mapping, or an instance of a `@pylon.named_tuple` class
+/// (a dataclass). `None` for anything else, which is read by position.
+///
+/// A tuple subclass (`NamedTupleValue`, `collections.namedtuple`) is left to
+/// the positional reading on purpose: it is ordered by definition, so its
+/// position is as reliable as its names, and a plain `select
+/// <tuple<…>>$value` given one keeps round-tripping as the tuple it is.
+fn self_named_members(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<(String, DecodedValue)>>> {
+    let member = |item: &Bound<'_, PyAny>| -> PyResult<DecodedValue> {
+        match self_named_members(item)? {
+            Some(entries) => Ok(DecodedValue::Object(entries)),
+            None => py_to_cached(item),
+        }
+    };
+    if let Ok(dict) = value.cast::<PyDict>() {
+        return dict
+            .iter()
+            .map(|(k, v)| Ok((k.extract::<String>()?, member(&v)?)))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Some);
+    }
+    if value.is_instance_of::<PyType>() || !value.hasattr("__dataclass_fields__")? {
+        return Ok(None);
+    }
+    // `__dataclass_fields__` is a dict in declaration order.
+    let fields = value.getattr("__dataclass_fields__")?.cast_into::<PyDict>()?;
+    fields
+        .keys()
+        .iter()
+        .map(|name| {
+            let name = name.extract::<String>()?;
+            let item = value.getattr(name.as_str())?;
+            Ok((name, member(&item)?))
+        })
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
 }
 
 /// One member's own value — recursing for a nested tuple member, so

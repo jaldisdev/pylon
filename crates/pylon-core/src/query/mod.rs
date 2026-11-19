@@ -328,6 +328,15 @@ pub struct ParamTupleType {
     /// type has a composite to bind against, so a structural `tuple<…>`
     /// whose shape nothing declares still travels as jsonb.
     pub as_composite: bool,
+    /// True when the value lands in — or is compared with — a column whose
+    /// tuple names its members, which `_pylon.populate_tuple` matches it to.
+    ///
+    /// Only an all-unnamed cast needs telling: `rgb := <tuple<int16, int16,
+    /// int16>>$rgb` has no names of its own, so a caller holding the value by
+    /// name (a mapping, a `@pylon.named_tuple` instance) can only be read by
+    /// the column's. Anywhere else such a value has nothing to be matched
+    /// against and is refused instead.
+    pub matched_to_column: bool,
 }
 
 /// A bound parameter in the shape the cast it feeds asks for.
@@ -418,6 +427,7 @@ mod bind_tuple_param_tests {
             type_name: Some("default::HttpHeader".to_string()),
             members,
             as_composite,
+            matched_to_column: false,
         }
     }
 

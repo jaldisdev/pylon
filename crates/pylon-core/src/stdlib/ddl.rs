@@ -262,34 +262,77 @@ pub const SIGNAL_OUTBOX_DDL: &str = concat!(
 /// two calls convert a column whatever it holds today: the jsonb a tuple
 /// used to be, or a composite of a shape that has since changed.
 pub const TUPLE_CONVERSION_DDL: &str = concat!(
-    // A positional tuple travelled as a json array, whose members are the
-    // composite's `"0"`, `"1"`, … attributes — named for their index exactly
-    // so this mapping is mechanical. A named tuple's object passes through.
-    "CREATE OR REPLACE FUNCTION _pylon.tuple_json_object(src jsonb)\n",
+    // The object `jsonb_populate_record` needs to fill composite `typ` from
+    // `src`. A positional tuple — a json array, which is how one was stored
+    // and how a parameter cast to an unnamed `tuple<…>` still arrives — maps
+    // onto the type's attributes by position, whatever they are named: `"0"`,
+    // `"1"`, … for an unnamed tuple, but `r`, `g`, `b` when the value lands in
+    // a named one. Mapping positions to `"0"`, `"1"`, … regardless filled
+    // a named tuple with nothing, and silently. A member that is itself a
+    // tuple, or an array of them, is mapped the same way all the way down.
+    //
+    // A positional value of the wrong length is refused rather than padded
+    // or truncated: there is no telling which member a missing one was.
+    "CREATE OR REPLACE FUNCTION _pylon.tuple_json_object(typ regtype, src jsonb)\n",
     "\tRETURNS jsonb\n",
-    "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
+    "\tLANGUAGE plpgsql STABLE PARALLEL SAFE\n",
     "AS $$\n",
-    "    SELECT CASE jsonb_typeof(src)\n",
-    "        WHEN 'array' THEN (\n",
-    "            SELECT COALESCE(jsonb_object_agg((ord - 1)::text, val), '{}'::jsonb)\n",
-    "            FROM jsonb_array_elements(src) WITH ORDINALITY AS e(val, ord)\n",
-    "        )\n",
-    "        ELSE src\n",
-    "    END\n",
+    "DECLARE\n",
+    "    names text[];\n",
+    "    types oid[];\n",
+    "    out jsonb;\n",
+    "    val jsonb;\n",
+    "    elem oid;\n",
+    "BEGIN\n",
+    "    IF src IS NULL OR jsonb_typeof(src) NOT IN ('array', 'object') THEN\n",
+    "        RETURN src;\n",
+    "    END IF;\n",
+    "    SELECT array_agg(a.attname::text ORDER BY a.attnum), array_agg(a.atttypid ORDER BY a.attnum)\n",
+    "        INTO names, types\n",
+    "        FROM pg_type t JOIN pg_attribute a ON a.attrelid = t.typrelid\n",
+    "        WHERE t.oid = typ AND a.attnum > 0 AND NOT a.attisdropped;\n",
+    "    IF names IS NULL THEN\n",
+    "        RETURN src;\n",
+    "    END IF;\n",
+    "    IF jsonb_typeof(src) = 'array' AND jsonb_array_length(src) <> cardinality(names) THEN\n",
+    "        RAISE EXCEPTION 'expected % elements in the tuple, got %',\n",
+    "            cardinality(names), jsonb_array_length(src)\n",
+    "            USING ERRCODE = 'invalid_parameter_value';\n",
+    "    END IF;\n",
+    "    out := CASE jsonb_typeof(src) WHEN 'array' THEN '{}'::jsonb ELSE src END;\n",
+    "    FOR i IN 1 .. cardinality(names) LOOP\n",
+    "        val := CASE jsonb_typeof(src) WHEN 'array' THEN src -> (i - 1) ELSE src -> names[i] END;\n",
+    "        CONTINUE WHEN val IS NULL;\n",
+    "        IF jsonb_typeof(val) IN ('array', 'object') THEN\n",
+    "            SELECT typelem INTO elem FROM pg_type WHERE oid = types[i] AND typcategory = 'A';\n",
+    "            IF elem IS NOT NULL AND jsonb_typeof(val) = 'array' THEN\n",
+    "                val := (SELECT COALESCE(jsonb_agg(_pylon.tuple_json_object(elem, e) ORDER BY ord), '[]'::jsonb)\n",
+    "                        FROM jsonb_array_elements(val) WITH ORDINALITY AS u(e, ord));\n",
+    "            ELSIF elem IS NULL THEN\n",
+    "                val := _pylon.tuple_json_object(types[i], val);\n",
+    "            END IF;\n",
+    "        END IF;\n",
+    "        out := jsonb_set(out, ARRAY[names[i]], val);\n",
+    "    END LOOP;\n",
+    "    RETURN out;\n",
+    "END\n",
     "$$;\n\n",
     "CREATE OR REPLACE FUNCTION _pylon.populate_tuple(base anyelement, src jsonb)\n",
     "\tRETURNS anyelement\n",
-    "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
+    "\tLANGUAGE sql STABLE PARALLEL SAFE\n",
     "AS $$\n",
     // `base` is the NULL of the target type, so an absent value stays absent
     // rather than becoming a row of all-NULL members — which a composite
     // treats as `IS NULL` but not as `IS NOT DISTINCT FROM NULL`.
     "    SELECT CASE WHEN src IS NULL OR jsonb_typeof(src) = 'null' THEN base\n",
-    "                ELSE jsonb_populate_record(base, _pylon.tuple_json_object(src)) END\n",
+    "                ELSE jsonb_populate_record(base, _pylon.tuple_json_object(pg_typeof(base), src)) END\n",
     "$$;\n\n",
+    // The positional-only form the helper above replaces. Nothing but the
+    // old `populate_tuple` called it.
+    "DROP FUNCTION IF EXISTS _pylon.tuple_json_object(jsonb);\n\n",
     "CREATE OR REPLACE FUNCTION _pylon.populate_tuples(base anyelement, src jsonb)\n",
     "\tRETURNS anyarray\n",
-    "\tLANGUAGE sql IMMUTABLE PARALLEL SAFE\n",
+    "\tLANGUAGE sql STABLE PARALLEL SAFE\n",
     "AS $$\n",
     // An empty array is a value, and a different one from an absent array —
     // so the two have to be told apart here rather than both collapsing to

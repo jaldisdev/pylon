@@ -1714,6 +1714,7 @@ impl CompiledQuery {
                     let d = PyDict::new(py);
                     d.set_item("is_array", plan.is_array)?;
                     d.set_item("type_name", plan.type_name.as_deref())?;
+                    d.set_item("matched_to_column", plan.matched_to_column)?;
                     d.set_item(
                         "members",
                         PyList::new(

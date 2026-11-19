@@ -7840,6 +7840,94 @@ mod tuple_type_live_tests {
 
         pool.batch_execute(&format!("DROP TYPE \"{tuple}_t\";")).await.unwrap();
     }
+
+    /// A positional value fills a tuple's members in declaration order
+    /// whatever they are named. Mapped to `"0"`, `"1"`, … regardless, a
+    /// named tuple matched none of them and came out as `(,,)`, silently.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn a_positional_value_fills_a_named_tuple_in_member_order() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        crate::migrate::ensure_internal_schema(&pool).await.unwrap();
+
+        let rgb = unique_name("Rgb");
+        let pair = unique_name("Pair");
+        let swatch = unique_name("Swatch");
+        pool.batch_execute(&format!(
+            "CREATE TYPE \"{rgb}_t\" AS (\"r\" int2, \"g\" int2, \"b\" int2);
+             CREATE TYPE \"{pair}_t\" AS (\"0\" text, \"1\" int8);
+             CREATE TYPE \"{swatch}_t\" AS (\"label\" text, \"main\" \"{rgb}_t\", \"accents\" \"{rgb}_t\"[]);"
+        ))
+        .await
+        .unwrap();
+
+        let rows = pool
+            .query_typed(
+                &format!(
+                    "SELECT (
+                         _pylon.populate_tuple(NULL::\"{rgb}_t\", '[0, 73, 214]')::text,
+                         _pylon.populate_tuple(NULL::\"{rgb}_t\", '{{\"r\": 0, \"g\": 73, \"b\": 214}}')::text,
+                         _pylon.populate_tuple(NULL::\"{pair}_t\", '[\"a\", 1]')::text,
+                         _pylon.populate_tuple(
+                             NULL::\"{swatch}_t\", '[\"x\", [1, 2, 3], [[4, 5, 6], {{\"r\": 7, \"g\": 8, \"b\": 9}}]]')::text,
+                         _pylon.populate_tuples(NULL::\"{rgb}_t\", '[[1, 2, 3], [4, 5, 6]]')::text,
+                         _pylon.populate_tuple(NULL::\"{rgb}_t\", NULL::jsonb) IS NOT DISTINCT FROM NULL
+                     ) AS result"
+                ),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .unwrap();
+        let [pylon_value::DecodedValue::Composite(fields)] = rows.as_slice() else {
+            panic!("expected one row, got {rows:?}")
+        };
+        let str = |s: &str| pylon_value::DecodedValue::Str(s.into());
+        assert_eq!(
+            fields,
+            &vec![
+                str("(0,73,214)"),
+                str("(0,73,214)"),
+                str("(a,1)"),
+                str("(x,\"(1,2,3)\",\"{\"\"(4,5,6)\"\",\"\"(7,8,9)\"\"}\")"),
+                str("{\"(1,2,3)\",\"(4,5,6)\"}"),
+                pylon_value::DecodedValue::Bool(true),
+            ],
+        );
+
+        // A missing or extra member has no position to be told apart by, so
+        // it is refused rather than padded or dropped — at the top level and
+        // inside a nested tuple alike.
+        for src in ["[1, 2]", "[1, 2, 3, 4]"] {
+            let err = pool
+                .query_typed(
+                    &format!("SELECT _pylon.populate_tuple(NULL::\"{rgb}_t\", '{src}')::text AS result"),
+                    &[],
+                    &pool.types(),
+                )
+                .await
+                .expect_err(src);
+            assert!(err.to_string().contains("elements in the tuple"), "{src}: {err}");
+        }
+        let err = pool
+            .query_typed(
+                &format!("SELECT _pylon.populate_tuple(NULL::\"{swatch}_t\", '[\"x\", [1, 2], []]')::text AS result"),
+                &[],
+                &pool.types(),
+            )
+            .await
+            .expect_err("a nested tuple one member short");
+        assert!(
+            err.to_string().contains("expected 3 elements in the tuple, got 2"),
+            "{err}"
+        );
+
+        pool.batch_execute(&format!(
+            "DROP TYPE \"{swatch}_t\"; DROP TYPE \"{pair}_t\"; DROP TYPE \"{rgb}_t\";"
+        ))
+        .await
+        .unwrap();
+    }
 }
 
 #[cfg(test)]

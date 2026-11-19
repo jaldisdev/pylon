@@ -1083,6 +1083,143 @@ def test_a_tuple_parameter_takes_the_shapes_a_caller_holds_it_in(live_pool, uniq
     asyncio.run(run())
 
 
+def test_a_named_tuple_property_written_from_a_parameter_stores_its_members(live_pool, unique_module):
+    """A tuple parameter written into a named-tuple property keeps every member.
+
+    `<tuple<int16, int16, int16>>$rgb` names no members, so a list reached
+    the database as a json array read into the column by position-as-name —
+    `"0"`, `"1"`, `"2"` — which a tuple whose members are `r`, `g`, `b`
+    matched none of. Every member came out NULL, with no error. A dict was
+    worse: iterated as a sequence, it sent its own keys as the members.
+
+    Checked against the stored composite itself, since a Pylon read could
+    hide the very loss being tested for.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+    from pylon.exceptions import InvalidParameterTypeError
+
+    module = unique_module('live_named_tuple_params')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    async def run():
+        clear_registry()
+
+        @pylon.named_tuple
+        class Rgb(pylon.NamedTuple):
+            r: pylon.Int16
+            g: pylon.Int16
+            b: pylon.Int16
+
+        Rgb.__pylon_module__ = module
+
+        @pylon.type(module=module, name='Color')
+        class Color:
+            name: pylon.Str
+            rgb: Rgb
+            accent: Rgb | None
+            accents: pylon.Array[Rgb] | None
+            pair: pylon.Tuple[pylon.Str, pylon.Int64] | None
+
+        schema = _build_schema(*snapshot(), named_tuples=[Rgb])
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        async def stored(name: str, column: str = 'rgb') -> str | None:
+            rows = await live_pool.query(
+                f'SELECT "{column}"::text FROM "{module}"."Color" WHERE "name" = \'{name}\'',
+                [],
+            )
+            assert len(rows) == 1, rows
+            return rows[0]
+
+        casts = ('<tuple<int16, int16, int16>>', f'<{module}::Rgb>')
+        forms = ([1, 2, 3], (1, 2, 3), {'r': 1, 'g': 2, 'b': 3}, Rgb(r=1, g=2, b=3))
+        for cast_index, cast in enumerate(casts):
+            for form_index, value in enumerate(forms):
+                name = f'c{cast_index}{form_index}'
+                await client.query(
+                    f"insert {module}::Color {{ name := '{name}', rgb := {cast}$rgb }};",
+                    rgb=value,
+                )
+                assert await stored(name) == '(1,2,3)', (cast, value)
+
+                # An update reads the parameter the same way an insert does.
+                updated = {'r': 4, 'g': 5, 'b': 6} if isinstance(value, dict) else [4, 5, 6]
+                if isinstance(value, Rgb):
+                    updated = Rgb(r=4, g=5, b=6)
+                await client.query(
+                    f"update {module}::Color filter .name = '{name}' set {{ rgb := {cast}$rgb }};",
+                    rgb=updated,
+                )
+                assert await stored(name) == '(4,5,6)', (cast, updated)
+
+        # An absent optional tuple stays absent rather than becoming `(,,)`.
+        await client.query(
+            f"insert {module}::Color {{ name := 'opt', rgb := (r := 0, g := 0, b := 0), "
+            f'accent := <optional tuple<int16, int16, int16>>$accent }};',
+            accent=None,
+        )
+        assert await stored('opt', 'accent') is None
+        await client.query(
+            f"update {module}::Color filter .name = 'opt' "
+            'set { accent := <optional tuple<int16, int16, int16>>$accent };',
+            accent=[7, 8, 9],
+        )
+        assert await stored('opt', 'accent') == '(7,8,9)'
+
+        # Element-wise for an array of them, and positionally for a tuple
+        # whose members are unnamed — the one shape that always worked.
+        await client.query(
+            f"insert {module}::Color {{ name := 'many', rgb := (r := 0, g := 0, b := 0), "
+            f'accents := <array<tuple<int16, int16, int16>>>$accents, pair := <tuple<str, int64>>$pair }};',
+            accents=[[1, 2, 3], {'r': 4, 'g': 5, 'b': 6}],
+            pair=['left', 1],
+        )
+        assert await stored('many', 'accents') == '{"(1,2,3)","(4,5,6)"}'
+        assert await stored('many', 'pair') == '(left,1)'
+
+        # The member read back off the row the insert returns, which a
+        # traversal re-reading the table by id could not see.
+        written = await client.query_required_single(
+            f"select (insert {module}::Color {{ name := 'back', rgb := <tuple<int16, int16, int16>>$rgb }}) "
+            '{ r := .rgb.r, b := .rgb.b, rgb };',
+            rgb=[10, 20, 30],
+        )
+        assert (written.r, written.b) == (10, 30)
+        assert written.rgb == Rgb(r=10, g=20, b=30)
+
+        # A wrong member count is refused, not stored short or padded.
+        for cast, value in (
+            *((cast, value) for cast in casts for value in ([1, 2], [1, 2, 3, 4], (1, 2))),
+            (casts[0], {'r': 1, 'g': 2}),
+            (casts[0], {'r': 1, 'g': 2, 'b': 3, 'a': 4}),
+        ):
+            with pytest.raises(InvalidParameterTypeError, match='expected 3 elements'):
+                await client.query(
+                    f"insert {module}::Color {{ name := 'short', rgb := {cast}$rgb }};",
+                    rgb=value,
+                )
+        assert await client.query(f"select {module}::Color filter .name = 'short';") == []
+
+        # With no column to match a dict's names against, there is nothing
+        # to read it by.
+        with pytest.raises(InvalidParameterTypeError, match='no member names'):
+            await client.query_single('select <tuple<int16, int16, int16>>$value;', value={'r': 1, 'g': 2, 'b': 3})
+        assert await client.query_single('select <tuple<int16, int16, int16>>$value;', value=[1, 2, 3]) == (1, 2, 3)
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
 def test_a_month_bearing_duration_survives_the_round_trip(live_pool, unique_module):
     """`cal::date_duration` and `cal::relative_duration` carry months, and a
     `datetime.timedelta` cannot.

@@ -2196,6 +2196,7 @@ impl<'a> Compiler<'a> {
                 type_name: shape.type_name.clone(),
                 members: shape.members.clone(),
                 as_composite: composite.is_some(),
+                matched_to_column: false,
             });
             if let Some(pg_type) = composite {
                 return IrExpr::TypeCast(Box::new(IrTypeCast {
@@ -3240,7 +3241,7 @@ impl<'a> Compiler<'a> {
     /// object its member names describe. `to_jsonb` is the identity on the
     /// jsonb a parameter arrives as and turns a composite into that same
     /// object, so one expression covers every way a tuple can be handed in.
-    fn column_tuple_value(&self, expr: IrExpr, prop: &PropertyDescriptor, module: &str) -> IrExpr {
+    fn column_tuple_value(&mut self, expr: IrExpr, prop: &PropertyDescriptor, module: &str) -> IrExpr {
         let Some(column_type) = crate::schema::tuple_type::property_column_type(prop, module) else {
             return expr;
         };
@@ -3251,6 +3252,14 @@ impl<'a> Compiler<'a> {
         // row form does not apply to it element-wise here.
         let is_array = column_type.ends_with("[]");
         let members = self.property_tuple_members(prop).unwrap_or_default();
+        if let IrExpr::TypeCast(cast) = &expr
+            && let IrExpr::Param { index } = &cast.expr
+            && !members.is_empty()
+            && members.iter().all(|m| m.name.is_some())
+            && let Some(Some(plan)) = self.param_tuple_types.get_mut(*index)
+        {
+            plan.matched_to_column = true;
+        }
         let row = match is_array {
             false => self.tuple_literal_as_row(&expr, &members, &column_type, module),
             true => None,
@@ -3387,7 +3396,7 @@ impl<'a> Compiler<'a> {
     /// Two tuple columns are left alone: they already have a type each, and
     /// reading one back out of json would only lose it.
     fn reconcile_tuple_comparison(
-        &self,
+        &mut self,
         left: IrExpr,
         right: IrExpr,
         ctx: Option<(&TypeDescriptor, &str)>,
@@ -3496,6 +3505,59 @@ impl<'a> Compiler<'a> {
             ast::TypeExpr::Array { element } => element,
             other => other,
         }
+    }
+
+    /// `base` — tuple property `prop`'s value — read down `steps`, one
+    /// member per step.
+    ///
+    /// Walked alongside the declared members so each step reads a member that
+    /// is really there, with the type it is declared with — a composite has
+    /// no "absent member" to hand back as NULL the way a jsonb lookup did.
+    fn read_tuple_members(
+        &self,
+        base: IrExpr,
+        prop: &PropertyDescriptor,
+        td: &TypeDescriptor,
+        steps: &[ast::PathStep],
+    ) -> Result<IrExpr, PyQLError> {
+        let mut ir = base;
+        let mut members = self.property_tuple_members(prop);
+        for step in steps {
+            let field = match step {
+                ast::PathStep::Name(n) => n.clone(),
+                _ => return Err(self.type_err("only field name steps are valid inside a named tuple")),
+            };
+            let member = members
+                .as_ref()
+                .and_then(|ms| ms.iter().find(|m| m.name.as_deref() == Some(field.as_str())).cloned());
+            let pg_type = match &member {
+                Some(m) => self.tuple_member_pg_type(&m.kind),
+                // Nothing to check it against — a nominal member whose own
+                // declaration is missing is reported where that declaration
+                // is resolved.
+                None if members.is_none() => None,
+                None => {
+                    let known: Vec<String> = members
+                        .as_ref()
+                        .map(|ms| ms.iter().filter_map(|m| m.name.clone()).collect())
+                        .unwrap_or_default();
+                    return Err(self.type_err(&format!(
+                        "'{field}' is not a member of tuple property '{}' on {}::{} (it has {})",
+                        prop.name,
+                        td.module,
+                        td.name,
+                        known.join(", ")
+                    )));
+                }
+            };
+            members = member.as_ref().and_then(|m| self.tuple_member_members(&m.kind));
+            ir = IrExpr::CompositeField {
+                expr: Box::new(ir),
+                field,
+                pg_type,
+            };
+        }
+        Ok(ir)
     }
 
     /// A tuple property's members, nominal or structural — `None` for a
@@ -4961,48 +5023,7 @@ impl<'a> Compiler<'a> {
                             column: p.name.clone(),
                             pg_type: p.pg_type.clone(),
                         };
-                        let remaining = &steps[idx + 1..];
-                        let mut ir: IrExpr = base;
-                        // Walked alongside the path so each step reads a member
-                        // that is really there, with the type it is declared
-                        // with — a composite has no "absent member" to hand
-                        // back as NULL the way a jsonb lookup did.
-                        let mut members = self.property_tuple_members(p);
-                        for step in remaining {
-                            let field = match step {
-                                ast::PathStep::Name(n) => n.clone(),
-                                _ => return Err(self.type_err("only field name steps are valid inside a named tuple")),
-                            };
-                            let member = members
-                                .as_ref()
-                                .and_then(|ms| ms.iter().find(|m| m.name.as_deref() == Some(field.as_str())).cloned());
-                            let pg_type = match &member {
-                                Some(m) => self.tuple_member_pg_type(&m.kind),
-                                // Nothing to check it against — a nominal member
-                                // whose own declaration is missing is reported
-                                // where that declaration is resolved.
-                                None if members.is_none() => None,
-                                None => {
-                                    let known: Vec<String> = members
-                                        .as_ref()
-                                        .map(|ms| ms.iter().filter_map(|m| m.name.clone()).collect())
-                                        .unwrap_or_default();
-                                    return Err(self.type_err(&format!(
-                                        "'{field}' is not a member of tuple property '{}' on {}::{} (it has {})",
-                                        p.name,
-                                        current_td.module,
-                                        current_td.name,
-                                        known.join(", ")
-                                    )));
-                                }
-                            };
-                            members = member.as_ref().and_then(|m| self.tuple_member_members(&m.kind));
-                            ir = IrExpr::CompositeField {
-                                expr: Box::new(ir),
-                                field,
-                                pg_type,
-                            };
-                        }
+                        let ir = self.read_tuple_members(base, p, current_td, &steps[idx + 1..])?;
                         let (filter, order_by, offset, limit) = self.compile_path_modifiers_scoped(
                             sel,
                             current_td,
@@ -15363,6 +15384,25 @@ impl<'a> Compiler<'a> {
         // pointer, so there is no trailing column for the two-step form to
         // read and it goes the way a longer traversal already does.
         let narrows_last = matches!(p.steps.last(), Some(ast::PathStep::TypeIntersection(_)));
+
+        // `.rgb.r` — a member of a tuple this row holds is read off this row.
+        // Walked as a traversal it re-read the row from the type's table by
+        // id, which over a DML result (`select (insert …) { r := .rgb.r }`)
+        // is a row the same statement cannot see yet, so it read as empty.
+        if p.partial
+            && p.steps.len() > 1
+            && let Some(ast::PathStep::Name(first)) = p.steps.first()
+            && let Some(prop) = td.properties.iter().find(|prop| &prop.name == first)
+            && (prop.pg_type.starts_with("__nt__:") || prop.tuple_members.is_some())
+            && !prop.pg_type.ends_with("[]")
+        {
+            let base = IrExpr::ColumnRef {
+                alias: alias.to_string(),
+                column: prop.name.clone(),
+                pg_type: prop.pg_type.clone(),
+            };
+            return self.read_tuple_members(base, prop, td, &p.steps[1..]);
+        }
 
         if p.steps.len() == 2 && !narrows_last {
             return self.compile_path_2step(p, td, alias);
