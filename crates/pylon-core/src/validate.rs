@@ -1300,4 +1300,19 @@ mod tests {
         let errors = validate_schema_types(&minimal_schema(vec![td], vec![])).unwrap_err();
         assert!(errors.iter().any(|e| e.to_string().contains("names 'brand'")));
     }
+
+    /// A default is applied by the insert that omits its pointer, before the
+    /// row exists, so one reading another of the row's pointers has nothing
+    /// to read and is reported here rather than by that insert.
+    #[test]
+    fn a_default_reading_the_row_it_fills_is_rejected() {
+        let mut nickname = base_property("nickname", "text");
+        nickname.default_pyql = Some(".name".into());
+        let td = person_type(vec![], vec![base_property("name", "text"), nickname]);
+        let errors = validate_schema_types(&minimal_schema(vec![td], vec![])).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.to_string().contains("does not exist yet")),
+            "got {errors:#?}"
+        );
+    }
 }

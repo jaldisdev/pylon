@@ -113,8 +113,16 @@ from the same version number.
   being updated, as a shape already allows: `preview := (select .preview
   filter .id != design_system.id)` keeps the link unless it equals the new
   value, in one statement. It was refused with "expected a type name as
-  SELECT subject". In an insert there is no row to walk from yet, and the
-  same select is refused with an error that says so.
+  SELECT subject".
+* A relative path in an insert's values — `name := .name`, `company :=
+  .company`, `posts := (select .posts)`, `exists .company`, `count(.posts)`
+  — is refused when the query compiles. It reads the row being inserted,
+  which does not exist yet, and compiled to SQL naming a table the INSERT
+  has no `FROM` for, so it failed only when it ran; on a multi-link it read
+  back the new row's junction rows, which are always empty. The same holds
+  for a nested insert's values and for a default, which an insert applies
+  the same way: a default reading another of the row's pointers is now a
+  schema error.
 
 ### Reading
 

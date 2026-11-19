@@ -1537,6 +1537,7 @@ pub fn compile_inlined_default(
     let td = c.resolve_type(type_name)?;
     let alias = c.fresh_alias();
     let element = default_shape_element(pointer, crate::parse::parse_pointer_expr(pyql)?);
+    c.unwritten_rows.push(alias.clone());
     let mut assignments = c.compile_assignments(&[element], td, &alias)?;
     Ok(assignments.remove(0))
 }
@@ -5393,7 +5394,7 @@ impl<'a> Compiler<'a> {
                         };
                         let mut inner =
                             self.compile_path_select_with_tail(&inner_sel, &inner_path, &[], false, field_steps, &[])?;
-                        Self::correlate_path_select(&mut inner, &current_alias);
+                        self.correlate_to_row(&mut inner, &current_alias)?;
                         let IrPathResult::Object { type_name, .. } = &inner.result else {
                             return Err(self.type_err(&format!(
                                 "computed pointer '{step_name}' is a scalar — a path cannot continue through it"
@@ -6183,6 +6184,11 @@ impl<'a> Compiler<'a> {
         operand: &Expr,
         ctx: Option<(&TypeDescriptor, &str)>,
     ) -> Result<IrExpr, PyQLError> {
+        if let (Expr::Path(p), Some((_, alias))) = (operand, ctx)
+            && p.partial
+        {
+            self.refuse_unwritten_row(alias)?;
+        }
         match operand {
             // exists $param  /  exists <type>$param → $N IS NOT NULL
             Expr::Parameter(name) => {
@@ -6311,7 +6317,7 @@ impl<'a> Compiler<'a> {
                     lock: None,
                 };
                 let mut ps = self.compile_path_select(&rooted, &full_path, &[], false)?;
-                Self::correlate_path_select(&mut ps, alias);
+                self.correlate_to_row(&mut ps, alias)?;
                 Ok(IrExpr::UnaryOp(Box::new(IrUnaryOp {
                     op: ast::UnaryOpKind::Exists,
                     operand: IrExpr::PathSubquery(Box::new(ps)),
@@ -6397,6 +6403,7 @@ impl<'a> Compiler<'a> {
         target: &str,
         through: &Option<String>,
     ) -> Result<IrSelect, PyQLError> {
+        self.refuse_unwritten_row(alias)?;
         let jt_alias = self.fresh_alias();
         let (jt_table, jt_module, jt_src_col, _, _) = self.junction_info_for(td, name, target, through)?;
 
@@ -8619,12 +8626,6 @@ impl<'a> Compiler<'a> {
                     && let Expr::Path(path) = &sel.result
                     && path.partial =>
             {
-                if self.unwritten_rows.iter().any(|row| row == alias) {
-                    return Err(self.type_err(
-                        "a relative path in an insert reads the row being inserted, which does not \
-                         exist yet; select from a type or a `with` binding instead",
-                    ));
-                }
                 let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
                 steps.extend(path.steps.iter().cloned());
                 let rooted = ast::Path { steps, partial: false };
@@ -8648,7 +8649,7 @@ impl<'a> Compiler<'a> {
                     },
                     None,
                 );
-                Self::correlate_path_select(&mut ps, alias);
+                self.correlate_to_row(&mut ps, alias)?;
                 Ok(Some(IrExpr::PathSubquery(Box::new(ps))))
             }
             // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
@@ -8784,7 +8785,7 @@ impl<'a> Compiler<'a> {
         };
         let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
         if let Some(alias) = correlate {
-            Self::correlate_path_select(&mut ps, &alias);
+            self.correlate_to_row(&mut ps, &alias)?;
         }
         let IrPathResult::Object { alias, type_name, .. } = &ps.result else {
             return Err(self.type_err(&format!(
@@ -9085,6 +9086,9 @@ impl<'a> Compiler<'a> {
         }
         let mut multi_link_appends = vec![];
         let mut scalar_elements: Vec<ShapeElement> = vec![];
+        // Left in place if a value fails to compile: the alias is fresh, so
+        // nothing else can name it.
+        self.unwritten_rows.push(alias.clone());
         for el in &shape {
             let pointer_name = match path_leaf(&el.path) {
                 Ok(n) => n,
@@ -9150,10 +9154,8 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        self.unwritten_rows.push(alias.clone());
-        let assignments = self.compile_assignments(&scalar_elements, td, &alias);
-        self.unwritten_rows.pop();
-        let assignments = assignments?;
+        let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
+        self.unwritten_rows.retain(|row| *row != alias);
         // Rewrites apply in the table's own `BEFORE` trigger — see
         // `export::rewrite_trigger_infos`.
         let rewrites = vec![];
@@ -10273,7 +10275,7 @@ impl<'a> Compiler<'a> {
                 lock: None,
             };
             let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
-            Self::correlate_path_select(&mut ps, alias);
+            self.correlate_to_row(&mut ps, alias)?;
             return Ok(IrMultiLinkValues {
                 source: IrMultiLinkValueSource::PathSelect(Box::new(ps)),
                 link_props: vec![],
@@ -11361,7 +11363,7 @@ impl<'a> Compiler<'a> {
             lock: None,
         };
         let mut path_select = self.compile_path_select_with_tail(&synthetic, &full_path, nested, false, tail, &[])?;
-        Self::correlate_path_select(&mut path_select, alias);
+        self.correlate_to_row(&mut path_select, alias)?;
         // A walk that crosses a multi step stands for a set, so it is
         // aggregated; one that cannot is a single object and is read as one,
         // rather than an array of length one.
@@ -12274,7 +12276,7 @@ impl<'a> Compiler<'a> {
                     lock: None,
                 };
                 let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
-                Self::correlate_path_select(&mut ps, alias);
+                self.correlate_to_row(&mut ps, alias)?;
                 branches.push(ps);
             }
             let limit = inner
@@ -12534,7 +12536,7 @@ impl<'a> Compiler<'a> {
 
         let mut ps = self.compile_path_select_with_tail(sel, &full_path, outer_shape, false, extra_steps.len(), &[])?;
         if let Some(outer_alias) = correlate {
-            Self::correlate_path_select(&mut ps, &outer_alias);
+            self.correlate_to_row(&mut ps, &outer_alias)?;
         }
         // A shape written after the projection (`(select … limit 1).account
         // { id, name }`) says the object was wanted, not its id, so the walk
@@ -12737,7 +12739,7 @@ impl<'a> Compiler<'a> {
                 lock: None,
             };
             let mut ps = self.compile_path_select(&synthetic, &rooted, elements, false)?;
-            Self::correlate_path_select(&mut ps, alias);
+            self.correlate_to_row(&mut ps, alias)?;
             let guards: Vec<IrExpr> = branches
                 .iter()
                 .map(|earlier| {
@@ -12953,7 +12955,7 @@ impl<'a> Compiler<'a> {
             lock: None,
         };
         let mut ps = self.compile_path_select(&synthetic, &full_path, &[], false)?;
-        Self::correlate_path_select(&mut ps, alias);
+        self.correlate_to_row(&mut ps, alias)?;
         if multi && matches!(ps.result, IrPathResult::Scalar(..)) {
             Ok(IrExpr::ArrayFromSelect(Box::new(IrArraySource::PathSelect(Box::new(
                 ps,
@@ -12999,13 +13001,33 @@ impl<'a> Compiler<'a> {
             lock: None,
         };
         let mut ps = self.compile_path_select(&synthetic, &rooted, shape, false)?;
-        Self::correlate_path_select(&mut ps, alias);
+        self.correlate_to_row(&mut ps, alias)?;
         Ok(Some(ps))
     }
 
     /// Tie a path select's root row to the enclosing row by primary key —
     /// what makes a relative path's subquery see only the current object's
     /// side of the graph.
+    /// A relative path read off `alias` needs a row there to read. The row an
+    /// insert is compiling the values for has none yet: compiled anyway, the
+    /// walk names a table the INSERT has no FROM for, and fails when it runs.
+    fn refuse_unwritten_row(&self, alias: &str) -> Result<(), PyQLError> {
+        if self.unwritten_rows.iter().any(|row| row == alias) {
+            return Err(self.type_err(
+                "a relative path in an insert reads the row being inserted, which does not \
+                 exist yet; select from a type or a `with` binding instead",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `correlate_path_select`, refusing a row an insert has not written.
+    fn correlate_to_row(&self, ps: &mut IrPathSelect, outer_alias: &str) -> Result<(), PyQLError> {
+        self.refuse_unwritten_row(outer_alias)?;
+        Self::correlate_path_select(ps, outer_alias);
+        Ok(())
+    }
+
     fn correlate_path_select(ps: &mut IrPathSelect, outer_alias: &str) {
         // A trigger's own row may not be in its table yet (`BEFORE INSERT`):
         // the walk starts from the row itself.
@@ -13976,7 +13998,7 @@ impl<'a> Compiler<'a> {
                             let root = format!("{}::{}", td.module, td.name);
                             let mut ps =
                                 self.compile_expr_as_path_select(&synthetic, &synthetic.result, &root, false)?;
-                            Self::correlate_path_select(&mut ps, alias);
+                            self.correlate_to_row(&mut ps, alias)?;
                             return Ok(aggregate_over_nothing(&f.name, IrExpr::PathSubquery(Box::new(ps))));
                         }
                         if let Expr::Path(p) = arg
@@ -14667,7 +14689,7 @@ impl<'a> Compiler<'a> {
                         lock: None,
                     };
                     let mut ps = self.compile_path_select(&synthetic, &rooted, &elements, false)?;
-                    Self::correlate_path_select(&mut ps, alias);
+                    self.correlate_to_row(&mut ps, alias)?;
                     branches.push(ps);
                 }
                 Ok(IrExpr::ObjectPathUnion {
@@ -15182,6 +15204,9 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_path(&mut self, p: &ast::Path, td: &TypeDescriptor, alias: &str) -> Result<IrExpr, PyQLError> {
+        if p.partial {
+            self.refuse_unwritten_row(alias)?;
+        }
         if !p.partial {
             if p.steps.len() == 1
                 && let ast::PathStep::Name(n) = &p.steps[0]

@@ -10514,6 +10514,51 @@ mod tests {
         assert_eq!(super::forward_cte_reference(good), None, "ordered CTEs must pass");
     }
 
+    /// A relative path in an insert's values reads the row being inserted,
+    /// which has no row to read yet. Each form below compiled, to SQL naming
+    /// an alias the INSERT has no FROM for — or, for a multi-link, to a read
+    /// of junction rows that cannot exist — and failed only when it ran.
+    #[test]
+    fn test_an_insert_refuses_a_relative_path_in_its_values() {
+        let schema = make_schema();
+        for query in [
+            "insert Person { name := .name }",
+            "insert Person { name := .company.name }",
+            "insert Person { name := 'x', company := .company }",
+            "insert Person { name := 'x', company := (select .company limit 1) }",
+            "insert Person { name := 'x', posts := (select .posts) }",
+            "insert Person { name := 'x' if exists .company else 'y' }",
+            "insert Person { name := <str>count(.posts) }",
+            "insert Person { name := (select .company limit 1).name }",
+            "update Person set { company := (insert Company { name := .name }) }",
+        ] {
+            let ast = parse::parse(query).expect("parse failed");
+            let Err(err) = ir::compile(&ast, &schema) else {
+                panic!("`{query}` should be refused");
+            };
+            assert!(
+                err.to_string().contains("does not exist yet"),
+                "`{query}`: unexpected error: {err}"
+            );
+        }
+    }
+
+    /// The same paths are the row's own in an update, and in values that
+    /// select from a type or walk a binding.
+    #[test]
+    fn test_relative_paths_still_compile_where_there_is_a_row() {
+        for query in [
+            "update Person set { name := .name ++ '!', company := .company }",
+            "update Person set { company := (select .company limit 1), posts += (select .posts) }",
+            "update Person set { name := <str>count(.posts) }",
+            "insert Person { name := (select Person filter .age > 1 limit 1).name }",
+            "with p := (select Person limit 1) insert Person { name := p.name, company := p.company }",
+            "select (insert Person { name := 'x' }) { name, n := .name }",
+        ] {
+            compile_and_emit(query);
+        }
+    }
+
     /// `.status IN <Enum>array_unpack($1)` — the cast sits between `IN` and
     /// the unpack, and used to hide it, leaving a set-returning function in a
     /// `WHERE` that PostgreSQL rejects at execution time.
