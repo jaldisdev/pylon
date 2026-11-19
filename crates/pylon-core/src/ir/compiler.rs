@@ -1681,6 +1681,9 @@ struct Compiler<'a> {
     /// so each row is of exactly the type compiled against. See
     /// `is_exact_row`.
     exact_rows: Vec<String>,
+    /// Aliases of rows an insert is compiling the values for: until it runs
+    /// there is no such row, so a walk from it has nothing to read.
+    unwritten_rows: Vec<String>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
     /// Nested DML hoisted out of a link-assignment value currently being
@@ -1822,6 +1825,7 @@ impl<'a> Compiler<'a> {
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
             exact_rows: Vec::new(),
+            unwritten_rows: Vec::new(),
             global_ctes: vec![],
             pending_nested_ctes: vec![],
             junction_read_overrides: HashMap::new(),
@@ -8590,6 +8594,46 @@ impl<'a> Compiler<'a> {
                 }
                 Ok(Some(IrExpr::ScalarSubquery(Box::new(select))))
             }
+            // `preview := (select .preview filter .id != system.id)` — a path
+            // relative to the row being written, rooted at its type and
+            // correlated back to it, read for the key of the row it lands on.
+            Expr::SubQuery(inner_stmt)
+                if let Stmt::Select(sel) = inner_stmt.as_ref()
+                    && let Expr::Path(path) = &sel.result
+                    && path.partial =>
+            {
+                if self.unwritten_rows.iter().any(|row| row == alias) {
+                    return Err(self.type_err(
+                        "a relative path in an insert reads the row being inserted, which does not \
+                         exist yet; select from a type or a `with` binding instead",
+                    ));
+                }
+                let mut steps = vec![ast::PathStep::Name(format!("{}::{}", td.module, td.name))];
+                steps.extend(path.steps.iter().cloned());
+                let rooted = ast::Path { steps, partial: false };
+                let synthetic = ast::SelectStmt {
+                    result: Expr::Path(rooted.clone()),
+                    filter: sel.filter.clone(),
+                    order_by: sel.order_by.clone(),
+                    offset: sel.offset.clone(),
+                    limit: sel.limit.clone(),
+                    lock: None,
+                };
+                let mut ps = self.compile_path_select(&synthetic, &rooted, &[], false)?;
+                let IrPathResult::Object { alias: target, .. } = &ps.result else {
+                    return Err(self.type_err("a link can only be set to a path that lands on objects"));
+                };
+                ps.result = IrPathResult::Scalar(
+                    IrExpr::ColumnRef {
+                        alias: target.clone(),
+                        column: "id".to_string(),
+                        pg_type: "uuid".to_string(),
+                    },
+                    None,
+                );
+                Self::correlate_path_select(&mut ps, alias);
+                Ok(Some(IrExpr::PathSubquery(Box::new(ps))))
+            }
             // Link assignment via subquery: `company := (SELECT Company FILTER ...)`
             // Compile as a scalar subquery returning the target pk (the FK uuid).
             Expr::SubQuery(inner_stmt) => self.compile_link_subquery(inner_stmt).map(Some),
@@ -9089,7 +9133,10 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let assignments = self.compile_assignments(&scalar_elements, td, &alias)?;
+        self.unwritten_rows.push(alias.clone());
+        let assignments = self.compile_assignments(&scalar_elements, td, &alias);
+        self.unwritten_rows.pop();
+        let assignments = assignments?;
         // Rewrites apply in the table's own `BEFORE` trigger — see
         // `export::rewrite_trigger_infos`.
         let rewrites = vec![];

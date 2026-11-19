@@ -210,3 +210,98 @@ async fn bindings_holding_exists_over_another_bindings_link_combine_in_a_filter(
         .await
         .unwrap();
 }
+
+/// `set { preview := (select .preview filter .id != system.id) }` keeps a link
+/// unless it equals the value another pointer is being set to — a path
+/// select over the row being updated, as a shape already allows, which `set`
+/// refused with "expected a type name as SELECT subject".
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn an_update_sets_a_link_from_a_path_select_on_its_own_row() {
+    let m = unique_module("live_with_update_path");
+    let sd = schema(&m);
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(&sd).unwrap()).await.unwrap();
+
+    for setup in [
+        format!("insert {m}::System {{ name := 'one' }}"),
+        format!("insert {m}::System {{ name := 'two' }}"),
+        format!("insert {m}::Corporate {{ name := 'kept', preview := (select {m}::System filter .name = 'one') }}"),
+        format!("insert {m}::Corporate {{ name := 'cleared', preview := (select {m}::System filter .name = 'two') }}"),
+    ] {
+        run(&pool, &sd, &setup).await;
+    }
+
+    // Once through the type itself and once through the interface, whose
+    // update is written once per implementor.
+    for (subject, brand) in [("Corporate", "kept"), ("Brand", "cleared")] {
+        run(
+            &pool,
+            &sd,
+            &format!(
+                "with system := (select {m}::System filter .name = 'two' limit 1) \
+                 update {m}::{subject} \
+                 filter .name = '{brand}' \
+                 set {{ \
+                   system := system, \
+                   preview := (select .preview filter .id != system.id) \
+                 }}"
+            ),
+        )
+        .await;
+    }
+
+    let rows = run(
+        &pool,
+        &sd,
+        &format!(
+            "select {m}::Corporate {{ name, system_name := .system.name, preview_name := .preview.name }} \
+             order by .name"
+        ),
+    )
+    .await;
+    let seen: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| match row {
+            DecodedValue::Composite(fields) => fields[2..]
+                .iter()
+                .map(|f| match f {
+                    DecodedValue::Str(s) => s.clone(),
+                    DecodedValue::Null => "{}".into(),
+                    other => format!("{other:?}"),
+                })
+                .collect(),
+            other => panic!("expected a Composite-shaped row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            vec!["cleared".to_string(), "two".into(), "{}".into()],
+            vec!["kept".to_string(), "two".into(), "one".into()],
+        ],
+        "a preview equal to the new system is cleared, any other kept"
+    );
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{m}\" CASCADE;"))
+        .await
+        .unwrap();
+}
+
+/// The same path select in an insert has no row to read yet, so it is refused
+/// when compiled rather than emitted as a correlation to a row the INSERT has
+/// no FROM for.
+#[test]
+fn an_insert_refuses_a_path_select_on_the_row_it_writes() {
+    let sd = schema("m");
+    let err = query::compile(
+        "insert m::Corporate { name := 'x', preview := (select .preview limit 1) }",
+        &sd,
+    )
+    .expect_err("an insert has no row of its own to walk from");
+    assert!(
+        err.to_string().contains("does not exist yet"),
+        "unexpected error: {err}"
+    );
+}

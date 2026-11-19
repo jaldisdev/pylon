@@ -103,6 +103,12 @@ from the same version number.
   always wrote both. The shape's read of the multi-link — and of one
   written by an insert into such a type — now sees the junction rows the
   statement wrote, where it read back an empty set.
+* A link in `update … set` can be set from a path select over the row
+  being updated, as a shape already allows: `preview := (select .preview
+  filter .id != design_system.id)` keeps the link unless it equals the new
+  value, in one statement. It was refused with "expected a type name as
+  SELECT subject". In an insert there is no row to walk from yet, and the
+  same select is refused with an error that says so.
 
 ### Reading
 
