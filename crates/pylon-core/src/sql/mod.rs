@@ -141,11 +141,14 @@ fn forward_cte_reference(sql: &str) -> Option<String> {
         .collect();
     for (name, defined_at) in &definitions {
         // A bare quoted name is a CTE; a real relation is always schema
-        // qualified (`"marketplace"."Order"`), so these never collide.
+        // qualified (`"marketplace"."Order"`). A binding may share its name
+        // with a module, so a match followed by `.` is that module's table.
         let quoted = qi(name);
         for prefix in ["FROM ", "JOIN ", "CROSS JOIN "] {
             let needle = format!("{prefix}{quoted}");
-            if let Some(used_at) = sql.find(&needle)
+            if let Some((used_at, _)) = sql
+                .match_indices(&needle)
+                .find(|(at, _)| !sql[at + needle.len()..].starts_with('.'))
                 && used_at < *defined_at
             {
                 return Some(format!(
@@ -10557,6 +10560,22 @@ mod tests {
         ] {
             compile_and_emit(query);
         }
+    }
+
+    /// `with account := (insert account::Organization { … })` — a binding
+    /// named after a module reads that module's tables before it is defined,
+    /// and those reads are not reads of the binding.
+    #[test]
+    fn test_the_cte_order_check_ignores_a_module_sharing_a_bindings_name() {
+        let sql = "WITH \"owner\" AS (\n SELECT * FROM \"account\".\"Individual\"\n),\n\"account\" AS (\n \
+                   INSERT INTO \"account\".\"Organization\" DEFAULT VALUES RETURNING *\n)\nSELECT * FROM \"account\"";
+        assert_eq!(super::forward_cte_reference(sql), None);
+        let bad = "WITH \"b\" AS (\n SELECT * FROM \"account\".\"T\" JOIN \"account\" ON true\n),\n\
+                   \"account\" AS (\n SELECT 1\n)\nSELECT 1";
+        assert!(
+            super::forward_cte_reference(bad).is_some(),
+            "a bare read before the binding is still one"
+        );
     }
 
     /// `.status IN <Enum>array_unpack($1)` — the cast sits between `IN` and
