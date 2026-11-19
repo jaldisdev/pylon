@@ -62,6 +62,23 @@ from the same version number.
   read back empty however the tuple was written. Filters on a member lose
   the extra self-join as well.
 
+### Triggers
+
+* A trigger handler on a concrete type that has subtypes can read
+  `__new__.__type__` and `__old__.__type__` again. It compiled to a read of
+  a `__type__` column, which only the union over the type and its subtypes
+  carries; the type's own table has none, so every insert or update the
+  trigger fired on failed with "column __type__ does not exist". A trigger
+  only ever sees rows of the table it is installed on, so the value is now
+  that type's name, as it already was for a type without subtypes. The same
+  holds for a rewrite, and for `__subject__.__type__` in a type's
+  `Expression` constraint. The compiled body names the trigger, so the next
+  `pylon migration create` replaces the broken trigger functions.
+* `__new__ is T` and `__old__ is T` inside a trigger handler test the row
+  the trigger fired for. Written inside the handler's own statement —
+  `insert Log { flag := __new__ is Admin }` — they tested that statement's
+  type (`Log`) instead, and so were always false.
+
 ## 0.10.0 — 2026-11-09
 
 ### Migrations

@@ -1358,7 +1358,10 @@ pub fn compile_constraint_expr(
             position: Position { line: 0, col: 0 },
         }));
     };
-    let (ir, _params) = compile_expr_unaliased(&sel.result, type_name, schema)?;
+    let mut c = Compiler::new(schema);
+    let td = c.resolve_type(type_name)?;
+    c.exact_rows.push(String::new());
+    let ir = c.compile_expr(&sel.result, td, "")?;
     Ok(crate::sql::emit_expr(&ir))
 }
 
@@ -1643,6 +1646,10 @@ struct Compiler<'a> {
     /// trigger) is simply absent from this map, and fails resolution the
     /// same way any other unknown identifier does.
     special_anchors: HashMap<String, (&'a TypeDescriptor, String)>,
+    /// Aliases besides the `special_anchors` that read one row of a single
+    /// table — a CHECK constraint's bare columns — so the row is of exactly
+    /// the type compiled against. See `is_exact_row`.
+    exact_rows: Vec<String>,
     /// Global CTEs collected during compilation (session and computed), in dependency order.
     global_ctes: Vec<IrGlobalCte>,
     /// Nested DML hoisted out of a link-assignment value currently being
@@ -1782,6 +1789,7 @@ impl<'a> Compiler<'a> {
             expanding_computeds: vec![],
             fn_params: HashMap::new(),
             special_anchors: HashMap::new(),
+            exact_rows: Vec::new(),
             global_ctes: vec![],
             pending_nested_ctes: vec![],
             junction_read_overrides: HashMap::new(),
@@ -4970,15 +4978,7 @@ impl<'a> Compiler<'a> {
                     );
                 }
                 let polymorphic = self.is_polymorphic(current_td);
-                let expr = if polymorphic {
-                    IrExpr::ColumnRef {
-                        alias: current_alias.clone(),
-                        column: "__type__".to_string(),
-                        pg_type: "text".to_string(),
-                    }
-                } else {
-                    IrExpr::Literal(IrLiteral::Str(format!("{}::{}", current_td.module, current_td.name)))
-                };
+                let expr = self.type_name_of(current_td, &current_alias);
                 // A CTE-backed root already carries the discriminator column
                 // from the binding's own polymorphic expansion; re-expanding it
                 // here would read the base type again and drop the binding's
@@ -10952,19 +10952,10 @@ impl<'a> Compiler<'a> {
         // It's always injected at position 0 for internal use; explicit inclusion adds
         // it as a regular computed pointer at a later position so Python can read it.
         if pointer_name == "__type__" && el.compexpr.is_none() {
-            let expr = if self.is_polymorphic(td) {
-                IrExpr::ColumnRef {
-                    alias: alias.to_string(),
-                    column: "__type__".to_string(),
-                    pg_type: "text".to_string(),
-                }
-            } else {
-                IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
-            };
             return Ok(IrShapePointer::Computed(IrComputedPointer {
                 marker_offset: el.marker_offset,
                 alias: "__type__".to_string(),
-                expr,
+                expr: self.type_name_of(td, alias),
             }));
         }
 
@@ -14801,6 +14792,20 @@ impl<'a> Compiler<'a> {
         alias: &str,
         set_valued: bool,
     ) -> Result<IrExpr, PyQLError> {
+        // `__new__ is T` tests the trigger's row, whatever scope it is
+        // written in.
+        if let Expr::Path(p) = expr
+            && let [ast::PathStep::Name(n)] = p.steps.as_slice()
+            && !p.partial
+            && let Some((anchor_td, anchor_alias)) = self.special_anchors.get(n).cloned()
+        {
+            let self_expr = Expr::Path(ast::Path {
+                steps: vec![ast::PathStep::Name(anchor_td.name.clone())],
+                partial: false,
+            });
+            return self.compile_type_is_inner(&self_expr, ty, anchor_td, &anchor_alias, set_valued);
+        }
+
         let self_qname = format!("{}::{}", td.module, td.name);
 
         // `.listing is T`, `x is T`: the objects the path reaches are tested,
@@ -14921,7 +14926,7 @@ impl<'a> Compiler<'a> {
         if check_qname == source_qname || Self::is_or_implements(td, check_qname) {
             return IrExpr::Literal(IrLiteral::Bool(true));
         }
-        if !self.is_polymorphic(td) {
+        if !self.is_polymorphic(td) || self.is_exact_row(alias) {
             return IrExpr::Literal(IrLiteral::Bool(false));
         }
         // A row is of the checked type when its own type is that type or one
@@ -15075,15 +15080,7 @@ impl<'a> Compiler<'a> {
                 }
                 // __type__ without a leading dot still means the current object's type.
                 if n == "__type__" {
-                    return Ok(if self.is_polymorphic(td) {
-                        IrExpr::ColumnRef {
-                            alias: alias.to_string(),
-                            column: "__type__".to_string(),
-                            pg_type: "text".to_string(),
-                        }
-                    } else {
-                        IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
-                    });
+                    return Ok(self.type_name_of(td, alias));
                 }
             }
             // Enum member access: `default::Gender.Female`
@@ -15427,15 +15424,7 @@ impl<'a> Compiler<'a> {
         // __type__ as an expression: for polymorphic (interface) types, read from the
         // inline union column; for concrete types, emit the static qualified name.
         if pointer_name == "__type__" {
-            return Ok(if self.is_polymorphic(td) {
-                IrExpr::ColumnRef {
-                    alias: alias.to_string(),
-                    column: "__type__".to_string(),
-                    pg_type: "text".to_string(),
-                }
-            } else {
-                IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
-            });
+            return Ok(self.type_name_of(td, alias));
         }
 
         if let Some(prop) = Self::resolve_property(td, pointer_name) {
@@ -15976,6 +15965,29 @@ impl<'a> Compiler<'a> {
     /// row's own `__type__`.
     fn is_polymorphic(&self, td: &TypeDescriptor) -> bool {
         td.abstract_ || self.has_subtypes(td)
+    }
+
+    /// Whether `alias` is the `__new__`/`__old__` row of a trigger or
+    /// rewrite. That row comes from the one table the trigger is installed
+    /// on, so it is of exactly the anchor's type even when the type has
+    /// subtypes, and that table has no `__type__` column to read.
+    fn is_exact_row(&self, alias: &str) -> bool {
+        self.special_anchors.values().any(|(_, a)| a == alias) || self.exact_rows.iter().any(|a| a == alias)
+    }
+
+    /// `__type__` of the row `alias` reads: the union's discriminator
+    /// column when rows of several types arrive through it, otherwise the
+    /// type's own name.
+    fn type_name_of(&self, td: &TypeDescriptor, alias: &str) -> IrExpr {
+        if self.is_polymorphic(td) && !self.is_exact_row(alias) {
+            IrExpr::ColumnRef {
+                alias: alias.to_string(),
+                column: "__type__".to_string(),
+                pg_type: "text".to_string(),
+            }
+        } else {
+            IrExpr::Literal(IrLiteral::Str(format!("{}::{}", td.module, td.name)))
+        }
     }
 
     /// One owner type's half of `compile_backlink_as_exists`: EXISTS over the

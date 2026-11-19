@@ -545,3 +545,185 @@ async fn migration_path_emits_the_same_working_trigger() {
         "trigger emitted via the diff path should work identically, got {rows:?}"
     );
 }
+
+/// A concrete `A` with a concrete subtype `B(A)`, each in a table of its
+/// own, both carrying the same insert and update audit triggers that record
+/// `__new__.__type__` — the shape of an audit mixin inherited by a type with
+/// subtypes.
+fn subtyped_audit_schema(module: &str) -> SchemaDescriptor {
+    let audit_triggers = vec![
+        trigger(
+            1,
+            "After",
+            &format!(
+                "insert {module}::Audit {{ action := 'insert', type_name := __new__.__type__, item := __new__.name }}"
+            ),
+        ),
+        trigger(
+            2,
+            "After",
+            &format!(
+                "insert {module}::Audit {{ action := 'update', type_name := __new__.__type__, item := __new__.name }}"
+            ),
+        ),
+    ];
+    let mut a = ty("A", module, vec![id_prop(), text_prop("name")]);
+    a.triggers = audit_triggers.clone();
+    let mut b = ty("B", module, vec![id_prop(), text_prop("name")]);
+    b.bases = vec![format!("{module}::A")];
+    b.triggers = audit_triggers;
+    let audit = ty(
+        "Audit",
+        module,
+        vec![
+            id_prop(),
+            text_prop("action"),
+            text_prop("type_name"),
+            text_prop("item"),
+        ],
+    );
+    SchemaDescriptor {
+        types: vec![a, b, audit],
+        ..Default::default()
+    }
+}
+
+/// Inserts and updates one `A` and one `B`, and returns what the audit
+/// triggers recorded as `item:action:type_name`, sorted.
+async fn audit_an_a_and_a_b(pool: &pylon_pgcon::PgPool, schema: &SchemaDescriptor, module: &str) -> Vec<String> {
+    exec(pool, schema, &format!("insert {module}::A {{ name := 'a' }}")).await;
+    exec(pool, schema, &format!("insert {module}::B {{ name := 'b' }}")).await;
+    exec(
+        pool,
+        schema,
+        &format!("update {module}::A filter .name = 'a' set {{ name := 'a2' }}"),
+    )
+    .await;
+    exec(
+        pool,
+        schema,
+        &format!("update {module}::B filter .name = 'b' set {{ name := 'b2' }}"),
+    )
+    .await;
+    rows_of(
+        pool,
+        schema,
+        &format!("select {module}::Audit {{ line := .item ++ ':' ++ .action ++ ':' ++ .type_name }} order by .line"),
+    )
+    .await
+    .iter()
+    .map(|row| match field(row, 2) {
+        DecodedValue::Str(s) => s.clone(),
+        other => panic!("expected a string, got {other:?}"),
+    })
+    .collect()
+}
+
+fn expected_audit_lines(module: &str) -> Vec<String> {
+    vec![
+        format!("a2:update:{module}::A"),
+        format!("a:insert:{module}::A"),
+        format!("b2:update:{module}::B"),
+        format!("b:insert:{module}::B"),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_trigger_on_a_type_with_subtypes_records_each_rows_own_type() {
+    let module = unique_module("live_trig_subtype");
+    let schema = subtyped_audit_schema(&module);
+
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    assert_eq!(
+        audit_an_a_and_a_b(&pool, &schema, &module).await,
+        expected_audit_lines(&module)
+    );
+}
+
+/// A database installed before the fix holds `A`'s audit functions reading
+/// `NEW."__type__"`, a column `A`'s table never had, under the names the old
+/// body hashed to. A migration replaces them.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_migration_replaces_a_trigger_that_reads_a_missing_type_column() {
+    let module = unique_module("live_trig_subtype_mig");
+    let schema = subtyped_audit_schema(&module);
+
+    let pool = test_pool().await;
+    bootstrap(&pool).await;
+    pool.batch_execute(&export_schema(&schema).unwrap()).await.unwrap();
+
+    // Put back what the old compiler installed: the same function under a
+    // different hash-derived name, reading the column instead of the name.
+    pool.batch_execute(&format!(
+        r#"DO $$
+        DECLARE r record; old_name text; broken int := 0;
+        BEGIN
+            FOR r IN
+                SELECT t.tgname, t.tgfoid FROM pg_trigger t
+                JOIN pg_class c ON c.oid = t.tgrelid
+                WHERE c.relnamespace = '"{module}"'::regnamespace AND c.relname = 'A' AND NOT t.tgisinternal
+                  AND pg_get_functiondef(t.tgfoid) LIKE '%''{module}::A''%'
+            LOOP
+                old_name := 'A_' || substr(md5(r.tgname), 1, 12);
+                EXECUTE format('ALTER TRIGGER %I ON %I.%I RENAME TO %I', r.tgname, '{module}', 'A', old_name);
+                EXECUTE format('ALTER FUNCTION %s() RENAME TO %I', r.tgfoid::regproc, old_name);
+                EXECUTE replace(pg_get_functiondef(r.tgfoid), '''{module}::A''', 'NEW."__type__"');
+                broken := broken + 1;
+            END LOOP;
+            IF broken <> 2 THEN RAISE 'expected two audit triggers on A, found %', broken; END IF;
+        END $$;"#
+    ))
+    .await
+    .unwrap();
+
+    let insert = query::compile(&format!("insert {module}::A {{ name := 'a' }}"), &schema).unwrap();
+    let err = pool.execute_typed(&insert.sql, &[]).await.unwrap_err();
+    assert!(
+        err.to_string().contains("__type__"),
+        "expected the broken trigger to fail, got {err}"
+    );
+
+    let mut live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    live.schemas.retain(|s| *s == module);
+    live.tables.retain(|t| t.schema == module);
+    live.enums.retain(|e| e.schema == module);
+    live.domains.retain(|d| d.schema == module);
+    live.composites.retain(|c| c.schema == module);
+    live.sequences.retain(|s| s.schema == module);
+    live.views.retain(|v| v.schema == module);
+    live.functions.retain(|f| f.schema == module);
+    let steps = diff_schema_steps(&schema, &live, &HashMap::new()).unwrap();
+    assert!(
+        !steps.is_empty(),
+        "expected the migration to replace the broken triggers"
+    );
+    for step in &steps {
+        for op in step.resolved_ddl(&HashMap::new()) {
+            pool.batch_execute(&op.sql).await.unwrap();
+        }
+    }
+
+    let remaining = pool
+        .query_typed(
+            &format!(
+                r#"SELECT ROW(count(*)::int8) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+                   WHERE c.relnamespace = '"{module}"'::regnamespace AND NOT t.tgisinternal
+                     AND pg_get_functiondef(t.tgfoid) LIKE '%NEW."\_\_type\_\_"%'"#
+            ),
+            &[],
+            &ExtensionOids::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(field(&remaining[0], 0), &DecodedValue::I64(0), "{remaining:?}");
+
+    assert_eq!(
+        audit_an_a_and_a_b(&pool, &schema, &module).await,
+        expected_audit_lines(&module)
+    );
+}

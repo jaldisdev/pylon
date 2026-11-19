@@ -7260,6 +7260,67 @@ mod tests {
         );
     }
 
+    /// A trigger fires for a row of exactly the table it is installed on,
+    /// and a concrete type's table holds no `__type__` column even when the
+    /// type has subtypes — those live in tables of their own.
+    #[test]
+    fn a_trigger_row_of_a_type_with_subtypes_is_of_exactly_that_type() {
+        let schema = schema_with_a_subtype();
+        for (type_name, on) in [("default::Person", 1), ("default::Admin", 1), ("default::Person", 2)] {
+            for (handler, expected) in [
+                ("insert Post { title := __new__.__type__ }", format!("'{type_name}'")),
+                (
+                    "insert Post { title := <std::str>(__new__ is Admin) }",
+                    if type_name == "default::Admin" { "TRUE" } else { "FALSE" }.to_string(),
+                ),
+                ("insert Post { title := __new__.name }", "NEW.\"name\"".to_string()),
+                (
+                    "insert Post { title := __new__.company.name }",
+                    "NEW.\"company_id\"".to_string(),
+                ),
+            ] {
+                let sql = crate::query::compile_trigger_handler(handler, type_name, on, &schema).unwrap();
+                assert!(!sql.contains("__type__"), "{type_name} {handler}:\n{sql}");
+                assert!(
+                    sql.contains(&expected),
+                    "{type_name} {handler}: expected {expected}\n{sql}"
+                );
+            }
+        }
+        let sql = crate::query::compile_trigger_handler(
+            "insert Post { title := __old__.__type__ }",
+            "default::Person",
+            2,
+            &schema,
+        )
+        .unwrap();
+        assert!(sql.contains("'default::Person'") && !sql.contains("__type__"), "{sql}");
+    }
+
+    #[test]
+    fn a_rewrite_on_a_type_with_subtypes_reads_its_own_type_name() {
+        let mut schema = schema_with_a_subtype();
+        for t in schema
+            .types
+            .iter_mut()
+            .filter(|t| t.name == "Person" || t.name == "Admin")
+        {
+            let p = t.properties.iter_mut().find(|p| p.name == "name").unwrap();
+            p.rewrites = vec![crate::schema::RewriteEntry {
+                on: 1,
+                handler: "__new__.__type__".into(),
+            }];
+        }
+        for type_name in ["default::Person", "default::Admin"] {
+            let assignments = crate::ir::compile_rewrite_assignments(type_name, 1, &schema).unwrap();
+            let sql = &assignments[0].sql;
+            assert!(
+                sql.contains(&format!("'{type_name}'")) && !sql.contains("__type__"),
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn is_a_supertype_matches_its_subtypes() {
         let out = compile_and_emit_with(
@@ -9227,6 +9288,22 @@ mod tests {
         let sql = ir::compile_constraint_expr("__subject__.age > 18", "default::Person", &schema)
             .expect("__subject__ names the row under check");
         assert!(sql.contains("\"age\""), "{sql}");
+    }
+
+    /// A CHECK sees only rows of its own table, which has no `__type__`
+    /// column even when the type has subtypes.
+    #[test]
+    fn a_constraint_on_a_type_with_subtypes_reads_its_own_type_name() {
+        let schema = schema_with_a_subtype();
+        for type_name in ["default::Person", "default::Admin"] {
+            let sql = ir::compile_constraint_expr("__subject__.__type__ != 'x'", type_name, &schema).unwrap();
+            assert!(
+                sql.contains(&format!("'{type_name}'")) && !sql.contains("__type__\""),
+                "{sql}"
+            );
+            let sql = ir::compile_constraint_expr("__subject__ is Admin", type_name, &schema).unwrap();
+            assert!(!sql.contains("__type__"), "{sql}");
+        }
     }
 
     #[test]
