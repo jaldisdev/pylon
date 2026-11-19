@@ -33,6 +33,13 @@ from the same version number.
   constraint, and a check the schema had stopped declaring could never be
   dropped. `migration create` was unaffected: it compares against the
   schema recorded with the previous migration, which did record them.
+* A fill expression that reads its own type again — a backlink such as
+  `.<visuals[is DesignSystem]` — now fills each row from itself. The fill's
+  subquery read the table under an alias of its own and pointed back at
+  the row being updated with a bare `"id"`, which PostgreSQL refused as
+  ambiguous. Where a subquery's alias left the bare name to bind to the
+  inner table instead, the result was silently wrong. A fill now names the
+  row by its table.
 
 ### Tuples
 

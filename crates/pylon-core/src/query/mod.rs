@@ -712,8 +712,9 @@ impl ExecutionMetadata {
 /// Compile a PyQL expression string in the context of a named type to a bare SQL
 /// expression suitable for use in an UPDATE SET clause.
 ///
-/// Pointer references (`.name`) are emitted without a table alias because UPDATE
-/// SET expressions reference the current row directly.  Query parameters (`$name`)
+/// Pointer references (`.name`) are qualified by the table's own name rather
+/// than an alias (see `ir::compile_expr_unaliased`), since the UPDATE they run
+/// in has none.  Query parameters (`$name`)
 /// are rejected — fill expressions must be literal values or pointer references.
 pub fn compile_fill_expr(
     type_name: &str,
@@ -940,6 +941,15 @@ mod tests {
             channels: vec![],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_fill_expression_names_its_row_by_the_table() {
+        let schema = make_schema();
+        assert_eq!(
+            compile_fill_expr("default::Person", ".id", &schema).unwrap(),
+            "\"public\".\"person\".\"id\""
+        );
     }
 
     #[test]

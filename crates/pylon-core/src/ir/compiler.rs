@@ -1337,9 +1337,13 @@ pub fn compile_computed_in_type(
     }
 }
 
-/// Like `compile_expr_in_type` but uses an empty table alias, so that column
-/// references emit as bare column names (`"col"` rather than `"a1"."col"`).
-/// Used for fill expressions in migration UPDATE SET clauses.
+/// Like `compile_expr_in_type`, but the row is named by its table's own
+/// qualified name (`"mod"."T"."col"`) rather than an alias — for a migration's
+/// fill expression, which runs as the SET of an unaliased `UPDATE` or as an
+/// `ALTER … TYPE … USING`, and both resolve that name to the row being
+/// written. A bare `"col"` would do at the top level, but not inside a
+/// sub-select that reads the same table again under its own alias: there it
+/// is ambiguous, or binds to the inner table.
 pub fn compile_expr_unaliased(
     expr: &Expr,
     type_name: &str,
@@ -1347,7 +1351,8 @@ pub fn compile_expr_unaliased(
 ) -> Result<(IrExpr, Vec<String>), PyQLError> {
     let mut c = Compiler::new(schema);
     let td = c.resolve_type(type_name)?;
-    let ir = c.compile_expr(expr, td, "")?;
+    let row = crate::sql::qualified_table(&td.module, &td.table);
+    let ir = c.compile_expr(expr, td, &row)?;
     Ok((ir, c.params))
 }
 

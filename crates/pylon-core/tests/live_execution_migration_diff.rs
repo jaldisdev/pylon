@@ -902,3 +902,117 @@ async fn a_checked_text_column_can_become_an_enum() {
         .await
         .unwrap();
 }
+
+/// A required link added to `Visual`, filled from the backlink of an
+/// exclusive multilink on `DesignSystem`. The fill's subquery starts from
+/// `Visual` again under its own alias, so the reference back to the row being
+/// updated has to name the target table — a bare `"id"` there is ambiguous
+/// between the two and PostgreSQL refuses the UPDATE.
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_required_link_fills_from_an_exclusive_multilinks_backlink() {
+    let module = unique_module("live_diff_backlink_fill");
+    let system_q = format!("{module}::DesignSystem");
+    let visual_q = format!("{module}::Visual");
+    let bare = |name: &str| TypeDescriptor {
+        name: name.into(),
+        module: module.clone(),
+        table: name.into(),
+        abstract_: false,
+        materialized: true,
+        description: None,
+        parents: vec![],
+        interfaces: vec![],
+        bases: vec![],
+        properties: vec![id_prop(), text_prop("name")],
+        links: vec![],
+        multilinks: vec![],
+        computed: vec![],
+        constraints: vec![],
+        indexes: vec![],
+        partition: None,
+        vector_indexes: vec![],
+        search_indexes: vec![],
+        triggers: vec![],
+        junction: false,
+        signals: vec![],
+    };
+    let v1 = SchemaDescriptor {
+        types: vec![
+            TypeDescriptor {
+                multilinks: vec![pylon_core::schema::MultiLinkDescriptor {
+                    is_exclusive: true,
+                    ..multilink("visuals", &visual_q)
+                }],
+                ..bare("DesignSystem")
+            },
+            bare("Visual"),
+        ],
+        ..Default::default()
+    };
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    pool.batch_execute(&export_schema(&v1).unwrap()).await.unwrap();
+
+    for (system, visuals) in [("first", ["a", "b"]), ("second", ["c", "d"])] {
+        let insert = query::compile(
+            &format!(
+                "insert {system_q} {{ name := '{system}', visuals := {{ \
+                 (insert {visual_q} {{ name := '{}' }}), (insert {visual_q} {{ name := '{}' }}) }} }}",
+                visuals[0], visuals[1]
+            ),
+            &v1,
+        )
+        .unwrap();
+        pool.execute_typed(&insert.sql, &[]).await.unwrap();
+    }
+
+    let mut v2 = v1.clone();
+    v2.types[1].links = vec![link("design_system", &system_q)];
+
+    let live = pylon_core::introspect::introspect_db_state(&pool).await.unwrap();
+    let required = pylon_core::diff::detect_fill_required(&v2, &live);
+    assert_eq!(
+        required.len(),
+        1,
+        "the new required link needs a fill, got {required:?}"
+    );
+    let fill_sql = query::compile_fill_expr(&visual_q, &format!(".<visuals[is {system_q}]"), &v2).unwrap();
+    let fills = vec![(
+        required[0].module.clone(),
+        required[0].table.clone(),
+        required[0].column.clone(),
+        fill_sql,
+    )];
+    let steps = diff_schema_steps_with_renames_and_fills(&v2, &live, &[], &[], &fills).unwrap();
+    for step in &steps {
+        for op in step.resolved_ddl(&HashMap::new()) {
+            pool.batch_execute(&op.sql)
+                .await
+                .unwrap_or_else(|e| panic!("applying `{}` failed: {e}", op.sql));
+        }
+    }
+
+    let select = query::compile(
+        &format!("select {visual_q} {{ name, system := .design_system.name }} order by .name"),
+        &v2,
+    )
+    .unwrap();
+    let rows = pool
+        .query_typed(&select.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    let pairs: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+    assert_eq!(pairs.len(), 4, "every visual should have survived, got {pairs:?}");
+    for (row, expected) in pairs.iter().zip(["first", "first", "second", "second"]) {
+        assert!(
+            row.contains(&format!("\"{expected}\"")),
+            "each visual should belong to its own design system, got {pairs:?}"
+        );
+    }
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}

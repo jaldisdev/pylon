@@ -283,6 +283,10 @@ pub fn pg_schema_str(module: &str) -> String {
     pg_schema(module)
 }
 
+pub(crate) fn qualified_table(module: &str, table: &str) -> String {
+    qn(module, table)
+}
+
 fn qn(module: &str, name: &str) -> String {
     format!("{}.{}", pg_schema(module), qi(name))
 }
@@ -3205,12 +3209,7 @@ fn emit_key_expr(expr: &IrExpr) -> String {
     if let IrExpr::ColumnRef { alias, column, pg_type } = expr
         && let Some(qualified) = QualifiedPgType::of(pg_type)
     {
-        let col_ref = if alias.is_empty() {
-            qi(column)
-        } else {
-            format!("{}.{}", qi(alias), qi(column))
-        };
-        return format!("{}{}", col_ref, qualified.text_cast());
+        return format!("{}{}", column_ref(alias, column), qualified.text_cast());
     }
     emit_expr(expr)
 }
@@ -5610,27 +5609,35 @@ pub fn emit_expr_with_fanouts(expr: &IrExpr, fanouts: &HashMap<(String, String),
     with_subtype_fanouts(fanouts, || emit_expr(expr))
 }
 
+/// How a `ColumnRef` names its column. An empty alias is a bare column, for
+/// a table-level CHECK. An alias that arrives already quoted is a table's own
+/// qualified name, standing in for the row an `UPDATE` writes (see
+/// `query::compile_fill_expr`), and is not quoted again.
+fn column_ref(alias: &str, column: &str) -> String {
+    if alias.is_empty() {
+        qi(column)
+    } else if alias == "NEW" || alias == "OLD" {
+        // plpgsql's trigger row variables (`ir::compile_trigger_handler`'s
+        // `__new__`/`__old__` anchors) are recognized by the plpgsql
+        // parser as bare, unquoted identifiers — quoting them like an
+        // ordinary table alias (`"NEW"."col"`) turns this into an
+        // *ordinary* SQL column reference instead, which Postgres then
+        // rejects with "missing FROM-clause entry for table NEW" the
+        // moment it appears inside a nested SQL command (e.g. the
+        // VALUES list of an `INSERT` the trigger handler runs) — there's
+        // no real `NEW` table to resolve it against there, only
+        // plpgsql's own row-variable substitution recognizes it.
+        format!("{alias}.{}", qi(column))
+    } else if alias.starts_with('"') {
+        format!("{alias}.{}", qi(column))
+    } else {
+        format!("{}.{}", qi(alias), qi(column))
+    }
+}
+
 pub fn emit_expr(expr: &IrExpr) -> String {
     match expr {
-        IrExpr::ColumnRef { alias, column, .. } => {
-            if alias.is_empty() {
-                qi(column)
-            } else if alias == "NEW" || alias == "OLD" {
-                // plpgsql's trigger row variables (`ir::compile_trigger_handler`'s
-                // `__new__`/`__old__` anchors) are recognized by the plpgsql
-                // parser as bare, unquoted identifiers — quoting them like an
-                // ordinary table alias (`"NEW"."col"`) turns this into an
-                // *ordinary* SQL column reference instead, which Postgres then
-                // rejects with "missing FROM-clause entry for table NEW" the
-                // moment it appears inside a nested SQL command (e.g. the
-                // VALUES list of an `INSERT` the trigger handler runs) — there's
-                // no real `NEW` table to resolve it against there, only
-                // plpgsql's own row-variable substitution recognizes it.
-                format!("{alias}.{}", qi(column))
-            } else {
-                format!("{}.{}", qi(alias), qi(column))
-            }
-        }
+        IrExpr::ColumnRef { alias, column, .. } => column_ref(alias, column),
         IrExpr::Param { index } => format!("${}", index + 1),
         IrExpr::Literal(lit) => emit_literal(lit),
         IrExpr::BinOp(op) => {
