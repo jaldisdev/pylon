@@ -60,6 +60,14 @@ type TypeAndShape<'e> = (String, &'e [ShapeElement], Option<&'e Stmt>, Option<St
 
 // ── Public entry point ──────────────────────────────────────────────────────────
 
+/// Below this much remaining stack, `compile_stmt` and `compile_expr_ctx`
+/// continue on a fresh heap-allocated segment of `STACK_SEGMENT` bytes. A
+/// nested expression costs ~145 KiB of stack per level in a debug build, and a
+/// caller on a 2 MiB tokio worker can run out: on macOS that overflow spins
+/// forever in the stack probe rather than aborting.
+pub(crate) const STACK_RED_ZONE: usize = 1024 * 1024;
+pub(crate) const STACK_SEGMENT: usize = 8 * 1024 * 1024;
+
 /// Compile a parsed PyQL statement against the schema, using default session
 /// config (see `crate::ir::SessionConfig`) — used throughout this crate's own
 /// tests and schema-time compilation, which never has a live client-supplied
@@ -4006,6 +4014,10 @@ impl<'a> Compiler<'a> {
     // ── Statement dispatch ────────────────────────────────────────────────────────
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<IrStmt, PyQLError> {
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || self.compile_stmt_inner(stmt))
+    }
+
+    fn compile_stmt_inner(&mut self, stmt: &Stmt) -> Result<IrStmt, PyQLError> {
         match stmt {
             Stmt::Select(s) => {
                 let (distinct, result) = match &s.result {
@@ -13131,6 +13143,14 @@ impl<'a> Compiler<'a> {
     /// diverge (`Path`, `BinOp`, `FunctionCall`, `Set`, `Detached`, `TypeIs`)
     /// branch internally on `ctx` — see each arm's own comment.
     fn compile_expr_ctx(&mut self, expr: &Expr, ctx: Option<(&TypeDescriptor, &str)>) -> Result<IrExpr, PyQLError> {
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || self.compile_expr_ctx_inner(expr, ctx))
+    }
+
+    fn compile_expr_ctx_inner(
+        &mut self,
+        expr: &Expr,
+        ctx: Option<(&TypeDescriptor, &str)>,
+    ) -> Result<IrExpr, PyQLError> {
         match expr {
             // The main free/schema divergence — kept genuinely two-branched
             // (`compile_path` needs a schema type + alias throughout:

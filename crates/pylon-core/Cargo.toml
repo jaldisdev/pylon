@@ -24,6 +24,7 @@ pylon-db-pgcon = { workspace = true }
 pylon-db-value = { workspace = true }
 tokio-postgres = "0.7"
 strsim = "0.11.1"
+stacker = "0.1.25"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

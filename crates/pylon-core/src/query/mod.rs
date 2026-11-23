@@ -828,8 +828,10 @@ fn compile_uncached(
     schema: &SchemaDescriptor,
     config: &ir::SessionConfig,
 ) -> Result<CompiledQuery, PyQLError> {
-    let ast = parse::parse(query)?;
-    compile_ast(&ast, schema, config)
+    stacker::maybe_grow(ir::STACK_RED_ZONE, ir::STACK_SEGMENT, || {
+        let ast = parse::parse(query)?;
+        compile_ast(&ast, schema, config)
+    })
 }
 
 /// Compile one already-parsed statement. Shared by the single-statement path

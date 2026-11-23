@@ -48,6 +48,7 @@ pub use compiler::{
     JunctionRef, REWRITE_OWNER_ALIAS, RewriteAssignment, compile_rewrite_assignments,
     compile_rewrite_assignments_anchored,
 };
+pub(crate) use compiler::{STACK_RED_ZONE, STACK_SEGMENT};
 
 use crate::parse::ast::{BinOpKind, UnaryOpKind};
 use std::collections::HashMap;
