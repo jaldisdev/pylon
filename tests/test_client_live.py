@@ -506,6 +506,57 @@ def test_a_decimal_survives_the_round_trip_whatever_its_precision(live_pool, uni
     asyncio.run(run())
 
 
+def test_a_json_parameter_takes_any_document_not_only_an_object(live_pool, unique_module):
+    """A `<json>` parameter takes a list, a number or a bool as well as an object.
+
+    Only an object used to get the jsonb framing. A list went through the
+    binary array encoder and an int as raw int8 bytes, and Postgres read the
+    leading zero byte of either as "unsupported jsonb version number 0". A
+    bool sent nothing at all after the version byte. A `str` is JSON text the
+    caller has already encoded, so it is the document `json.loads` reads from it.
+    """
+    from pylon._core import export_schema, migration_ensure_internal_schema, migration_write_schema_snapshot
+
+    from pylon.client import Client
+    from pylon.config import Config, DatabaseConfig
+
+    module = unique_module('live_json_param_roots')
+    cfg = Config(database=DatabaseConfig(dsn=_dsn()))
+
+    values = [{'list': []}, [], [1], ['a'], [{'a': 1}], 1, 1.5, True, False]
+
+    async def run():
+        clear_registry()
+
+        @pylon.type(module=module, name='Doc')
+        class Doc:
+            body: pylon.JSON
+
+        schema = _build_schema(*snapshot())
+        await live_pool.batch_execute(export_schema(schema))
+        await migration_ensure_internal_schema(live_pool)
+        await migration_write_schema_snapshot(live_pool, schema.to_json(), 'Apply')
+
+        client = Client(cfg)
+        await client.ensure_connected()
+
+        for value in values:
+            assert await client.query_single('select <json>$value;', value=value) == value, value
+            written = await client.query_required_single(
+                f'select (insert {module}::Doc {{ body := <json>$value }}) {{ body }};',
+                value=value,
+            )
+            assert written.body == value, value
+
+        assert await client.query_single('select <json>$value;', value='"x"') == 'x'
+        assert await client.query_single('select <json>$value;', value='[1, 2]') == [1, 2]
+
+        await client.aclose()
+        await live_pool.batch_execute(f'DROP SCHEMA IF EXISTS "{module}" CASCADE;')
+
+    asyncio.run(run())
+
+
 def test_an_array_of_named_tuples_round_trips_as_the_type_it_declares(live_pool, unique_module):
     """A `tuple<…>` inside an `array<…>` keeps its member shape end to end.
 

@@ -586,6 +586,19 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
         numeric::encode(&text, out)?;
         return Ok(IsNull::No);
     }
+    // A `jsonb` slot takes any JSON document, not only an object: without
+    // this a list went through the binary *array* encoder and an integer as
+    // a raw int8, both of whose first byte Postgres read as jsonb version 0,
+    // and a bool left nothing after the version byte. A `Str` is the one
+    // value kept as it is -- it is JSON text a caller already serialized
+    // (see the `Str` arm below).
+    if *ty == Type::JSONB && !matches!(value, DecodedValue::Str(_)) {
+        out.put_u8(1); // jsonb binary format version prefix
+        let mut json = String::new();
+        write_cached_json(value, &mut json);
+        out.put_slice(json.as_bytes());
+        return Ok(IsNull::No);
+    }
     match value {
         DecodedValue::Null => unreachable!("caller already handled NULL"),
         DecodedValue::Bool(b) => out.put_u8(*b as u8),
@@ -665,16 +678,6 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
             };
             encode_array(items, &element_ty, out)?;
         }
-        DecodedValue::Composite(items) if *ty == Type::JSONB => {
-            // An all-unnamed `tuple<str, bool>` is a jsonb *array* — the
-            // positional form `_decode`'s named-tuple case reads back by
-            // index. JSON needs no per-field Postgres type, which is what
-            // makes this encodable where the composite below is not.
-            out.put_u8(1); // jsonb binary format version prefix
-            let mut json = String::new();
-            write_cached_json(value, &mut json);
-            out.put_slice(json.as_bytes());
-        }
         DecodedValue::Composite(fields) => {
             // A tuple parameter, bound as a value of the composite type its
             // column or cast names. The driver resolves that type's own
@@ -722,10 +725,6 @@ fn encode_non_null(value: &DecodedValue, ty: &Type, out: &mut bytes::BytesMut) -
         // Its own digits, wherever they are going: a jsonb number keeps them
         // (that is why it is carried as text at all), `numeric` parses them
         // exactly, and a text column takes them as written.
-        DecodedValue::JsonNumber(digits) if *ty == Type::JSONB => {
-            out.put_u8(1);
-            out.put_slice(digits.as_bytes());
-        }
         DecodedValue::JsonNumber(digits) if *ty == Type::NUMERIC => numeric::encode(digits, out)?,
         DecodedValue::JsonNumber(digits) if accepts_text_bytes(ty) => out.put_slice(digits.as_bytes()),
         DecodedValue::JsonNumber(digits) => match digits.parse::<f64>() {
@@ -1948,5 +1947,26 @@ mod tests {
             refused.is_err_and(|e| e.to_string().contains("cannot bind a composite value")),
             "an anonymous record has no attributes to encode against"
         );
+    }
+
+    #[test]
+    fn encodes_any_json_document_root_against_jsonb() {
+        let cases: [(DecodedValue, &[u8]); 7] = [
+            (DecodedValue::Array(vec![]), b"[]"),
+            (
+                DecodedValue::Array(vec![DecodedValue::Object(vec![("a".into(), DecodedValue::I64(1))])]),
+                br#"[{"a":1}]"#,
+            ),
+            (DecodedValue::I64(1), b"1"),
+            (DecodedValue::F64(1.5), b"1.5"),
+            (DecodedValue::JsonNumber("1.50".into()), b"1.50"),
+            (DecodedValue::Bool(true), b"true"),
+            (DecodedValue::Bool(false), b"false"),
+        ];
+        for (value, json) in cases {
+            let mut out = bytes::BytesMut::new();
+            encode_value(&value, &Type::JSONB, &mut out).unwrap();
+            assert_eq!(out.as_ref(), [&[1u8][..], json].concat(), "{value:?}");
+        }
     }
 }

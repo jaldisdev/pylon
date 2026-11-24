@@ -1528,6 +1528,21 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+    async fn round_trips_a_jsonb_param_whose_root_is_not_an_object() {
+        let pool = PgPool::connect(&test_dsn(), 5).await.unwrap();
+        for param in [
+            DecodedValue::Array(vec![]),
+            DecodedValue::Array(vec![DecodedValue::Str("a".into())]),
+            DecodedValue::Array(vec![DecodedValue::Object(vec![("a".into(), DecodedValue::I64(1))])]),
+            DecodedValue::I64(1),
+            DecodedValue::Bool(true),
+        ] {
+            assert_eq!(round_trip(&pool, "jsonb", param.clone()).await, param);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
     async fn query_typed_matches_pylon_cores_own_param_binding_convention() {
         // $1, $2, ... positional, matching multiple params in one query —
         // the same shape a real PyQL query with several kwargs produces.
