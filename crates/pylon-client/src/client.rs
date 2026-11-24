@@ -158,7 +158,12 @@ struct Connected {
     /// An `Arc` rather than a plain `RwLock` so `Client::transaction` can
     /// hand a `Transaction` its own handle on the same schema slot without
     /// borrowing from the `OnceCell` for the transaction's whole lifetime.
-    schema: Arc<RwLock<SchemaDescriptor>>,
+    ///
+    /// The schema itself is an `Arc` too. Every query takes its own handle on
+    /// it, and a deep copy would cost more than the copying: it starts with
+    /// empty derived caches, so each new query would redo the analysis behind
+    /// `functions_needing_globals`, which compiles every function body.
+    schema: Arc<RwLock<Arc<SchemaDescriptor>>>,
 }
 
 /// An async Pylon client — a connection pool plus a compiled schema,
@@ -221,7 +226,7 @@ impl Client {
                 let schema = schema::fetch(&pool).await?;
                 Ok(Connected {
                     pool,
-                    schema: Arc::new(RwLock::new(schema)),
+                    schema: Arc::new(RwLock::new(Arc::new(schema))),
                 })
             })
             .await
@@ -252,7 +257,7 @@ impl Client {
         // connect time.
         conn.pool.refresh_types().await?;
         let fresh = schema::fetch(&conn.pool).await?;
-        *conn.schema.write().unwrap() = fresh;
+        *conn.schema.write().unwrap() = Arc::new(fresh);
         pylon_core::query::clear_query_cache();
         Ok(())
     }
@@ -296,7 +301,7 @@ impl Client {
     /// this client hasn't yet. Clones out from behind the lock rather than
     /// returning a guard, same reasoning as every query method here.
     pub async fn schema(&self) -> Result<SchemaDescriptor> {
-        Ok(self.connected().await?.schema.read().unwrap().clone())
+        Ok(SchemaDescriptor::clone(&self.connected().await?.schema.read().unwrap()))
     }
 
     /// The `Arc<pylon_cache::Cache>` this client reads/writes through, if

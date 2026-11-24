@@ -74,7 +74,7 @@ impl Isolation {
 /// never runs inside an explicit transaction).
 pub struct Transaction {
     pub(crate) inner: pylon_pgcon::PgTransaction,
-    pub(crate) schema: Arc<RwLock<SchemaDescriptor>>,
+    pub(crate) schema: Arc<RwLock<Arc<SchemaDescriptor>>>,
     pub(crate) config: SessionConfig,
     pub(crate) globals: Arc<HashMap<String, DecodedValue>>,
     /// Held only to *evict* on a write — see `execute`. Never used to read
