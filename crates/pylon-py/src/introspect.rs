@@ -26,14 +26,28 @@ use pyo3::prelude::*;
 use pylon_core as core;
 
 use crate::pgcon::{PgconPool, pgcon_err};
-use crate::{DbDump, DbState};
+use crate::{DbDump, DbState, SchemaDescriptor};
 
 /// Query pg_catalog and return a `DbState` describing the live database.
+/// With `schema`, every default, view and function the schema also declares
+/// is recorded as the schema's own when Postgres says it already is — see
+/// `pylon_core::introspect::introspect_db_state_against`. Pass it whenever
+/// the state is going to be diffed against that schema.
 #[pyfunction]
-fn introspect_db_state<'py>(py: Python<'py>, pool: &PgconPool) -> PyResult<Bound<'py, PyAny>> {
+#[pyo3(signature = (pool, schema=None))]
+fn introspect_db_state<'py>(
+    py: Python<'py>,
+    pool: &PgconPool,
+    schema: Option<&SchemaDescriptor>,
+) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
+    let schema = schema.map(|s| s.inner.clone());
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let state = core::introspect::introspect_db_state(&pool).await.map_err(pgcon_err)?;
+        let state = match schema {
+            Some(schema) => core::introspect::introspect_db_state_against(&pool, &schema).await,
+            None => core::introspect::introspect_db_state(&pool).await,
+        }
+        .map_err(pgcon_err)?;
         Ok(DbState { inner: state })
     })
 }

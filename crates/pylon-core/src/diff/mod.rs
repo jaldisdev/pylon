@@ -71,6 +71,36 @@ pub struct DbState {
     /// `required_extensions`/`missing_extension_ddl`.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// The function each trigger executes. Empty in a baseline recorded
+    /// before this was tracked; `fill_trigger_functions` derives it then.
+    #[serde(default)]
+    pub trigger_functions: Vec<DbTriggerFunction>,
+    /// Trigger functions in a module's schema that no trigger runs. Only a
+    /// live database can say; a recorded baseline leaves this empty.
+    #[serde(default)]
+    pub orphaned_trigger_functions: Vec<DbFunctionName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DbFunctionName {
+    pub schema: String,
+    pub name: String,
+}
+
+/// Which function a trigger executes. The function need not live beside the
+/// trigger's table: an interface-link trigger sits on the implementor's table
+/// while its function lives in the referencing type's module, and a table
+/// moved with `SET SCHEMA` takes its triggers along but leaves their
+/// functions where they were.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DbTriggerFunction {
+    /// The module of the trigger's table.
+    pub schema: String,
+    pub table: String,
+    pub trigger: String,
+    /// The module of the function, `_pylon` included.
+    pub function_schema: String,
+    pub function: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,7 +671,102 @@ pub fn schema_to_db_state(schema: &SchemaDescriptor) -> DbState {
         views,
         functions,
         extensions,
+        trigger_functions: expected_trigger_functions(schema, &type_map),
+        orphaned_trigger_functions: Vec::new(),
     }
+}
+
+/// The function every generated trigger of `schema` executes, read off the
+/// trigger's own `EXECUTE FUNCTION` clause. The cache-invalidation trigger is
+/// left out: its function is installed once in `_pylon` and never moves.
+pub fn expected_trigger_functions(
+    schema: &SchemaDescriptor,
+    type_map: &HashMap<String, (&str, &str)>,
+) -> Vec<DbTriggerFunction> {
+    let mut out: Vec<DbTriggerFunction> = Vec::new();
+    for info in crate::export::interface_exclusive_trigger_infos(schema) {
+        for trigger in [&info.ins_trigger_name, &info.upd_trigger_name] {
+            out.push(DbTriggerFunction {
+                schema: info.impl_module.clone(),
+                table: info.impl_table.clone(),
+                trigger: trigger.clone(),
+                function_schema: info.fn_module.clone(),
+                function: info.fn_name.clone(),
+            });
+        }
+    }
+    let infos = crate::export::deletion_policy_trigger_infos(schema, type_map)
+        .into_iter()
+        .chain(crate::export::signal_trigger_infos(schema))
+        .chain(crate::export::user_trigger_infos(schema).unwrap_or_default());
+    for info in infos {
+        if let Some((function_schema, function)) = executed_function(&info.ddl) {
+            out.push(DbTriggerFunction {
+                schema: info.table_module,
+                table: info.table_name,
+                trigger: info.trigger_name,
+                function_schema,
+                function,
+            });
+        }
+    }
+    out
+}
+
+/// The `(module, name)` a `CREATE TRIGGER ... EXECUTE FUNCTION "s"."f"()`
+/// statement runs.
+fn executed_function(ddl: &str) -> Option<(String, String)> {
+    const KEYWORD: &str = "EXECUTE FUNCTION ";
+    let rest = &ddl[ddl.find(KEYWORD)? + KEYWORD.len()..];
+    let (schema, rest) = take_ident(rest)?;
+    let (name, _) = take_ident(rest.strip_prefix('.')?)?;
+    let module = if schema == "public" {
+        "default".to_string()
+    } else {
+        schema
+    };
+    Some((module, name))
+}
+
+/// One SQL identifier off the front of `s`, quoted (`""` escapes) or bare.
+fn take_ident(s: &str) -> Option<(String, &str)> {
+    if let Some(quoted) = s.strip_prefix('"') {
+        let mut ident = String::new();
+        let mut chars = quoted.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if c != '"' {
+                ident.push(c);
+            } else if matches!(chars.peek(), Some((_, '"'))) {
+                ident.push('"');
+                chars.next();
+            } else {
+                return Some((ident, &quoted[i + 1..]));
+            }
+        }
+        None
+    } else {
+        let end = s.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(s.len());
+        (end > 0).then(|| (s[..end].to_string(), &s[end..]))
+    }
+}
+
+/// Derive `trigger_functions` from the schema a baseline was recorded for,
+/// when the baseline predates their being tracked.
+pub fn fill_trigger_functions(state: &mut DbState, schema: &SchemaDescriptor) {
+    if !state.trigger_functions.is_empty() {
+        return;
+    }
+    let type_map: HashMap<String, (&str, &str)> = schema
+        .types
+        .iter()
+        .map(|t| {
+            (
+                format!("{}::{}", t.module, t.name),
+                (t.module.as_str(), t.table.as_str()),
+            )
+        })
+        .collect();
+    state.trigger_functions = expected_trigger_functions(schema, &type_map);
 }
 
 /// The composite types a target schema needs, or none at all when they
@@ -923,7 +1048,7 @@ pub fn expected_triggers(
 
 /// A detected potential type (table) rename: a dropped table whose column
 /// structure closely matches a newly-created type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeRenameCandidate {
     pub old_module: String,
     pub old_table: String,
@@ -1113,7 +1238,16 @@ fn verbosename_module(name: &str) -> String {
 /// The 8-hex-digit segment is what distinguishes one from a hand-written
 /// constraint that happens to end in `_check`.
 fn is_generated_check_name(name: &str) -> bool {
-    let Some(rest) = name.strip_suffix("_check") else {
+    // A name Postgres cut at 63 bytes lost some or all of its `_check`.
+    let suffix = if name.len() == 63 {
+        ["_check", "_chec", "_che", "_ch", "_c", "_"]
+            .into_iter()
+            .find(|s| name.ends_with(s))
+            .unwrap_or("")
+    } else {
+        "_check"
+    };
+    let Some(rest) = name.strip_suffix(suffix) else {
         return false;
     };
     match rest.rsplit_once('_') {
@@ -1440,9 +1574,12 @@ pub fn detect_type_renames(
         .map(|t| (t.schema.as_str(), t.name.as_str()))
         .collect();
 
+    // A junction table (`Owner.link`) is never a candidate of its own: it goes
+    // wherever its owner goes.
     let dropped: Vec<&DbTable> = current
         .tables
         .iter()
+        .filter(|t| !t.name.contains('.'))
         .filter(|t| !target_keys.contains(&(t.schema.as_str(), t.name.as_str())))
         .collect();
     let created: Vec<&TypeDescriptor> = target
@@ -1456,6 +1593,24 @@ pub fn detect_type_renames(
         return vec![];
     }
 
+    // Compared column for column, link columns included: a type that is
+    // mostly links would otherwise look nothing like its own table.
+    let expected = schema_to_db_state(target);
+    let expected_cols: HashMap<(&str, &str), HashSet<&str>> = expected
+        .tables
+        .iter()
+        .map(|t| {
+            (
+                (t.schema.as_str(), t.name.as_str()),
+                t.columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .filter(|n| !n.starts_with("__"))
+                    .collect(),
+            )
+        })
+        .collect();
+
     let mut candidates: Vec<TypeRenameCandidate> = Vec::new();
     for dropped_t in &dropped {
         let old_cols: HashSet<&str> = dropped_t
@@ -1465,7 +1620,10 @@ pub fn detect_type_renames(
             .filter(|n| !n.starts_with("__"))
             .collect();
         for new_type in &created {
-            let new_cols: HashSet<&str> = new_type.properties.iter().map(|p| p.name.as_str()).collect();
+            let new_cols = expected_cols
+                .get(&(new_type.module.as_str(), new_type.table.as_str()))
+                .cloned()
+                .unwrap_or_else(|| new_type.properties.iter().map(|p| p.name.as_str()).collect());
             let intersection = old_cols.intersection(&new_cols).count();
             let union_size = old_cols.union(&new_cols).count();
             if union_size == 0 {
@@ -1496,6 +1654,107 @@ pub fn detect_type_renames(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     candidates
+}
+
+/// The type renames that are really a type moving to another module: the
+/// same table name gone from one module and new in another, with columns that
+/// largely match, and no other table of that name to confuse it with. Safe to
+/// take without asking — the alternative is dropping the table with its rows.
+///
+/// Only for a table `previous`, the schema the database was last migrated
+/// to, declared as that type. A same-named table Pylon never created — a
+/// database being adopted, another project's module — is not a type that
+/// moved, and quietly taking it over would be its own surprise.
+pub fn detect_module_moves(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    previous: Option<&SchemaDescriptor>,
+) -> Vec<TypeRenameCandidate> {
+    let Some(previous) = previous else {
+        return vec![];
+    };
+    let declared = |module: &str, table: &str| {
+        previous
+            .types
+            .iter()
+            .any(|t| !t.abstract_ && !t.junction && t.module == module && t.table == table)
+    };
+    let candidates: Vec<TypeRenameCandidate> = detect_type_renames(target, current, &Guidance::default())
+        .into_iter()
+        .filter(|c| declared(&c.old_module, &c.old_table))
+        .collect();
+    let same_name = |c: &TypeRenameCandidate| c.old_table == c.new_table && c.old_module != c.new_module;
+    let ambiguous = |c: &TypeRenameCandidate| {
+        candidates
+            .iter()
+            .filter(|o| same_name(o) && o.old_table == c.old_table)
+            .count()
+            > 1
+    };
+    candidates
+        .iter()
+        .filter(|c| same_name(c) && c.confidence >= 0.5 && !ambiguous(c))
+        .cloned()
+        .collect()
+}
+
+/// The DDL that carries out confirmed renames. A renamed or moved type takes
+/// its junction tables (`Owner.link`) along, or their rows would be dropped
+/// with the old names.
+pub fn type_rename_ddl(
+    current: &DbState,
+    type_renames: &[(String, String, String, String)],
+    col_renames: &[(String, String, String, String)],
+) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut created_schemas: HashSet<&str> = HashSet::new();
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        // Runs ahead of the rest of the diff, so ahead of its `CREATE SCHEMA`.
+        if old_mod != new_mod
+            && new_mod != "default"
+            && !current.schemas.contains(new_mod)
+            && created_schemas.insert(new_mod)
+        {
+            push_tx(&mut ops, format!("CREATE SCHEMA IF NOT EXISTS {};", pg_schema(new_mod)));
+        }
+        let junction_prefix = format!("{old_table}.");
+        let junctions = current
+            .tables
+            .iter()
+            .filter(|t| &t.schema == old_mod)
+            .filter_map(|t| t.name.strip_prefix(&junction_prefix))
+            .map(|suffix| (format!("{old_table}.{suffix}"), format!("{new_table}.{suffix}")));
+        for (old_name, new_name) in std::iter::once((old_table.clone(), new_table.clone())).chain(junctions) {
+            if old_mod != new_mod {
+                push_tx(
+                    &mut ops,
+                    format!(
+                        "ALTER TABLE {} SET SCHEMA {};",
+                        qn(old_mod, &old_name),
+                        pg_schema(new_mod)
+                    ),
+                );
+            }
+            if old_name != new_name {
+                push_tx(
+                    &mut ops,
+                    format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, &old_name), qi(&new_name)),
+                );
+            }
+        }
+    }
+    for (module, table, old_col, new_col) in col_renames {
+        push_tx(
+            &mut ops,
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {};",
+                qn(module, table),
+                qi(old_col),
+                qi(new_col)
+            ),
+        );
+    }
+    ops
 }
 
 /// Detect potential column renames within tables that exist in both `current`
@@ -1712,13 +1971,39 @@ fn apply_renames(
     col_renames: &[(String, String, String, String)],
 ) {
     for (old_mod, old_table, new_mod, new_table) in type_renames {
-        if let Some(t) = state
-            .tables
-            .iter_mut()
-            .find(|t| &t.schema == old_mod && &t.name == old_table)
-        {
-            t.schema = new_mod.clone();
-            t.name = new_table.clone();
+        if !state.schemas.contains(new_mod) {
+            state.schemas.push(new_mod.clone());
+        }
+        // The table itself, then its junction tables — see `type_rename_ddl`.
+        let renamed = |schema: &str, name: &str| -> Option<String> {
+            if schema != old_mod {
+                return None;
+            }
+            if name == old_table {
+                return Some(new_table.clone());
+            }
+            let suffix = name.strip_prefix(old_table.as_str())?.strip_prefix('.')?;
+            Some(format!("{new_table}.{suffix}"))
+        };
+        for t in &mut state.tables {
+            for fk in &mut t.foreign_keys {
+                if let Some(name) = renamed(&fk.ref_schema, &fk.ref_table) {
+                    fk.ref_schema = new_mod.clone();
+                    fk.ref_table = name;
+                }
+            }
+            if let Some(name) = renamed(&t.schema, &t.name) {
+                t.schema = new_mod.clone();
+                t.name = name;
+            }
+        }
+        // The triggers travel with their table; their functions do not, which
+        // is what lets the diff see them as stale.
+        for f in &mut state.trigger_functions {
+            if let Some(name) = renamed(&f.schema, &f.table) {
+                f.schema = new_mod.clone();
+                f.table = name;
+            }
         }
     }
     for (module, table, old_col, new_col) in col_renames {
@@ -1731,6 +2016,239 @@ fn apply_renames(
             col.name = new_col.clone();
         }
     }
+}
+
+/// Every `(type, property)` one of `t`'s trigger handlers stores a qualified
+/// type name in — `insert logging::Audit { type := __new__.__type__ }`. The
+/// name is compiled into the trigger as a literal, so a row written before
+/// the type was renamed or moved keeps the old one.
+fn type_name_columns(t: &TypeDescriptor) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for trig in &t.triggers {
+        let h = trig.handler.as_str();
+        let lower = h.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(found) = h[from..].find("__type__") {
+            let at = from + found;
+            from = at + "__type__".len();
+            let before = h[..at].trim_end();
+            let Some(before) = before
+                .strip_suffix("__new__.")
+                .or_else(|| before.strip_suffix("__old__."))
+                .or_else(|| before.strip_suffix('.'))
+            else {
+                continue;
+            };
+            let Some(before) = before.trim_end().strip_suffix(":=") else {
+                continue;
+            };
+            let before = before.trim_end();
+            let prop_start = before
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .map_or(0, |i| i + 1);
+            let prop = &before[prop_start..];
+            // The statement writing it: the nearest `insert X` / `update X`.
+            let stmt = ["insert ", "update "]
+                .iter()
+                .filter_map(|kw| lower[..prop_start].rfind(kw).map(|i| i + kw.len()))
+                .max();
+            let Some(stmt) = stmt else { continue };
+            let rest = h[stmt..].trim_start();
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                .unwrap_or(rest.len());
+            let qname = &rest[..end];
+            if !prop.is_empty() && qname.contains("::") {
+                out.push((qname.to_string(), prop.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `UPDATE`s carrying the qualified names Pylon has stored for renamed or
+/// moved types over to the new names: the index and signal outboxes, and
+/// every column any trigger handler writes `__type__` into. Any, not just the
+/// moved type's own: the rows were written by whatever the type declared at
+/// the time, which need not be what it declares now.
+fn renamed_type_name_ops(target: &SchemaDescriptor, type_renames: &[(String, String, String, String)]) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        let Some(td) = target
+            .types
+            .iter()
+            .find(|t| &t.module == new_mod && &t.table == new_table)
+        else {
+            continue;
+        };
+        let old_name = if td.table == td.name {
+            old_table.as_str()
+        } else {
+            td.name.as_str()
+        };
+        let old_q = format!("{old_mod}::{old_name}").replace('\'', "''");
+        let new_q = format!("{}::{}", td.module, td.name).replace('\'', "''");
+        if old_q == new_q {
+            continue;
+        }
+        let columns: Vec<(&TypeDescriptor, String)> = target
+            .types
+            .iter()
+            .flat_map(type_name_columns)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|(qname, prop)| {
+                let holder = target
+                    .types
+                    .iter()
+                    .find(|t| format!("{}::{}", t.module, t.name) == qname)?;
+                holder
+                    .properties
+                    .iter()
+                    .any(|p| p.name == prop)
+                    .then_some((holder, prop))
+            })
+            .collect();
+        for outbox in ["IndexOutbox", "SignalOutbox"] {
+            push_tx(
+                &mut ops,
+                format!("UPDATE _pylon.\"{outbox}\" SET type_name = '{new_q}' WHERE type_name = '{old_q}';"),
+            );
+        }
+        for (holder, column) in &columns {
+            push_tx(
+                &mut ops,
+                format!(
+                    "UPDATE {} SET {} = '{new_q}' WHERE {} = '{old_q}';",
+                    qn(&holder.module, &holder.table),
+                    qi(column),
+                    qi(column)
+                ),
+            );
+        }
+    }
+    ops
+}
+
+/// An enum or custom scalar gone from one module and declared under the same
+/// name in another. Moved with `SET SCHEMA` rather than asked about: dropping
+/// the old type would take every column of that type down with it, and
+/// nothing about a type with the same name in its new module reads otherwise.
+#[derive(Debug, Clone)]
+struct ScalarMove {
+    is_enum: bool,
+    old_module: String,
+    new_module: String,
+    name: String,
+    /// A sequence scalar's `{name}_seq`, which moves along.
+    sequence: bool,
+}
+
+/// Pairs `gone` and `added` `(module, name)`s by name, keeping only the names
+/// that occur exactly once on each side.
+fn moved_by_name<'a>(
+    gone: impl Iterator<Item = (&'a str, &'a str)>,
+    added: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String, String)> {
+    let mut by_name: HashMap<&str, (Vec<&str>, Vec<&str>)> = HashMap::new();
+    for (module, name) in gone {
+        by_name.entry(name).or_default().0.push(module);
+    }
+    for (module, name) in added {
+        by_name.entry(name).or_default().1.push(module);
+    }
+    let mut moves: Vec<(String, String, String)> = by_name
+        .into_iter()
+        .filter_map(|(name, (gone, added))| match (gone.as_slice(), added.as_slice()) {
+            ([old], [new]) => Some((old.to_string(), new.to_string(), name.to_string())),
+            _ => None,
+        })
+        .collect();
+    moves.sort();
+    moves
+}
+
+fn detect_scalar_moves(target: &SchemaDescriptor, current: &DbState) -> Vec<ScalarMove> {
+    let target_enums: HashSet<(&str, &str)> = target
+        .enums
+        .iter()
+        .map(|e| (e.module.as_str(), e.name.as_str()))
+        .collect();
+    let current_enums: HashSet<(&str, &str)> = current
+        .enums
+        .iter()
+        .map(|e| (e.schema.as_str(), e.name.as_str()))
+        .collect();
+    let enum_moves = moved_by_name(
+        current_enums.iter().copied().filter(|k| !target_enums.contains(k)),
+        target_enums.iter().copied().filter(|k| !current_enums.contains(k)),
+    );
+
+    let target_domains: HashSet<(&str, &str)> = target
+        .scalars
+        .iter()
+        .map(|s| (s.module.as_str(), s.name.as_str()))
+        .collect();
+    let current_domains: HashSet<(&str, &str)> = current
+        .domains
+        .iter()
+        .map(|d| (d.schema.as_str(), d.name.as_str()))
+        .collect();
+    let domain_moves = moved_by_name(
+        current_domains.iter().copied().filter(|k| !target_domains.contains(k)),
+        target_domains.iter().copied().filter(|k| !current_domains.contains(k)),
+    );
+
+    let enums = enum_moves.into_iter().map(|(old_module, new_module, name)| ScalarMove {
+        is_enum: true,
+        old_module,
+        new_module,
+        name,
+        sequence: false,
+    });
+    let domains = domain_moves.into_iter().map(|(old_module, new_module, name)| {
+        let sequence = current
+            .sequences
+            .iter()
+            .any(|s| s.schema == old_module && s.name == format!("{name}_seq"));
+        ScalarMove {
+            is_enum: false,
+            old_module,
+            new_module,
+            name,
+            sequence,
+        }
+    });
+    enums.chain(domains).collect()
+}
+
+/// `current` as it is once `moves` have run.
+fn relocate_scalars(current: &DbState, moves: &[ScalarMove]) -> DbState {
+    let mut state = current.clone();
+    for m in moves {
+        if m.is_enum {
+            for e in &mut state.enums {
+                if e.schema == m.old_module && e.name == m.name {
+                    e.schema = m.new_module.clone();
+                }
+            }
+        } else {
+            for d in &mut state.domains {
+                if d.schema == m.old_module && d.name == m.name {
+                    d.schema = m.new_module.clone();
+                }
+            }
+            let seq = format!("{}_seq", m.name);
+            for s in &mut state.sequences {
+                if s.schema == m.old_module && s.name == seq {
+                    s.schema = m.new_module.clone();
+                }
+            }
+        }
+    }
+    state
 }
 
 /// Full diff with confirmed renames and fill expressions applied.
@@ -1757,34 +2275,7 @@ pub fn diff_schema_ops_with_renames_and_fills(
     let mut modified = current.clone();
 
     // ── Emit the rename DDL ───────────────────────────────────────────────────
-    for (old_mod, old_table, new_mod, new_table) in type_renames {
-        if old_mod == new_mod {
-            push_tx(
-                &mut ops,
-                format!("ALTER TABLE {} RENAME TO {};", qn(old_mod, old_table), qi(new_table)),
-            );
-        } else {
-            push_tx(
-                &mut ops,
-                format!("ALTER TABLE {} SET SCHEMA {};", qn(old_mod, old_table), qi(new_mod)),
-            );
-            push_tx(
-                &mut ops,
-                format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, old_table), qi(new_table)),
-            );
-        }
-    }
-    for (module, table, old_col, new_col) in col_renames {
-        push_tx(
-            &mut ops,
-            format!(
-                "ALTER TABLE {} RENAME COLUMN {} TO {};",
-                qn(module, table),
-                qi(old_col),
-                qi(new_col)
-            ),
-        );
-    }
+    ops.extend(type_rename_ddl(current, type_renames, col_renames));
 
     // ── ...and make the baseline match what that DDL will have done ───────────
     apply_renames(&mut modified, type_renames, col_renames);
@@ -1824,6 +2315,7 @@ pub fn diff_schema_ops_with_renames_and_fills(
         );
     }
 
+    ops.extend(renamed_type_name_ops(target, type_renames));
     Ok(ops)
 }
 
@@ -1892,6 +2384,19 @@ pub fn diff_schema_steps_with_renames_and_fills(
         }
     }
 
+    let renamed_names = renamed_type_name_ops(target, type_renames);
+    if !renamed_names.is_empty() {
+        let object_desc = "the type names stored for renamed types".to_string();
+        steps.push(MigrationStep {
+            prompt: format!("did you {} {object_desc}?", Verb::Alter.as_str()),
+            verb: Verb::Alter,
+            object_desc,
+            ddl: renamed_names,
+            required_input: vec![],
+            op_key: OpKey::Table("_pylon".into(), "type names".into()),
+        });
+    }
+
     Ok(steps)
 }
 
@@ -1899,6 +2404,41 @@ pub fn diff_schema_steps_with_renames_and_fills(
 
 fn qi(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// A name the generator gives a trigger function: an interface-link
+/// (`_ifl_`) or interface-exclusive (`_excl_`) guard, or one ending in the
+/// 8- or 12-digit hex hash every other generated trigger carries.
+fn is_generated_trigger_function_name(name: &str) -> bool {
+    if name.starts_with("_ifl_") || name.starts_with("_excl_") {
+        return true;
+    }
+    match name.rsplit_once('_') {
+        Some((prefix, hash)) => {
+            !prefix.is_empty() && matches!(hash.len(), 8 | 12) && hash.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
+/// `name` as Postgres stores it: an identifier longer than 63 bytes is
+/// silently cut there, on a character boundary. A generated constraint name
+/// can run past that, and the database then holds a name the schema never
+/// mentions.
+fn pg_identifier(name: &str) -> &str {
+    const MAX: usize = 63;
+    if name.len() <= MAX {
+        return name;
+    }
+    let mut end = MAX;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+fn same_identifier(a: &str, b: &str) -> bool {
+    pg_identifier(a) == pg_identifier(b)
 }
 
 fn pg_schema(module: &str) -> String {
@@ -2405,6 +2945,16 @@ fn diff_inner(
 ) -> Result<Vec<MigrationStep>, String> {
     let mut steps = StepBuilder::new();
 
+    // Everything below diffs against the state these moves leave behind.
+    let scalar_moves = detect_scalar_moves(target, current);
+    let relocated;
+    let current: &DbState = if scalar_moves.is_empty() {
+        current
+    } else {
+        relocated = relocate_scalars(current, &scalar_moves);
+        &relocated
+    };
+
     let cur_schemas: HashSet<&str> = current.schemas.iter().map(|s| s.as_str()).collect();
     let cur_tables: HashMap<(&str, &str), &DbTable> = current
         .tables
@@ -2502,6 +3052,40 @@ fn diff_inner(
                 },
             );
         }
+    }
+
+    // ── Phase 1.5: enums and custom scalars moved to another module ──────────
+    for m in &scalar_moves {
+        let kind = if m.is_enum { "TYPE" } else { "DOMAIN" };
+        let mut ops = vec![DiffOp {
+            sql: format!(
+                "ALTER {kind} {} SET SCHEMA {};",
+                qn(&m.old_module, &m.name),
+                pg_schema(&m.new_module)
+            ),
+            non_transactional: false,
+        }];
+        if m.sequence {
+            ops.push(DiffOp {
+                sql: format!(
+                    "ALTER SEQUENCE {} SET SCHEMA {};",
+                    qn(&m.old_module, &format!("{}_seq", m.name)),
+                    pg_schema(&m.new_module)
+                ),
+                non_transactional: false,
+            });
+        }
+        steps.extend(
+            OpKey::Scalar(m.new_module.clone(), m.name.clone()),
+            Verb::Rename,
+            format!(
+                "{} to '{}::{}'",
+                verbosename_scalar(&m.old_module, &m.name),
+                m.new_module,
+                m.name
+            ),
+            ops,
+        );
     }
 
     // Composite types this schema wants. Needed as early as Phase 2.2, which
@@ -2709,7 +3293,7 @@ fn diff_inner(
         let unchanged = wanted.len() == cur_domain.checks.len()
             && wanted
                 .iter()
-                .all(|(_, _, cname, _)| cur_domain.checks.iter().any(|name| name == cname));
+                .all(|(_, _, cname, _)| cur_domain.checks.iter().any(|name| same_identifier(name, cname)));
         if unchanged {
             continue;
         }
@@ -3061,7 +3645,7 @@ fn diff_inner(
         // as missing (see `drop_generated_checks`).
         let already_there = cur_tables
             .get(&(module.as_str(), table.as_str()))
-            .map(|t| t.checks.iter().any(|c| c.constraint_name == cname))
+            .map(|t| t.checks.iter().any(|c| same_identifier(&c.constraint_name, &cname)))
             .unwrap_or(false)
             && !dropped_checks.contains(&(module.clone(), table.clone(), cname.clone()));
         if already_there {
@@ -3415,16 +3999,6 @@ fn diff_inner(
     // "altering type X", not as separate objects) ────────────────────────────
     {
         let infos = crate::export::interface_exclusive_trigger_infos(target);
-        let cur_trigger_map: HashMap<(&str, &str), HashSet<&str>> = current
-            .tables
-            .iter()
-            .map(|t| {
-                (
-                    (t.schema.as_str(), t.name.as_str()),
-                    t.triggers.iter().map(|n| n.as_str()).collect::<HashSet<_>>(),
-                )
-            })
-            .collect();
 
         // What every table's trigger set *should* be once `target` is fully
         // applied — the single source of truth both the add-decisions below
@@ -3432,6 +4006,102 @@ fn diff_inner(
         // `expected_triggers`'s own doc comment for why this must be one
         // shared computation, not two).
         let expected_trigger_map = expected_triggers(target, &type_map);
+
+        // A trigger whose name is expected can still run the wrong function:
+        // `SET SCHEMA` moves a table's triggers along with it but leaves
+        // their functions behind, still reading the table under its old
+        // name. Such a trigger is stale, and is replaced like a missing one.
+        let target_trigger_fns = expected_trigger_functions(target, &type_map);
+        let expected_fn_of: HashMap<(&str, &str, &str), (&str, &str)> = target_trigger_fns
+            .iter()
+            .map(|f| {
+                (
+                    (f.schema.as_str(), f.table.as_str(), f.trigger.as_str()),
+                    (f.function_schema.as_str(), f.function.as_str()),
+                )
+            })
+            .collect();
+        let current_fn_of: HashMap<(&str, &str, &str), (&str, &str)> = current
+            .trigger_functions
+            .iter()
+            .map(|f| {
+                (
+                    (f.schema.as_str(), f.table.as_str(), f.trigger.as_str()),
+                    (f.function_schema.as_str(), f.function.as_str()),
+                )
+            })
+            .collect();
+        let stale: HashSet<(&str, &str, &str)> = current_fn_of
+            .iter()
+            .filter(|(key, function)| expected_fn_of.get(key).is_some_and(|expected| expected != *function))
+            .map(|(key, _)| *key)
+            .collect();
+
+        let cur_trigger_map: HashMap<(&str, &str), HashSet<&str>> = current
+            .tables
+            .iter()
+            .map(|t| {
+                (
+                    (t.schema.as_str(), t.name.as_str()),
+                    t.triggers
+                        .iter()
+                        .map(|n| n.as_str())
+                        .filter(|n| !stale.contains(&(t.schema.as_str(), t.name.as_str(), *n)))
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect();
+
+        // Every trigger this diff drops: the stale ones above, and the ones
+        // the target no longer declares on a table it keeps.
+        let mut dropped_triggers: HashSet<(&str, &str, &str)> = stale.clone();
+        for cur_table in &current.tables {
+            if !target_tables.contains(&(cur_table.schema.clone(), cur_table.name.clone())) {
+                continue;
+            }
+            let expected = expected_trigger_map.get(&(cur_table.schema.clone(), cur_table.name.clone()));
+            for trigger in &cur_table.triggers {
+                if !expected.is_some_and(|e| e.contains(trigger)) {
+                    dropped_triggers.insert((cur_table.schema.as_str(), cur_table.name.as_str(), trigger.as_str()));
+                }
+            }
+        }
+        // A function is only dropped once nothing will run it any more: not
+        // the target's triggers, and none of the current ones that stay.
+        let wanted_fns: HashSet<(&str, &str)> = target_trigger_fns
+            .iter()
+            .map(|f| (f.function_schema.as_str(), f.function.as_str()))
+            .chain(
+                current_fn_of
+                    .iter()
+                    .filter(|(key, _)| !dropped_triggers.contains(*key))
+                    .map(|(_, function)| *function),
+            )
+            .collect();
+        let mut dropped_fns: HashSet<(String, String)> = HashSet::new();
+        let mut drop_trigger_ops = |schema: &str, table: &str, trigger: &str| -> Vec<DiffOp> {
+            let mut ops = vec![DiffOp {
+                sql: format!("DROP TRIGGER IF EXISTS {} ON {};", qi(trigger), qn(schema, table)),
+                non_transactional: false,
+            }];
+            // Generated triggers name their function after themselves, which
+            // is the only guess left for a baseline that never recorded where
+            // the function is.
+            let (fn_schema, fn_name) = current_fn_of
+                .get(&(schema, table, trigger))
+                .copied()
+                .unwrap_or((schema, trigger));
+            if fn_schema != "_pylon"
+                && !wanted_fns.contains(&(fn_schema, fn_name))
+                && dropped_fns.insert((fn_schema.to_string(), fn_name.to_string()))
+            {
+                ops.push(DiffOp {
+                    sql: format!("DROP FUNCTION IF EXISTS {}();", qn(fn_schema, fn_name)),
+                    non_transactional: false,
+                });
+            }
+            ops
+        };
 
         // A physical table's (module, name) -> the type whose step its
         // trigger changes should fold into. Concrete tables own themselves;
@@ -3472,6 +4142,15 @@ fn diff_inner(
                 verbosename_type(module, table),
             )
         };
+
+        // Ahead of the adds below, which re-create these under the same name.
+        let mut stale_sorted: Vec<&(&str, &str, &str)> = stale.iter().collect();
+        stale_sorted.sort();
+        for &(schema, table, trigger) in stale_sorted {
+            let (key, verb, desc) = owner_of(schema, table);
+            let ops = drop_trigger_ops(schema, table, trigger);
+            steps.extend(key, verb, desc, ops);
+        }
 
         struct PendingExclTrigger<'a> {
             info: &'a crate::export::ExclTriggerInfo,
@@ -3682,42 +4361,13 @@ fn diff_inner(
             for trigger_name in &cur_table.triggers {
                 if !expected.contains(trigger_name) {
                     let (owner_key, verb, desc) = owner_of(&cur_table.schema, &cur_table.name);
-                    steps.extend(
-                        owner_key,
-                        verb,
-                        desc,
-                        vec![
-                            DiffOp {
-                                sql: format!(
-                                    "DROP TRIGGER IF EXISTS {} ON {};",
-                                    qi(trigger_name),
-                                    qn(&cur_table.schema, &cur_table.name)
-                                ),
-                                non_transactional: false,
-                            },
-                            // Generated triggers name their function after
-                            // themselves, so dropping one leaves an
-                            // unreferenced function behind. That was rare
-                            // while trigger names were stable; now that a
-                            // name follows its body (see `trigger_names` in
-                            // `export`), every codegen change renames, and
-                            // the orphans would accumulate — and read as
-                            // live triggers to anyone introspecting.
-                            //
-                            // A no-op for triggers that don't follow that
-                            // convention: the cache-invalidate trigger's
-                            // function lives in `_pylon`, and the two
-                            // interface-exclusive triggers (`..._ins`,
-                            // `..._upd`) share one function named after
-                            // neither. Nothing shared is reachable by this
-                            // name, so this can't drop a function another
-                            // trigger still needs.
-                            DiffOp {
-                                sql: format!("DROP FUNCTION IF EXISTS {}();", qn(&cur_table.schema, trigger_name)),
-                                non_transactional: false,
-                            },
-                        ],
-                    );
+                    // The function goes with it: a trigger's name follows its
+                    // body (see `trigger_names` in `export`), so every codegen
+                    // change renames one, and the functions left behind would
+                    // accumulate. It is dropped where it really lives, which
+                    // for an interface-link trigger is not the table's module.
+                    let ops = drop_trigger_ops(&cur_table.schema, &cur_table.name, trigger_name);
+                    steps.extend(owner_key, verb, desc, ops);
                 }
             }
         }
@@ -3732,7 +4382,7 @@ fn diff_inner(
     let expected_checks: HashSet<(String, String, String)> = crate::export::check_constraints(target)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|(module, table, name, _)| (module, table, name))
+        .map(|(module, table, name, _)| (module, table, pg_identifier(&name).to_string()))
         .collect();
     for cur_table in &current.tables {
         if !target_tables.contains(&(cur_table.schema.clone(), cur_table.name.clone())) {
@@ -3747,7 +4397,8 @@ fn diff_inner(
                 cur_table.name.clone(),
                 check.constraint_name.clone(),
             );
-            if expected_checks.contains(&key) || dropped_checks.contains(&key) {
+            let stored = (key.0.clone(), key.1.clone(), pg_identifier(&key.2).to_string());
+            if expected_checks.contains(&stored) || dropped_checks.contains(&key) {
                 continue;
             }
             steps.extend(
@@ -3828,6 +4479,78 @@ fn diff_inner(
                     ),
                     non_transactional: false,
                 }],
+            );
+        }
+    }
+
+    // ── Phase 11.95: drop functions that moved to another module ─────────────
+    // `CREATE OR REPLACE` in the new module leaves the old definition where
+    // it was, still reading the tables under their old names. Only a
+    // function the schema now declares elsewhere: a live database also lists
+    // trigger and bootstrap functions, which this has no business touching.
+    {
+        let target_fns: HashSet<(&str, &str)> = target
+            .functions
+            .iter()
+            .map(|f| (f.module.as_str(), f.name.as_str()))
+            .collect();
+        let target_fn_names: HashSet<&str> = target.functions.iter().map(|f| f.name.as_str()).collect();
+        let mut moved: Vec<(&str, &str)> = current
+            .functions
+            .iter()
+            .map(|f| (f.schema.as_str(), f.name.as_str()))
+            .filter(|key| !target_fns.contains(key) && target_fn_names.contains(key.1))
+            .collect();
+        moved.sort();
+        moved.dedup();
+        for (module, name) in moved {
+            let pg_name = if module == "default" { "public" } else { module };
+            steps.push(
+                OpKey::Function(module.to_string(), name.to_string()),
+                Verb::Drop,
+                verbosename_function(module, name),
+                DiffOp {
+                    sql: format!(
+                        "DO $$ DECLARE r record; BEGIN \
+                         FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE n.nspname = '{}' AND p.proname = '{}' \
+                         LOOP EXECUTE 'DROP FUNCTION ' || r.sig; END LOOP; END $$;",
+                        pg_name.replace('\'', "''"),
+                        name.replace('\'', "''")
+                    ),
+                    non_transactional: false,
+                },
+            );
+        }
+    }
+
+    // ── Phase 11.96: drop generated trigger functions nothing runs ───────────
+    // Left behind by drops that looked for them in the wrong schema, before
+    // trigger functions were tracked where they live. Only names Pylon
+    // generates, so a hand-written function is never touched.
+    {
+        let target_trigger_fns = expected_trigger_functions(target, &type_map);
+        let wanted: HashSet<(&str, &str)> = target_trigger_fns
+            .iter()
+            .map(|f| (f.function_schema.as_str(), f.function.as_str()))
+            .collect();
+        let mut orphans: Vec<&DbFunctionName> = current
+            .orphaned_trigger_functions
+            .iter()
+            .filter(|f| is_generated_trigger_function_name(&f.name))
+            .filter(|f| !wanted.contains(&(f.schema.as_str(), f.name.as_str())))
+            .collect();
+        orphans.sort();
+        for f in orphans {
+            steps.push(
+                OpKey::Function(f.schema.clone(), f.name.clone()),
+                Verb::Drop,
+                verbosename_function(&f.schema, &f.name),
+                DiffOp {
+                    sql: format!("DROP FUNCTION IF EXISTS {}();", qn(&f.schema, &f.name)),
+                    non_transactional: false,
+                },
             );
         }
     }
@@ -7348,6 +8071,264 @@ mod tests {
             create_new < composite_rebuild && composite_rebuild < drop_old,
             "the composite must be rebuilt before the old enum is dropped; got:\n{joined}"
         );
+    }
+
+    // ── Moving types between modules ────────────────────────────────────────
+
+    /// `Parent` (an enum property, a multi-link to `Child`, an audit trigger)
+    /// and `Child`, all in `module`, plus a `logging::Audit` the trigger
+    /// writes the type's name into.
+    fn family_in(module: &str) -> SchemaDescriptor {
+        use crate::schema::MultiLinkDescriptor;
+        let mut child = simple_type(module, "Child", "Child");
+        child.properties.push(prop("rank", "int4", true));
+        let mut parent = simple_type(module, "Parent", "Parent");
+        parent
+            .properties
+            .push(prop("status", &format!("\"{module}\".\"Status\""), true));
+        parent.multilinks = vec![MultiLinkDescriptor {
+            name: "children".into(),
+            target: format!("{module}::Child"),
+            through: None,
+            nullable: true,
+            description: None,
+            default_pyql: None,
+            on_delete: vec![],
+            is_exclusive: false,
+        }];
+        parent.triggers = vec![crate::schema::TriggerDescriptor {
+            on: 1,
+            timing: "After".into(),
+            handler: "insert logging::Audit { kind := __new__.__type__ }".into(),
+        }];
+        let mut audit = simple_type("logging", "Audit", "Audit");
+        audit.properties.push(prop("kind", "text", true));
+        SchemaDescriptor {
+            types: vec![child, parent, audit],
+            enums: vec![EnumDescriptor {
+                name: "Status".into(),
+                module: module.into(),
+                members: vec!["Draft".into(), "Live".into()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    type Rename = (String, String, String, String);
+
+    fn moved_family() -> (DbState, SchemaDescriptor, Vec<Rename>, String) {
+        let state = schema_to_db_state(&family_in("a"));
+        let target = family_in("b");
+        let moves: Vec<(String, String, String, String)> = detect_module_moves(&target, &state, Some(&family_in("a")))
+            .into_iter()
+            .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
+            .collect();
+        let joined = sql_of(&diff_schema_ops_with_renames_and_fills(&target, &state, &moves, &[], &[]).unwrap());
+        (state, target, moves, joined)
+    }
+
+    #[test]
+    fn a_type_that_changed_module_is_detected_as_a_move() {
+        let (_, _, moves, _) = moved_family();
+        let mut moved: Vec<&str> = moves.iter().map(|m| m.1.as_str()).collect();
+        moved.sort();
+        assert_eq!(moved, ["Child", "Parent"], "got: {moves:?}");
+        assert!(moves.iter().all(|m| m.0 == "a" && m.2 == "b" && m.1 == m.3));
+    }
+
+    #[test]
+    fn a_moved_type_takes_its_rows_junction_table_and_enum_along() {
+        let (_, _, _, joined) = moved_family();
+        for statement in [
+            r#"ALTER TABLE "a"."Parent" SET SCHEMA "b";"#,
+            r#"ALTER TABLE "a"."Parent.children" SET SCHEMA "b";"#,
+            r#"ALTER TABLE "a"."Child" SET SCHEMA "b";"#,
+            r#"ALTER TYPE "a"."Status" SET SCHEMA "b";"#,
+        ] {
+            assert!(joined.contains(statement), "missing {statement}:\n{joined}");
+        }
+        assert!(!joined.contains("DROP TABLE"), "nothing may be dropped:\n{joined}");
+        assert!(!joined.contains("DROP TYPE"), "nothing may be dropped:\n{joined}");
+        assert!(!joined.contains("CREATE TABLE"), "nothing may be re-created:\n{joined}");
+        let create_schema = at(&joined, r#"CREATE SCHEMA IF NOT EXISTS "b";"#);
+        assert!(
+            create_schema < at(&joined, "SET SCHEMA"),
+            "the module has to exist before anything moves into it:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_moved_types_triggers_are_rebuilt_next_to_it() {
+        // `SET SCHEMA` carries the triggers along and leaves their functions
+        // in the old module, still writing the old type name.
+        let (state, target, moves, joined) = moved_family();
+        let old = state
+            .trigger_functions
+            .iter()
+            .find(|f| f.table == "Parent" && f.function_schema == "a" && f.trigger != "pylon_cache_invalidate")
+            .expect("the audit trigger's function is recorded in the baseline");
+        let drop_trigger = at(
+            &joined,
+            &format!("DROP TRIGGER IF EXISTS \"{}\" ON \"b\".\"Parent\";", old.trigger),
+        );
+        at(
+            &joined,
+            &format!("DROP FUNCTION IF EXISTS \"a\".\"{}\"();", old.function),
+        );
+        let new = expected_trigger_functions(&target, &HashMap::new())
+            .into_iter()
+            .find(|f| f.table == "Parent")
+            .expect("target has the audit trigger");
+        assert_eq!(new.function_schema, "b");
+        let create = at(&joined, &format!("FUNCTION \"b\".\"{}\"()", new.function));
+        // Under the same name the old trigger is in the way; under a new one
+        // it is just swept up afterwards.
+        if new.trigger == old.trigger {
+            assert!(drop_trigger < create, "the stale trigger goes first:\n{joined}");
+        }
+        assert!(!moves.is_empty());
+    }
+
+    #[test]
+    fn a_moved_trigger_keeping_its_name_is_dropped_before_it_is_re_added() {
+        // A rewrite's trigger name hashes only its own expression, so it is
+        // the same in either module — and there already is one by that name
+        // on the moved table, running the function left behind.
+        let with_rewrite = |module: &str| {
+            let mut schema = family_in(module);
+            let parent = schema.types.iter_mut().find(|t| t.name == "Parent").unwrap();
+            parent.triggers.clear();
+            let mut done = prop("done", "bool", true);
+            done.rewrites = vec![crate::schema::RewriteEntry {
+                on: 1,
+                handler: "EXISTS (.name)".into(),
+            }];
+            parent.properties.push(done);
+            schema
+        };
+        let state = schema_to_db_state(&with_rewrite("a"));
+        let target = with_rewrite("b");
+        let moves: Vec<(String, String, String, String)> =
+            detect_module_moves(&target, &state, Some(&with_rewrite("a")))
+                .into_iter()
+                .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
+                .collect();
+        let joined = sql_of(&diff_schema_ops_with_renames_and_fills(&target, &state, &moves, &[], &[]).unwrap());
+        let rewrite = state
+            .trigger_functions
+            .iter()
+            .find(|f| f.trigger.contains("_rw_"))
+            .expect("the rewrite trigger is recorded");
+        let drop = at(
+            &joined,
+            &format!("DROP TRIGGER IF EXISTS \"{}\" ON \"b\".\"Parent\";", rewrite.trigger),
+        );
+        at(
+            &joined,
+            &format!("DROP FUNCTION IF EXISTS \"a\".\"{}\"();", rewrite.function),
+        );
+        let create = at(&joined, &format!("FUNCTION \"b\".\"{}\"()", rewrite.function));
+        assert!(drop < create, "got:\n{joined}");
+    }
+
+    #[test]
+    fn a_moved_types_stored_names_follow_it() {
+        let (_, _, _, joined) = moved_family();
+        for statement in [
+            r#"UPDATE "logging"."Audit" SET "kind" = 'b::Parent' WHERE "kind" = 'a::Parent';"#,
+            r#"UPDATE _pylon."IndexOutbox" SET type_name = 'b::Parent' WHERE type_name = 'a::Parent';"#,
+            r#"UPDATE _pylon."SignalOutbox" SET type_name = 'b::Child' WHERE type_name = 'a::Child';"#,
+        ] {
+            assert!(joined.contains(statement), "missing {statement}:\n{joined}");
+        }
+    }
+
+    #[test]
+    fn a_type_name_leaving_two_modules_is_not_guessed_at() {
+        let mut before = family_in("a");
+        before
+            .types
+            .extend(family_in("c").types.into_iter().filter(|t| t.name == "Child"));
+        let state = schema_to_db_state(&before);
+        let moves = detect_module_moves(&family_in("b"), &state, Some(&before));
+        assert!(
+            moves.iter().all(|m| m.old_table != "Child"),
+            "two Child tables could have gone either way: {moves:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_table_pylon_never_declared_is_not_taken_over() {
+        let state = schema_to_db_state(&family_in("a"));
+        assert!(detect_module_moves(&family_in("b"), &state, None).is_empty());
+        let unrelated = family_in("c");
+        assert!(detect_module_moves(&family_in("b"), &state, Some(&unrelated)).is_empty());
+    }
+
+    #[test]
+    fn a_stale_trigger_function_is_dropped_where_it_lives() {
+        // An interface-link trigger sits on the implementor's table while its
+        // function lives in the referencing type's module; dropping it under
+        // the table's module found nothing.
+        let target = family_in("a");
+        let mut state = schema_to_db_state(&target);
+        let table = state.tables.iter_mut().find(|t| t.name == "Child").unwrap();
+        table.triggers.push("_ifl_Other_owner_deadbeef".into());
+        state.trigger_functions.push(DbTriggerFunction {
+            schema: "a".into(),
+            table: "Child".into(),
+            trigger: "_ifl_Other_owner_deadbeef".into(),
+            function_schema: "elsewhere".into(),
+            function: "_ifl_Other_owner_deadbeef".into(),
+        });
+        let joined = diff_schema(&target, &state).unwrap().join("\n");
+        assert!(
+            joined.contains(r#"DROP FUNCTION IF EXISTS "elsewhere"."_ifl_Other_owner_deadbeef"();"#),
+            "got:\n{joined}"
+        );
+        assert!(!joined.contains(r#""a"."_ifl_Other_owner_deadbeef""#), "got:\n{joined}");
+    }
+
+    #[test]
+    fn only_generated_orphaned_trigger_functions_are_dropped() {
+        let target = family_in("a");
+        let mut state = schema_to_db_state(&target);
+        state.orphaned_trigger_functions = vec![
+            DbFunctionName {
+                schema: "a".into(),
+                name: "Parent_rw_ins_0123456789ab".into(),
+            },
+            DbFunctionName {
+                schema: "a".into(),
+                name: "_excl_Parent_name".into(),
+            },
+            DbFunctionName {
+                schema: "a".into(),
+                name: "hand_written_audit".into(),
+            },
+        ];
+        let joined = diff_schema(&target, &state).unwrap().join("\n");
+        assert!(joined.contains(r#"DROP FUNCTION IF EXISTS "a"."Parent_rw_ins_0123456789ab"();"#));
+        assert!(joined.contains(r#"DROP FUNCTION IF EXISTS "a"."_excl_Parent_name"();"#));
+        assert!(!joined.contains("hand_written_audit"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn a_trigger_function_baseline_is_derived_when_it_was_never_recorded() {
+        let schema = family_in("a");
+        let mut state = schema_to_db_state(&schema);
+        let recorded = std::mem::take(&mut state.trigger_functions);
+        fill_trigger_functions(&mut state, &schema);
+        assert_eq!(state.trigger_functions, recorded);
+    }
+
+    #[test]
+    fn a_constraint_name_postgres_cut_short_still_counts_as_generated() {
+        let full = format!("{}_deadbeef_check", "T".repeat(50));
+        assert_eq!(pg_identifier(&full).len(), 63);
+        assert!(is_generated_check_name(pg_identifier(&full)));
+        assert!(same_identifier(&full, pg_identifier(&full)));
+        assert!(!is_generated_check_name("Person_hand_written_check"));
     }
 }
 

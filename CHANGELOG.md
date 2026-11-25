@@ -4,6 +4,52 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
+## 0.12.0
+
+### Migrations
+
+* Moving a type to another module no longer loses its data. The diff saw a
+  table gone from one module and a new one in another, and wrote `DROP TABLE
+  … CASCADE` plus an empty `CREATE TABLE` — silently, in non-interactive
+  mode, and even confirming the rename interactively left the link tables
+  out, so their rows went with the old names. A type that keeps its name is
+  now moved with `ALTER TABLE … SET SCHEMA`, its link tables along with it;
+  non-interactively that happens without asking when the move is
+  unambiguous and the last migration declared the type there. An enum or
+  custom scalar that moves under its own name is moved with `SET SCHEMA`
+  too, where it used to be dropped with every column of its type.
+* Everything compiled against a moved type's old name follows it. `SET
+  SCHEMA` carries a table's triggers along but leaves their functions
+  behind, still reading the old tables; such a trigger is now recognised as
+  stale and rebuilt in the new module, and the old function dropped. A
+  schema function declared in a new module drops its copy in the old one.
+  A `Trigger` handler that stores `__type__` (an audit log's `type :=
+  __new__.__type__`) gets its existing rows updated to the new name, and so
+  do the type's pending index and signal outbox jobs.
+* A dropped trigger's function is dropped where it actually lives. The diff
+  assumed the trigger table's module, which for an interface-link trigger
+  is the implementor's, not the module the function was created in — every
+  such `DROP FUNCTION IF EXISTS` hit nothing and left the function behind.
+  A diff against the live database now also drops generated trigger
+  functions that no trigger runs, which those drops left behind.
+* `pylon migration create --non-interactive` refuses to drop a table that
+  still holds rows, instead of writing the drop unasked. Run it
+  interactively to decide each drop, or pass `--allow-unsafe`.
+* A migration applied without a recorded baseline — written by hand with
+  `--blank`, or created against another database — no longer records the
+  schema files as the state it reached. It used to, so after a hand-written
+  `SET SCHEMA` the next `create` reported "No schema changes detected"
+  while every trigger function still pointed at the old tables. That
+  `create` now diffs against the live database, and `create --live` does
+  so on demand.
+* A diff against the live database of a database that matches its schema
+  is empty. Every column default came back from Postgres with casts added,
+  and every interface view and schema function in Postgres's own
+  formatting, so all of them were re-proposed each time. The schema's
+  version of each is now built as a temporary object and compared by
+  Postgres itself. A generated check-constraint name longer than 63 bytes,
+  which Postgres stores cut short, no longer reads as missing either.
+
 ## 0.11.0 — 2026-11-23
 
 ### Migrations

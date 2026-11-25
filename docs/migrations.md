@@ -39,7 +39,9 @@ pylon migration create
 
 Every unapplied migration must already be applied before you can create a new one — `create` needs the live database to actually be at the chain tip to diff against, otherwise the diff would be computed against a moving target.
 
-Writing the file also records, on the migration's own tracking row, the state that migration reaches. Editing the schema afterwards (which the rule above makes the normal way to work) therefore can't move the baseline out from under it. A migration created with changes left out — a rejected step, or stopping the prompt loop early — doesn't reach the compiled schema, so no baseline is recorded for it and the next `create` falls back to introspecting the live database, which re-proposes unchanged functions and interface types.
+Writing the file also records, on the migration's own tracking row, the state that migration reaches. Editing the schema afterwards (which the rule above makes the normal way to work) therefore can't move the baseline out from under it. A migration created with changes left out — a rejected step, or stopping the prompt loop early — doesn't reach the compiled schema, so no baseline is recorded for it and the next `create` falls back to introspecting the live database. So does one with no tracking row at all when it is applied — written by hand with `--blank`, or created against another database — since nothing says how far its DDL got. `--live` forces the same comparison at any time.
+
+Against the live database, a column default, interface view or schema function that already is what the schema declares is recognised as such: Postgres keeps none of them as written, so each is checked by having Postgres build the schema's version as a temporary object and compare the two. A live diff of a database that matches its schema is empty.
 
 The diff engine compares your compiled schema against the database's introspected structure and produces a sequence of steps: create/alter/drop table, add/drop/alter column, create/drop index, install/replace function, and so on. Two categories need special handling beyond a plain accept/reject:
 
@@ -54,6 +56,18 @@ did you rename object type 'shop::Product' to 'shop::Item'?
 ```
 
 Rejecting a candidate doesn't just skip it — it's banned for the rest of this `create` run, and the diff engine searches again with that pairing excluded, typically converging on a plain drop+create instead. This is the one place in the whole flow with real ambiguity to search over; every other kind of step has no alternative interpretation, so a rejection there just excludes it.
+
+### Moving a type to another module
+
+A type that keeps its name but moves to another module is a rename too (`did you rename object type 'shop::Product' to 'catalog::Product'?`), and confirming it moves the table with `ALTER TABLE … SET SCHEMA` instead of dropping and re-creating it. Its link tables (`Product.tags`) move with it. An enum or custom scalar that moves under its own name is moved the same way without asking, since dropping it would take every column of that type down with it.
+
+What does not move along is everything compiled against the old name, so the migration rebuilds it in the new module and drops the old copy: the type's trigger functions (rewrites, delete policies, interface links, `Trigger`s), and any schema function that moved with it. Stored type names follow too: a `Trigger` handler that writes `__type__` into a property (an audit log's `type := __new__.__type__`) has its existing rows updated to the new name, as do the type's pending index and signal outbox jobs.
+
+Non-interactively there is nobody to ask, so a move is taken without asking when it is unambiguous: the same name gone from exactly one module and new in exactly one other, with largely the same columns, and a type the last migration actually declared there. A same-named table Pylon never created is never taken over.
+
+### Steps that would drop rows
+
+Interactively every dropped type is its own question. Non-interactively, a migration that would drop a table still holding rows — a type removed, or renamed further than rename detection recognises — is refused instead of written; run it interactively to decide each drop, or pass `--allow-unsafe` to drop them anyway.
 
 ### Fill expressions
 
@@ -114,7 +128,7 @@ pylon migration create --blank
 pylon migration rehash dbschema/migrations/00004_m1xxxxxx.sql
 ```
 
-`--blank` skips diffing entirely and writes an empty, hand-editable stub — for a migration whose DDL you want to write yourself (e.g. a data-only migration with no schema change at all). Since the file's ID is a content hash of its body, editing it by hand invalidates the header — `rehash` recomputes the ID and renames the file to match. Only valid for the current chain tip, and only before that migration has been applied anywhere (once applied, its ID is a commitment other databases may already be keying off of).
+`--blank` skips diffing entirely and writes an empty, hand-editable stub — for a migration whose DDL you want to write yourself (e.g. a data-only migration with no schema change at all). Nothing records what state it reaches, so the `create` after it diffs against the live database and picks up whatever the hand-written DDL left for Pylon to finish. Since the file's ID is a content hash of its body, editing it by hand invalidates the header — `rehash` recomputes the ID and renames the file to match. Only valid for the current chain tip, and only before that migration has been applied anywhere (once applied, its ID is a commitment other databases may already be keying off of).
 
 ## Collapsing history: `squash`
 

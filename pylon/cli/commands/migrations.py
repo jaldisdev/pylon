@@ -213,7 +213,6 @@ async def _apply(
         migration_try_advisory_lock,
         migration_write_schema_snapshot,
         pgcon_connect,
-        schema_to_db_state_json,
     )
 
     config = ctx.obj['config']
@@ -304,14 +303,22 @@ async def _apply(
                     "\nThe next 'pylon migration create' will diff against the live database instead."
                 )
         elif tip.id == chain[-1].id:
-            # No recorded baseline (created on another machine, or by a Pylon
-            # that predates this), but the whole on-disk chain is applied — so
-            # the schema files do describe the state just reached.
+            # No recorded baseline: written by hand (--blank), created on
+            # another machine, or by a Pylon that predates recording one. The
+            # schema files describe what the chain *means* to reach, so they
+            # stand in for the schema; but nothing says the DDL actually got
+            # there — a hand-written migration usually moves only part of
+            # the way — so no db_state is recorded, and the next create diffs
+            # against the live database instead of trusting the files.
             schema = _reload_schema(config)
             schema_json = schema.to_json()
             await pool.execute(
-                'UPDATE _pylon."Migrations" SET db_state = $1::jsonb, schema_state = $2::jsonb WHERE id = $3',
-                [schema_to_db_state_json(schema), schema_json, tip.id],
+                'UPDATE _pylon."Migrations" SET db_state = NULL, schema_state = $1::jsonb WHERE id = $2',
+                [schema_json, tip.id],
+            )
+            click.echo(
+                f'\n{tip.filename} carries no recorded baseline, so the next '
+                "'pylon migration create' diffs against the live database."
             )
         else:
             # Stopped short of the chain tip with nothing recorded to fall
@@ -538,6 +545,7 @@ async def _status(ctx: click.Context, dev_mode: bool) -> None:
         )
 
         schema = _reload_schema(config)
+        db_state = await introspect_db_state(pool, schema)
         ops = _core_diff_schema(schema, db_state)
 
         # DDL diffs alone miss schema semantics with zero physical footprint
@@ -693,7 +701,7 @@ async def _sync_once(config) -> None:
     schema = _reload_schema(config)
 
     pool = await pgcon_connect(_pg_dsn(config), 2)
-    db_state = await introspect_db_state(pool)
+    db_state = await introspect_db_state(pool, schema)
 
     ops = _diff_schema(schema, db_state)
 
@@ -856,6 +864,19 @@ def _reload_schema(config):
     default=False,
     help="Omit the outbox backfill for added/amended search and vector indexes; run 'pylon index rebuild' instead.",
 )
+@click.option(
+    '--allow-unsafe',
+    'allow_unsafe',
+    is_flag=True,
+    default=False,
+    help='With --non-interactive, drop tables that still hold rows instead of refusing to.',
+)
+@click.option(
+    '--live',
+    is_flag=True,
+    default=False,
+    help='Diff against the introspected database instead of the state recorded by the last migration.',
+)
 @requires_config
 @click.pass_context
 def create(
@@ -866,17 +887,22 @@ def create(
     non_interactive: bool,
     expert: bool,
     no_index_backfill: bool,
+    allow_unsafe: bool,
+    live: bool,
 ) -> None:
     """Generate a new migration file.
 
-    Diffs the compiled schema against the live database and writes a migration
-    file for any pending changes. Use --blank to skip diffing and write a
-    hand-editable stub instead.
+    Diffs the compiled schema against the state the last applied migration
+    recorded, or against the introspected database when it recorded none
+    (or with --live), and writes a migration file for any pending changes.
+    Use --blank to skip diffing and write a hand-editable stub instead.
     """
     if blank:
         _create_blank(ctx, name, dry_run)
     else:
-        asyncio.run(_create_from_diff(ctx, name, dry_run, non_interactive, expert, no_index_backfill))
+        asyncio.run(
+            _create_from_diff(ctx, name, dry_run, non_interactive, expert, no_index_backfill, allow_unsafe, live)
+        )
 
 
 def _create_blank(ctx: click.Context, name: str | None, dry_run: bool) -> None:
@@ -1003,21 +1029,16 @@ def _ask_action(
             click.echo(f'  Unknown option. Enter one of: {hint}')
 
 
-def _rename_ddl(type_renames: list[tuple], col_renames: list[tuple]) -> list[tuple[str, bool]]:
-    """Render confirmed rename tuples back to (sql, non_transactional) pairs
-    — used both by the rename loop's own "confirmed"/"stop" display and to
-    assemble the final migration body alongside the general diff's DDL.
+def _rename_ddl(db_state, type_renames: list[tuple], col_renames: list[tuple]) -> list[tuple[str, bool]]:
+    """Render confirmed rename tuples to (sql, non_transactional) pairs — used
+    both by the rename loop's own "confirmed"/"stop" display and to assemble
+    the final migration body alongside the general diff's DDL. A renamed or
+    moved type's junction tables go with it, which is why this needs the
+    database state.
     """
-    ops: list[tuple[str, bool]] = []
-    for old_mod, old_table, new_mod, new_table in type_renames:
-        if old_mod == new_mod:
-            ops.append((f'ALTER TABLE "{old_mod}"."{old_table}" RENAME TO "{new_table}";', False))
-        else:
-            ops.append((f'ALTER TABLE "{old_mod}"."{old_table}" SET SCHEMA "{new_mod}";', False))
-            ops.append((f'ALTER TABLE "{new_mod}"."{old_table}" RENAME TO "{new_table}";', False))
-    for module, table, old_col, new_col in col_renames:
-        ops.append((f'ALTER TABLE "{module}"."{table}" RENAME COLUMN "{old_col}" TO "{new_col}";', False))
-    return ops
+    from pylon._core import type_rename_ddl
+
+    return type_rename_ddl(db_state, list(type_renames), list(col_renames))
 
 
 def _rename_prompt_loop(
@@ -1060,22 +1081,18 @@ def _rename_prompt_loop(
 
         if type_candidates:
             old_mod, old_table, new_mod, new_table, new_type_name, _confidence = type_candidates[0]
-            if old_mod == new_mod:
-                ddl = [f'ALTER TABLE "{old_mod}"."{old_table}" RENAME TO "{new_table}";']
-            else:
-                ddl = [
-                    f'ALTER TABLE "{old_mod}"."{old_table}" SET SCHEMA "{new_mod}";',
-                    f'ALTER TABLE "{new_mod}"."{old_table}" RENAME TO "{new_table}";',
-                ]
-            prompt = f"did you rename object type '{old_mod}::{old_table}' to '{new_type_name}'?"
-            kind, data = 'type', (old_mod, old_table, new_mod, new_table)
+            data = (old_mod, old_table, new_mod, new_table)
+            ddl = [sql for sql, _ in _rename_ddl(db_state, [data], [])]
+            prompt = f"did you rename object type '{old_mod}::{old_table}' to '{new_mod}::{new_type_name}'?"
+            kind = 'type'
         else:
             module, table, old_col, new_col, _pg_type = col_candidates[0]
-            ddl = [f'ALTER TABLE "{module}"."{table}" RENAME COLUMN "{old_col}" TO "{new_col}";']
+            data = (module, table, old_col, new_col)
+            ddl = [sql for sql, _ in _rename_ddl(db_state, [], [data])]
             prompt = f"did you rename property '{old_col}' of object type '{module}::{table}' to '{new_col}'?"
-            kind, data = 'col', (module, table, old_col, new_col)
+            kind = 'col'
 
-        confirmed_so_far = [sql for sql, _ in _rename_ddl(confirmed_type, confirmed_col)]
+        confirmed_so_far = [sql for sql, _ in _rename_ddl(db_state, confirmed_type, confirmed_col)]
         action = _ask_action(prompt, ddl, confirmed_so_far, expert)
 
         if action == 'y':
@@ -1297,6 +1314,8 @@ async def _create_from_diff(
     non_interactive: bool,
     expert: bool,
     no_index_backfill: bool = False,
+    allow_unsafe: bool = False,
+    live: bool = False,
 ) -> None:
     import sys
 
@@ -1319,6 +1338,9 @@ async def _create_from_diff(
     )
     from pylon._core import (
         detect_fill_required as _core_detect_fill_required,
+    )
+    from pylon._core import (
+        detect_module_moves as _core_detect_module_moves,
     )
     from pylon._core import (
         diff_schema_steps_with_renames_and_fills as _core_diff_schema_steps_with_renames_and_fills,
@@ -1370,27 +1392,36 @@ async def _create_from_diff(
     # is the correct baseline even when watch has run since then.
     # Fall back to live DB introspection only when no snapshot exists yet.
     tip_row = next((r for r in tracking if r[0] == chain_tip), None)
-    db_state_json = tip_row[2] if tip_row else None
-    if db_state_json is not None:
-        db_state = db_state_from_json(db_state_json)
-    else:
-        db_state = await introspect_db_state(pool)
 
     # Schema semantics with zero physical DDL footprint (readonly, rewrites,
-    # channels, ...) never show up in the DDL diff above no matter what, so
+    # channels, ...) never show up in the DDL diff below no matter what, so
     # they need their own content comparison against the same tip-row
     # baseline (not against live `_pylon."Schema"`, for the same reason
-    # db_state above isn't live-introspected: watch may have already pushed
+    # db_state isn't live-introspected: watch may have already pushed
     # ad hoc changes straight to the database without ever going through
     # `migration create`, and those must still show up as pending here).
     schema_state_json = tip_row[3] if tip_row else None
     previous_schema = SchemaDescriptor.from_json(schema_state_json) if schema_state_json is not None else None
     content_changed = _core_schema_content_changed(schema, previous_schema)
 
+    db_state_json = None if live else (tip_row[2] if tip_row else None)
+    if db_state_json is not None:
+        db_state = db_state_from_json(db_state_json, previous_schema)
+    else:
+        db_state = await introspect_db_state(pool, schema)
+
     confirmed_type_renames: list[tuple[str, str, str, str]] = []
     confirmed_col_renames: list[tuple[str, str, str, str]] = []
     is_interactive = not non_interactive and sys.stdout.isatty()
     stop_early = False
+
+    if not is_interactive:
+        # Nobody to ask, and the alternative is dropping the table with its
+        # rows: a type that only changed module is moved — one the last
+        # migration declared, never a same-named table Pylon did not create.
+        confirmed_type_renames = [tuple(m) for m in _core_detect_module_moves(schema, db_state, previous_schema)]
+        for old_mod, old_table, new_mod, _new_table in confirmed_type_renames:
+            click.echo(f"Moving object type '{old_mod}::{old_table}' to module '{new_mod}'.")
 
     if is_interactive:
         if not expert:
@@ -1413,7 +1444,7 @@ async def _create_from_diff(
         # "stop" during rename prompts: finalize with only what's been
         # confirmed so far, skipping fill detection and the general diff
         # entirely — same semantics as "stop" anywhere else in the flow.
-        ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames)
+        ops = _rename_ddl(db_state, confirmed_type_renames, confirmed_col_renames)
         reaches_schema = False
     else:
         # ── Fill expression detection ──────────────────────────────────────
@@ -1428,11 +1459,13 @@ async def _create_from_diff(
             confirmed_ddl, quit_requested, reaches_schema = _migration_prompt_loop(steps, schema, expert)
             if quit_requested:
                 raise click.ClickException('Aborted.')
-            ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames) + confirmed_ddl
+            ops = _rename_ddl(db_state, confirmed_type_renames, confirmed_col_renames) + confirmed_ddl
         else:
+            if not allow_unsafe:
+                await _refuse_dropping_rows(pool, steps)
             # Non-interactive: auto-accept every step (any required_input
             # placeholder resolves to its own default expression).
-            ops = _rename_ddl(confirmed_type_renames, confirmed_col_renames)
+            ops = _rename_ddl(db_state, confirmed_type_renames, confirmed_col_renames)
             for step in steps:
                 ops.extend(step.resolved_ddl({}))
 
@@ -1545,6 +1578,33 @@ async def _create_from_diff(
             'and no diff baseline was recorded.'
             "\nOnce it is applied, the next 'migration create' diffs against the live database, "
             'which re-proposes unchanged functions and interface types.'
+        )
+
+
+async def _refuse_dropping_rows(pool, steps: list) -> None:
+    """Stop a non-interactive create from dropping a table that holds rows.
+
+    Interactively every drop is its own question. Here nothing asks, and a
+    type moved or renamed beyond what rename detection recognises reads as
+    a drop plus a create, so the first anyone would hear of it is the data
+    being gone.
+    """
+    holding: list[str] = []
+    for step in steps:
+        dropped = step.dropped_table
+        if dropped is None:
+            continue
+        module, table = dropped
+        pg_schema = 'public' if module == 'default' else module
+        quoted = '"{}"."{}"'.format(pg_schema.replace('"', '""'), table.replace('"', '""'))
+        rows = await pool.query(f'SELECT EXISTS (SELECT 1 FROM {quoted}) AS result', [])
+        if rows and rows[0]:
+            holding.append(f'{module}::{table}')
+    if holding:
+        raise click.ClickException(
+            'This migration would drop table(s) that still hold rows: '
+            + ', '.join(holding)
+            + '\nRun it interactively to confirm or reject each drop, or pass --allow-unsafe to drop them anyway.'
         )
 
 

@@ -45,6 +45,12 @@ from pylon.schema._walker import walk
 pytestmark = [pytest.mark.live_db]
 
 
+# A create with no recorded baseline diffs the whole live database, and the
+# shared test database holds every other suite's tables, rows included. A
+# non-interactive create refuses to drop those unless told it may.
+CREATE = ['--non-interactive', '--allow-unsafe']
+
+
 def _build_schema(types, enums, scalars, signals=None):
     return walk(types, enums, scalars, [], signals=signals)
 
@@ -306,7 +312,7 @@ def test_readonly_only_change_is_captured_by_migration_create(live_pool, tmp_pat
     try:
         # First migration: real DDL (creates the table). Baseline, not the
         # behavior under test.
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         first_files = sorted(migrations_dir.glob('*.sql'))
         assert len(first_files) == 1, result.output
@@ -319,7 +325,7 @@ def test_readonly_only_change_is_captured_by_migration_create(live_pool, tmp_pat
         # a silent no-op forever.
         write_schema(readonly=True)
 
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         assert 'No schema changes detected' not in result.output, result.output
 
@@ -414,7 +420,7 @@ def test_reload_schema_collects_aliases(live_pool, tmp_path, unique_module):
     migrations_dir = tmp_path / 'migrations'
 
     try:
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
 
         result = runner.invoke(migration.commands['apply'], [], obj=obj)
@@ -497,7 +503,7 @@ def test_channel_addition_is_captured_by_migration_create(live_pool, tmp_path, u
 
     try:
         # First migration: real DDL (creates the table), no Channel yet.
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         first_files = sorted(migrations_dir.glob('*.sql'))
         assert len(first_files) == 1, result.output
@@ -509,7 +515,7 @@ def test_channel_addition_is_captured_by_migration_create(live_pool, tmp_path, u
         # the schema_content_changed fix this made `create` a silent no-op.
         write_schema(with_channel=True)
 
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         assert 'No schema changes detected' not in result.output, result.output
 
@@ -598,7 +604,7 @@ def test_baseline_survives_schema_edits_between_create_and_apply(live_pool, tmp_
 
     try:
         write_schema(with_gadget=created_with_gadget)
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         first_files = sorted(migrations_dir.glob('*.sql'))
         assert len(first_files) == 1, result.output
@@ -607,7 +613,7 @@ def test_baseline_survives_schema_edits_between_create_and_apply(live_pool, tmp_
         write_schema(with_gadget=not created_with_gadget)
 
         # Creating on top of a pending migration stays refused, as in Gel.
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 1, result.output
         assert 'unapplied migration(s)' in result.output, result.output
 
@@ -615,7 +621,7 @@ def test_baseline_survives_schema_edits_between_create_and_apply(live_pool, tmp_
         assert result.exit_code == 0, result.output
 
         if direction == 'grown':
-            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
             assert result.exit_code == 0, result.output
             assert 'No schema changes detected' not in result.output, result.output
             second_files = sorted(migrations_dir.glob('*.sql'))
@@ -626,7 +632,7 @@ def test_baseline_survives_schema_edits_between_create_and_apply(live_pool, tmp_
             # Gadget is back in the files and really is in the database, so
             # there is nothing left to migrate.
             write_schema(with_gadget=True)
-            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
             assert result.exit_code == 0, result.output
             assert 'No schema changes detected' in result.output, result.output
             assert sorted(migrations_dir.glob('*.sql')) == first_files, result.output
@@ -676,7 +682,7 @@ def test_migration_log_marks_a_created_but_unapplied_migration_as_pending(live_p
     migrations_dir = tmp_path / 'migrations'
 
     try:
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
 
         result = runner.invoke(migration.commands['log'], ['--from-db'], obj=obj)
@@ -745,7 +751,7 @@ def test_apply_rebases_onto_watch_drift_without_being_told_to(live_pool, tmp_pat
         assert result.exit_code == 0, result.output
         assert "'watch' last wrote" in result.output, result.output
 
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
 
         # No --dev-mode: the marker is what has to carry it.
@@ -834,7 +840,7 @@ def test_multilink_added_to_an_interface_applies_without_hand_reordering(live_po
 
     try:
         # Baseline: the two implementors' tables and the interface's view.
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         first_files = sorted(migrations_dir.glob('*.sql'))
         assert len(first_files) == 1, result.output
@@ -846,7 +852,7 @@ def test_multilink_added_to_an_interface_applies_without_hand_reordering(live_po
         # table, and the interface gains a view over them.
         write_schema(with_tags=True)
 
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         second_files = sorted(migrations_dir.glob('*.sql'))
         assert len(second_files) == 2, [f.name for f in second_files]
@@ -947,7 +953,7 @@ def test_interface_pointer_changing_kind_applies_without_hand_reordering(live_po
     migrations_dir = tmp_path / 'migrations'
 
     try:
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         first_files = sorted(migrations_dir.glob('*.sql'))
         assert len(first_files) == 1, result.output
@@ -969,7 +975,7 @@ def test_interface_pointer_changing_kind_applies_without_hand_reordering(live_po
 
         write_schema(as_multilink=True)
 
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         second_files = sorted(migrations_dir.glob('*.sql'))
         assert len(second_files) == 2, [f.name for f in second_files]
@@ -1145,7 +1151,7 @@ def test_squash_reaches_the_same_schema_as_the_migrations_it_replaces(live_pool,
         # database beyond creating and dropping its shadow copies.
         for version in (1, 2, 3, 4):
             write_schema(version)
-            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
             # Each file's text is kept as it appears: squash deletes the ones
             # it replaces, and this database's tracking rows for them still
             # have to be cleaned up afterwards.
@@ -1273,7 +1279,7 @@ def test_apply_carries_a_pre_squash_database_onto_the_squashed_chain(live_pool, 
     try:
         for version in (1, 2, 3):
             write_schema(version)
-            result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+            result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
             written = [f.read_text() for f in sorted(migrations_dir.glob('*.sql'))]
             assert result.exit_code == 0, result.output
             result = runner.invoke(migration.commands['apply'], [], obj=obj)
@@ -1321,7 +1327,7 @@ def test_apply_carries_a_pre_squash_database_onto_the_squashed_chain(live_pool, 
         # create: proceeds, and sees the schema as already recorded rather
         # than re-proposing it — which is only true if the backfill left a
         # usable baseline behind.
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         assert 'No schema changes detected.' in result.output, result.output
 
@@ -1374,7 +1380,7 @@ def test_apply_clears_tracking_rows_for_migrations_that_no_longer_exist(live_poo
     discarded_id = ''
 
     try:
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         files = sorted(migrations_dir.glob('*.sql'))
         written = [f.read_text() for f in files]
@@ -1384,7 +1390,7 @@ def test_apply_clears_tracking_rows_for_migrations_that_no_longer_exist(live_poo
         # its row behind under an ID no file has any more.
         files[0].unlink()
         schema_file.write_text(schema_file.read_text() + '    size: int | None\n')
-        result = runner.invoke(migration.commands['create'], ['--non-interactive'], obj=obj)
+        result = runner.invoke(migration.commands['create'], CREATE, obj=obj)
         assert result.exit_code == 0, result.output
         written = [f.read_text() for f in sorted(migrations_dir.glob('*.sql'))]
         assert discarded_id not in written[0]

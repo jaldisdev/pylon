@@ -50,14 +50,16 @@ Migration file lifecycle. See [Migrations](migrations.md) for the full workflow 
 
 ### `pylon migration create`
 
-Diffs the compiled schema against the live database (or writes a blank stub) and writes a new file under `<schema-dir>/migrations/`.
+Diffs the compiled schema against the state the last applied migration recorded — or against the introspected live database when it recorded none, or with `--live` — and writes a new file under `<schema-dir>/migrations/` (or writes a blank stub).
 
 | Flag | Description |
 |---|---|
 | `--blank` | Skip diffing entirely; write a hand-editable stub. Run `pylon migration rehash` after editing it. |
 | `--name SLUG` | Append a label to the generated filename. |
 | `--dry-run` | Print the file content instead of writing it. |
-| `--non-interactive` | Skip the confirmation prompts; auto-accepts every step (also the default automatically when stdout isn't a TTY). Any column that needs an explicit fill expression and has no schema-declared default fails the command instead of prompting. |
+| `--non-interactive` | Skip the confirmation prompts; auto-accepts every step (also the default automatically when stdout isn't a TTY). A type that only moved to another module is moved, not dropped and re-created. Any column that needs an explicit fill expression and has no schema-declared default fails the command instead of prompting, and so does a step that would drop a table still holding rows. |
+| `--allow-unsafe` | With `--non-interactive`, drop tables that still hold rows instead of refusing to. |
+| `--live` | Diff against the introspected database instead of the state the last migration recorded — to pick up whatever a hand-written migration or a change made outside Pylon left behind. |
 | `--expert` | Terser prompts — hides the DDL/Python-declaration preview by default; press `l` during a prompt to reveal it anyway. |
 | `--no-index-backfill` | Leave out the outbox backfill for added/amended deferred search and vector indexes. They then cover only objects written after the migration until you run `pylon index rebuild`. |
 

@@ -2186,6 +2186,15 @@ impl MigrationStep {
         &self.inner.object_desc
     }
 
+    /// `(module, table)` when this step drops a table, rows and all.
+    #[getter]
+    fn dropped_table(&self) -> Option<(String, String)> {
+        match (&self.inner.verb, &self.inner.op_key) {
+            (core::diff::Verb::Drop, core::diff::OpKey::Table(module, table)) => Some((module.clone(), table.clone())),
+            _ => None,
+        }
+    }
+
     /// List of (sql, non_transactional) tuples, in emission order. May
     /// contain `\(placeholder)` tokens — see `required_input` — that must be
     /// resolved via `resolved_ddl` before executing.
@@ -2538,12 +2547,52 @@ fn deferred_index_backfills(schema: &SchemaDescriptor) -> Vec<DeferredIndex> {
 
 /// Deserialize a `DbState` from the JSON snapshot stored in `_pylon."Migrations".db_state`.
 /// Returns a `DbState` object usable as a diff baseline for `diff_schema`, the
-/// `diff_schema_*_with_renames_and_fills` pair.
+/// `diff_schema_*_with_renames_and_fills` pair. `schema` is the schema the
+/// snapshot was recorded for: a snapshot from before trigger functions were
+/// tracked gets them derived from it.
 #[pyfunction]
-fn db_state_from_json(py: Python<'_>, json: &str) -> PyResult<DbState> {
-    py.detach(|| core::diff::db_state_from_json(json))
-        .map(|inner| DbState { inner })
-        .map_err(pyo3::exceptions::PyValueError::new_err)
+#[pyo3(signature = (json, schema=None))]
+fn db_state_from_json(py: Python<'_>, json: &str, schema: Option<&SchemaDescriptor>) -> PyResult<DbState> {
+    py.detach(|| {
+        let mut state = core::diff::db_state_from_json(json)?;
+        if let Some(schema) = schema {
+            core::diff::fill_trigger_functions(&mut state, &schema.inner);
+        }
+        Ok::<_, String>(state)
+    })
+    .map(|inner| DbState { inner })
+    .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// Type renames that are a type moving to another module under the same
+/// name — unambiguous enough to take without asking. `previous` is the schema
+/// the database was last migrated to; only a type it declared can move.
+/// Returns list of (old_module, old_table, new_module, new_table).
+#[pyfunction]
+#[pyo3(signature = (target, current, previous=None))]
+fn detect_module_moves(
+    target: &SchemaDescriptor,
+    current: &DbState,
+    previous: Option<&SchemaDescriptor>,
+) -> Vec<(String, String, String, String)> {
+    core::diff::detect_module_moves(&target.inner, &current.inner, previous.map(|p| &p.inner))
+        .into_iter()
+        .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
+        .collect()
+}
+
+/// The DDL carrying out confirmed renames, junction tables included.
+/// Returns list of (sql, non_transactional).
+#[pyfunction]
+fn type_rename_ddl(
+    current: &DbState,
+    type_renames: Vec<(String, String, String, String)>,
+    col_renames: Vec<(String, String, String, String)>,
+) -> Vec<(String, bool)> {
+    core::diff::type_rename_ddl(&current.inner, &type_renames, &col_renames)
+        .into_iter()
+        .map(|op| (op.sql, op.non_transactional))
+        .collect()
 }
 
 /// Discard all cached compiled queries. Must be called after a schema reload
@@ -2915,6 +2964,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
     m.add_function(wrap_pyfunction!(detect_col_renames, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_module_moves, m)?)?;
+    m.add_function(wrap_pyfunction!(type_rename_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;
     m.add_function(wrap_pyfunction!(detect_fill_required, m)?)?;
     m.add_function(wrap_pyfunction!(diff_schema_ops_with_renames_and_fills, m)?)?;

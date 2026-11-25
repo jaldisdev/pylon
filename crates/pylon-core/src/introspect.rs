@@ -36,8 +36,8 @@ use crate::diff::dump::{
     DumpFunction, DumpIndex, DumpSequence, DumpTable, DumpTrigger, DumpView,
 };
 use crate::diff::{
-    DbColumn, DbComposite, DbCompositeAttr, DbDomain, DbEnum, DbForeignKey, DbFunction, DbIndex, DbSequence, DbState,
-    DbTable, DbView,
+    DbColumn, DbComposite, DbCompositeAttr, DbDomain, DbEnum, DbForeignKey, DbFunction, DbFunctionName, DbIndex,
+    DbSequence, DbState, DbTable, DbTriggerFunction, DbView,
 };
 use pylon_pgcon::PgPool;
 use pylon_value::DecodedValue;
@@ -268,10 +268,12 @@ const FUNCTIONS_SQL: &str = r#"
 // `migration create`/`watch` run, forever, even with zero schema changes
 // (confirmed live against the demo project).
 const TRIGGERS_SQL: &str = r#"
-    SELECT (t.tgname, n.nspname, c.relname) AS result
+    SELECT (t.tgname, n.nspname, c.relname, pn.nspname, p.proname) AS result
     FROM pg_trigger t
     JOIN pg_class c ON c.oid = t.tgrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_proc p ON p.oid = t.tgfoid
+    JOIN pg_namespace pn ON pn.oid = p.pronamespace
     WHERE NOT t.tgisinternal
       AND n.nspname NOT LIKE 'pg_%'
       AND n.nspname <> ALL($1::text[])
@@ -296,6 +298,23 @@ const CHECKS_SQL: &str = r#"
       AND n.nspname NOT LIKE 'pg_%'
       AND n.nspname <> ALL($1::text[])
     ORDER BY n.nspname, c.relname, con.conname
+"#;
+
+// Trigger functions no trigger runs — what a drop aimed at the wrong
+// schema leaves behind.
+const ORPHANED_TRIGGER_FUNCTIONS_SQL: &str = r#"
+    SELECT (n.nspname, p.proname) AS result
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.prorettype = 'trigger'::regtype
+      AND n.nspname NOT LIKE 'pg_%'
+      AND n.nspname <> ALL($1::text[])
+      AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid = p.oid)
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+      )
+    ORDER BY n.nspname, p.proname
 "#;
 
 const EXTENSIONS_SQL: &str = r#"
@@ -570,14 +589,27 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
 
     // Constraint triggers (cross-table exclusive enforcement)
     for row in query(pool, TRIGGERS_SQL, std::slice::from_ref(&object_excludes)).await? {
-        let Some([tgname, pg_schema, table_name]) = fields::<3>(row) else {
+        let Some([tgname, pg_schema, table_name, fn_schema, fn_name]) = fields::<5>(row) else {
             continue;
         };
-        let (Some(tgname), Some(pg_schema), Some(table_name)) = (as_str(tgname), as_str(pg_schema), as_str(table_name))
-        else {
+        let (Some(tgname), Some(pg_schema), Some(table_name), Some(fn_schema), Some(fn_name)) = (
+            as_str(tgname),
+            as_str(pg_schema),
+            as_str(table_name),
+            as_str(fn_schema),
+            as_str(fn_name),
+        ) else {
             continue;
         };
-        state.add_trigger(&pg_to_module(&pg_schema), &table_name, &tgname);
+        let module = pg_to_module(&pg_schema);
+        state.add_trigger(&module, &table_name, &tgname);
+        state.trigger_functions.push(DbTriggerFunction {
+            schema: module,
+            table: table_name,
+            trigger: tgname,
+            function_schema: pg_to_module(&fn_schema),
+            function: fn_name,
+        });
     }
 
     // Table CHECK constraints
@@ -591,6 +623,25 @@ pub async fn introspect_db_state(pool: &PgPool) -> Result<DbState> {
             continue;
         };
         state.add_check(&pg_to_module(&pg_schema), &table_name, &conname);
+    }
+
+    for row in query(
+        pool,
+        ORPHANED_TRIGGER_FUNCTIONS_SQL,
+        std::slice::from_ref(&object_excludes),
+    )
+    .await?
+    {
+        let Some([schema, name]) = fields::<2>(row) else {
+            continue;
+        };
+        let (Some(schema), Some(name)) = (as_str(schema), as_str(name)) else {
+            continue;
+        };
+        state.orphaned_trigger_functions.push(DbFunctionName {
+            schema: pg_to_module(&schema),
+            name,
+        });
     }
 
     // Installed extensions (no excludes — this list is small and deliberate).
@@ -834,6 +885,179 @@ const DUMP_FUNCTIONS_SQL: &str = r#"
 /// Read the whole structure of the live database, DDL included — see
 /// `crate::diff::dump` for what this is for and `diff_dumps` for what reads
 /// it.
+/// `introspect_db_state`, with every column default, view and function that
+/// `target` also declares checked for already being what `target` would
+/// create — and recorded as exactly that when it is.
+///
+/// Postgres keeps none of these as written. A default comes back deparsed
+/// with casts added (`'USD'::"default"."Currency"`), a view as its rewritten
+/// query, a function as `pg_get_functiondef`'s reformatting of it. Compared
+/// against the target's own SQL they all differ, so a diff against a live
+/// database re-proposed every one of them. Normalizing the text by hand
+/// would have to know every rule of Postgres's deparser; instead the target's
+/// version is created as a temporary object, and Postgres deparses both.
+/// Everything runs in one transaction that is rolled back.
+pub async fn introspect_db_state_against(pool: &PgPool, target: &crate::schema::SchemaDescriptor) -> Result<DbState> {
+    let mut state = introspect_db_state(pool).await?;
+    let conn = pool.connection().await?;
+    conn.batch_execute("BEGIN").await?;
+    let result = reconcile(&conn, target, &mut state).await;
+    conn.batch_execute("ROLLBACK").await?;
+    result?;
+    Ok(state)
+}
+
+/// Runs `create` and then `read` under a savepoint that is always rolled
+/// back, so neither a temporary object nor a failure outlives the check. A
+/// target object that cannot be created (it reads something the database
+/// does not have yet) is simply not equal: `None`.
+async fn canonical(conn: &pylon_pgcon::PgConnection, create: &str, read: &str) -> Result<Option<DecodedValue>> {
+    conn.batch_execute("SAVEPOINT pylon_canon").await?;
+    let value = match conn.batch_execute(create).await {
+        Ok(()) => conn
+            .query_typed(read, &[], conn.types())
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().next()),
+        Err(_) => None,
+    };
+    conn.batch_execute("ROLLBACK TO SAVEPOINT pylon_canon").await?;
+    Ok(value)
+}
+
+fn sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn pg_schema_name(module: &str) -> &str {
+    if module == "default" { "public" } else { module }
+}
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+async fn reconcile(
+    conn: &pylon_pgcon::PgConnection,
+    target: &crate::schema::SchemaDescriptor,
+    state: &mut DbState,
+) -> Result<()> {
+    let expected = crate::diff::schema_to_db_state(target);
+
+    // Column defaults.
+    for want_table in &expected.tables {
+        let Some(have_table) = state
+            .tables
+            .iter_mut()
+            .find(|t| t.schema == want_table.schema && t.name == want_table.name)
+        else {
+            continue;
+        };
+        for want_col in &want_table.columns {
+            let Some(want) = want_col.column_default.as_deref() else {
+                continue;
+            };
+            let Some(have_col) = have_table.columns.iter_mut().find(|c| c.name == want_col.name) else {
+                continue;
+            };
+            let Some(have) = have_col.column_default.clone() else {
+                continue;
+            };
+            if have == want {
+                continue;
+            }
+            let create = format!(
+                "CREATE TEMP TABLE \"_pylon_canon\" (c {} DEFAULT {want})",
+                have_col.pg_type
+            );
+            let read = "SELECT pg_get_expr(d.adbin, d.adrelid) AS result FROM pg_attrdef d \
+                        WHERE d.adrelid = 'pg_temp.\"_pylon_canon\"'::regclass";
+            if let Some(DecodedValue::Str(canon)) = canonical(conn, &create, read).await?
+                && canon == have
+            {
+                have_col.column_default = Some(want.to_string());
+            }
+        }
+    }
+
+    // Views.
+    let views = crate::export::interface_view_ddl_with_names(target)
+        .into_iter()
+        .chain(crate::export::interface_junction_view_ddl_with_names(target));
+    for (module, name, ddl) in views {
+        let Some(have) = state.views.iter_mut().find(|v| v.schema == module && v.name == name) else {
+            continue;
+        };
+        let want_hash = ddl_hash(&ddl);
+        if have.body_hash == want_hash {
+            continue;
+        }
+        let qualified = format!("{}.{}", quote_ident(pg_schema_name(&module)), quote_ident(&name));
+        let Some(body) = ddl
+            .strip_prefix("CREATE VIEW ")
+            .or_else(|| ddl.strip_prefix("CREATE OR REPLACE VIEW "))
+            .and_then(|rest| rest.strip_prefix(qualified.as_str()))
+        else {
+            continue;
+        };
+        let create = format!("CREATE TEMP VIEW \"_pylon_canon\"{body}");
+        let read = format!(
+            "SELECT (pg_get_viewdef('pg_temp.\"_pylon_canon\"'::regclass) = pg_get_viewdef({}::regclass)) AS result",
+            sql_literal(&qualified)
+        );
+        if matches!(canonical(conn, &create, &read).await?, Some(DecodedValue::Bool(true))) {
+            have.body_hash = want_hash;
+        }
+    }
+
+    // Functions.
+    for (module, name, ddl) in crate::export::function_ddl_with_names(target).unwrap_or_default() {
+        let want_hash = ddl_hash(&ddl);
+        let existing: Vec<usize> = state
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.schema == module && f.name == name)
+            .map(|(i, _)| i)
+            .collect();
+        if existing.is_empty() || existing.iter().all(|&i| state.functions[i].body_hash == want_hash) {
+            continue;
+        }
+        let qualified = format!("{}.{}", quote_ident(pg_schema_name(&module)), quote_ident(&name));
+        let Some(rest) = ddl
+            .strip_prefix("CREATE OR REPLACE FUNCTION ")
+            .and_then(|rest| rest.strip_prefix(qualified.as_str()))
+        else {
+            continue;
+        };
+        let create = format!("CREATE FUNCTION pg_temp.\"_pylon_canon\"{rest}");
+        // Everything `CREATE FUNCTION` can set, compared field by field.
+        let read = format!(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_proc w, pg_proc h JOIN pg_namespace n ON n.oid = h.pronamespace \
+                WHERE w.pronamespace = pg_my_temp_schema() AND w.proname = '_pylon_canon' \
+                  AND n.nspname = {} AND h.proname = {} \
+                  AND w.prosrc = h.prosrc AND w.prolang = h.prolang \
+                  AND pg_get_function_arguments(w.oid) = pg_get_function_arguments(h.oid) \
+                  AND pg_get_function_result(w.oid) = pg_get_function_result(h.oid) \
+                  AND w.provolatile = h.provolatile AND w.proisstrict = h.proisstrict \
+                  AND w.prosecdef = h.prosecdef AND w.proretset = h.proretset \
+                  AND w.proparallel = h.proparallel AND w.proleakproof = h.proleakproof \
+                  AND w.procost = h.procost AND w.prorows = h.prorows \
+                  AND w.proconfig IS NOT DISTINCT FROM h.proconfig\
+            ) AS result",
+            sql_literal(pg_schema_name(&module)),
+            sql_literal(&name)
+        );
+        if matches!(canonical(conn, &create, &read).await?, Some(DecodedValue::Bool(true))) {
+            for i in existing {
+                state.functions[i].body_hash = want_hash.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn introspect_db_dump(pool: &PgPool) -> Result<DbDump> {
     let mut dump = DbDump::default();
     let excludes = exclude_param(&OBJECT_EXCLUDES);
