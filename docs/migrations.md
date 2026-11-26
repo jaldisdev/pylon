@@ -55,15 +55,17 @@ did you rename object type 'shop::Product' to 'shop::Item'?
 "no" (or "n"): Reject the prompt; a rejected rename gets a fresh suggestion, ...
 ```
 
-Rejecting a candidate doesn't just skip it — it's banned for the rest of this `create` run, and the diff engine searches again with that pairing excluded, typically converging on a plain drop+create instead. This is the one place in the whole flow with real ambiguity to search over; every other kind of step has no alternative interpretation, so a rejection there just excludes it.
+Rejecting a candidate doesn't just skip it — it's banned for the rest of this `create` run, and the diff engine searches again with that pairing excluded, typically converging on a plain drop+create instead. Confirming one takes both sides out of the search: a type that has been matched is never offered again, paired with anything else. This is the one place in the whole flow with real ambiguity to search over; every other kind of step has no alternative interpretation, so a rejection there just excludes it.
 
 ### Moving a type to another module
 
-A type that keeps its name but moves to another module is a rename too (`did you rename object type 'shop::Product' to 'catalog::Product'?`), and confirming it moves the table with `ALTER TABLE … SET SCHEMA` instead of dropping and re-creating it. Its link tables (`Product.tags`) move with it. An enum or custom scalar that moves under its own name is moved the same way without asking, since dropping it would take every column of that type down with it.
+A type that moves to another module is a rename too (`did you rename object type 'shop::Product' to 'catalog::Product'?`), and confirming it moves the table with `ALTER TABLE … SET SCHEMA` instead of dropping and re-creating it — followed by `RENAME TO` when its name changes as well (`'shop::ShopProduct'` to `'catalog::Product'`). Its link tables (`Product.tags`) move and are renamed with it, and so are the constraints and indexes named after the table (`ShopProduct_pkey` becomes `Product_pkey`); a check constraint whose expression is unchanged is renamed rather than dropped and added again.
+
+An enum or custom scalar that moves under its own name is moved the same way without asking, since dropping it would take every column of that type down with it. So is an enum that is renamed, in its module or into another one, while keeping exactly the same labels (`did you rename scalar type 'shop::ShopStatus' to 'catalog::Status'?`) — as long as no other enum gone or added has those labels too.
 
 What does not move along is everything compiled against the old name, so the migration rebuilds it in the new module and drops the old copy: the type's trigger functions (rewrites, delete policies, interface links, `Trigger`s), and any schema function that moved with it. Stored type names follow too: a `Trigger` handler that writes `__type__` into a property (an audit log's `type := __new__.__type__`) has its existing rows updated to the new name, as do the type's pending index and signal outbox jobs.
 
-Non-interactively there is nobody to ask, so a move is taken without asking when it is unambiguous: the same name gone from exactly one module and new in exactly one other, with largely the same columns, and a type the last migration actually declared there. A same-named table Pylon never created is never taken over.
+Non-interactively there is nobody to ask, so a rename or move is taken without asking when it is unambiguous: the old table and the new type are each other's best match with nothing tied, their columns largely match (most of them for a type whose name changed), and the last migration actually declared the old type there. A table Pylon never created is never taken over.
 
 ### Steps that would drop rows
 

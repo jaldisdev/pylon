@@ -1057,7 +1057,7 @@ def _rename_prompt_loop(
 
     Returns (confirmed_type_renames, confirmed_col_renames, quit_requested, stopped).
     """
-    from pylon._core import Guidance
+    from pylon._core import Guidance, db_state_with_renames
     from pylon._core import detect_col_renames as _detect_col
     from pylon._core import detect_type_renames as _detect_type
 
@@ -1070,12 +1070,11 @@ def _rename_prompt_loop(
     history: list[tuple[str, tuple]] = []
 
     while True:
-        type_candidates = [
-            c for c in _detect_type(schema, db_state, guidance) if (c[0], c[1], c[2], c[3]) not in confirmed_type
-        ]
-        col_candidates = [
-            c for c in _detect_col(schema, db_state, guidance) if (c[0], c[1], c[2], c[3]) not in confirmed_col
-        ]
+        # Against the state the confirmed renames leave, so a type matched
+        # once is neither offered again nor paired with anything else.
+        renamed = db_state_with_renames(db_state, confirmed_type, confirmed_col)
+        type_candidates = _detect_type(schema, renamed, guidance)
+        col_candidates = _detect_col(schema, renamed, guidance)
         if not type_candidates and not col_candidates:
             return confirmed_type, confirmed_col, False, False
 
@@ -1340,7 +1339,7 @@ async def _create_from_diff(
         detect_fill_required as _core_detect_fill_required,
     )
     from pylon._core import (
-        detect_module_moves as _core_detect_module_moves,
+        detect_unambiguous_renames as _core_detect_unambiguous_renames,
     )
     from pylon._core import (
         diff_schema_steps_with_renames_and_fills as _core_diff_schema_steps_with_renames_and_fills,
@@ -1417,11 +1416,15 @@ async def _create_from_diff(
 
     if not is_interactive:
         # Nobody to ask, and the alternative is dropping the table with its
-        # rows: a type that only changed module is moved — one the last
-        # migration declared, never a same-named table Pylon did not create.
-        confirmed_type_renames = [tuple(m) for m in _core_detect_module_moves(schema, db_state, previous_schema)]
-        for old_mod, old_table, new_mod, _new_table in confirmed_type_renames:
-            click.echo(f"Moving object type '{old_mod}::{old_table}' to module '{new_mod}'.")
+        # rows: a type that unmistakably moved or was renamed is carried over
+        # — one the last migration declared, never a same-named table Pylon
+        # did not create.
+        confirmed_type_renames = [tuple(m) for m in _core_detect_unambiguous_renames(schema, db_state, previous_schema)]
+        for old_mod, old_table, new_mod, new_table in confirmed_type_renames:
+            if old_table == new_table:
+                click.echo(f"Moving object type '{old_mod}::{old_table}' to module '{new_mod}'.")
+            else:
+                click.echo(f"Renaming object type '{old_mod}::{old_table}' to '{new_mod}::{new_table}'.")
 
     if is_interactive:
         if not expert:
@@ -1435,6 +1438,12 @@ async def _create_from_diff(
         )
         if quit_requested:
             raise click.ClickException('Aborted.')
+
+    if db_state_json is None and confirmed_type_renames:
+        # Read again knowing where the renamed tables are now: the check for
+        # defaults already matching the schema found them only by their
+        # new names, and re-proposed every one of a renamed table's defaults.
+        db_state = await introspect_db_state(pool, schema, list(confirmed_type_renames))
 
     # Whether the migration being written ends at the compiled schema. Only
     # then is there a state to record as the next create's baseline.

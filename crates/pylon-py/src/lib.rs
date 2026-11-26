@@ -2564,21 +2564,34 @@ fn db_state_from_json(py: Python<'_>, json: &str, schema: Option<&SchemaDescript
     .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
-/// Type renames that are a type moving to another module under the same
-/// name — unambiguous enough to take without asking. `previous` is the schema
-/// the database was last migrated to; only a type it declared can move.
+/// Type renames clear enough to take without asking — see
+/// `pylon_core::diff::detect_unambiguous_renames`. `previous` is the schema
+/// the database was last migrated to; only a type it declared is renamed.
 /// Returns list of (old_module, old_table, new_module, new_table).
 #[pyfunction]
 #[pyo3(signature = (target, current, previous=None))]
-fn detect_module_moves(
+fn detect_unambiguous_renames(
     target: &SchemaDescriptor,
     current: &DbState,
     previous: Option<&SchemaDescriptor>,
 ) -> Vec<(String, String, String, String)> {
-    core::diff::detect_module_moves(&target.inner, &current.inner, previous.map(|p| &p.inner))
+    core::diff::detect_unambiguous_renames(&target.inner, &current.inner, previous.map(|p| &p.inner))
         .into_iter()
         .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
         .collect()
+}
+
+/// `current` as it is once the confirmed renames have run — what rename
+/// detection has to look at next, so a matched type is not offered again.
+#[pyfunction]
+fn db_state_with_renames(
+    current: &DbState,
+    type_renames: Vec<(String, String, String, String)>,
+    col_renames: Vec<(String, String, String, String)>,
+) -> DbState {
+    DbState {
+        inner: core::diff::db_state_with_renames(&current.inner, &type_renames, &col_renames),
+    }
 }
 
 /// The DDL carrying out confirmed renames, junction tables included.
@@ -2964,7 +2977,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_dumps, m)?)?;
     m.add_function(wrap_pyfunction!(detect_type_renames, m)?)?;
     m.add_function(wrap_pyfunction!(detect_col_renames, m)?)?;
-    m.add_function(wrap_pyfunction!(detect_module_moves, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_unambiguous_renames, m)?)?;
+    m.add_function(wrap_pyfunction!(db_state_with_renames, m)?)?;
     m.add_function(wrap_pyfunction!(type_rename_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(compile_fill_expr, m)?)?;
     m.add_function(wrap_pyfunction!(detect_fill_required, m)?)?;

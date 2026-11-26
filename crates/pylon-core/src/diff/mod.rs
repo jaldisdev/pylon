@@ -1656,16 +1656,19 @@ pub fn detect_type_renames(
     candidates
 }
 
-/// The type renames that are really a type moving to another module: the
-/// same table name gone from one module and new in another, with columns that
-/// largely match, and no other table of that name to confuse it with. Safe to
-/// take without asking — the alternative is dropping the table with its rows.
+/// The type renames clear enough to take without asking — the alternative is
+/// dropping the table with its rows. A candidate qualifies when it is the
+/// best match for both its old table and its new type, with no tie for
+/// either, and its columns match closely: half of them for a type that only
+/// moved to another module under its own name, most of them for one whose
+/// name changed. A tie is broken in favour of the candidate keeping its name
+/// and is otherwise nobody's.
 ///
 /// Only for a table `previous`, the schema the database was last migrated
 /// to, declared as that type. A same-named table Pylon never created — a
 /// database being adopted, another project's module — is not a type that
 /// moved, and quietly taking it over would be its own surprise.
-pub fn detect_module_moves(
+pub fn detect_unambiguous_renames(
     target: &SchemaDescriptor,
     current: &DbState,
     previous: Option<&SchemaDescriptor>,
@@ -1683,17 +1686,23 @@ pub fn detect_module_moves(
         .into_iter()
         .filter(|c| declared(&c.old_module, &c.old_table))
         .collect();
-    let same_name = |c: &TypeRenameCandidate| c.old_table == c.new_table && c.old_module != c.new_module;
-    let ambiguous = |c: &TypeRenameCandidate| {
+    let keeps_name = |c: &TypeRenameCandidate| c.old_table == c.new_table;
+    let rank = |c: &TypeRenameCandidate| (c.confidence, keeps_name(c));
+    let beats = |a: (f64, bool), b: (f64, bool)| a.0 > b.0 || (a.0 == b.0 && a.1 && !b.1);
+    let unrivalled = |c: &TypeRenameCandidate| {
         candidates
             .iter()
-            .filter(|o| same_name(o) && o.old_table == c.old_table)
-            .count()
-            > 1
+            .filter(|o| !std::ptr::eq(*o, c))
+            .filter(|o| {
+                (o.old_module == c.old_module && o.old_table == c.old_table)
+                    || (o.new_module == c.new_module && o.new_table == c.new_table)
+            })
+            .all(|o| beats(rank(c), rank(o)))
     };
     candidates
         .iter()
-        .filter(|c| same_name(c) && c.confidence >= 0.5 && !ambiguous(c))
+        .filter(|c| c.confidence >= if keeps_name(c) { 0.5 } else { 0.8 })
+        .filter(|c| unrivalled(c))
         .cloned()
         .collect()
 }
@@ -1739,6 +1748,12 @@ pub fn type_rename_ddl(
                 push_tx(
                     &mut ops,
                     format!("ALTER TABLE {} RENAME TO {};", qn(new_mod, &old_name), qi(&new_name)),
+                );
+            }
+            if old_table != new_table {
+                push_tx(
+                    &mut ops,
+                    rename_prefixed_names_sql(new_mod, &new_name, old_table, new_table),
                 );
             }
         }
@@ -1995,6 +2010,17 @@ fn apply_renames(
             if let Some(name) = renamed(&t.schema, &t.name) {
                 t.schema = new_mod.clone();
                 t.name = name;
+                // See `rename_prefixed_names_sql`.
+                if old_table != new_table {
+                    let rename = |n: &mut String| {
+                        if let Some(renamed) = renamed_prefix(n, old_table, new_table) {
+                            *n = renamed;
+                        }
+                    };
+                    t.indexes.iter_mut().for_each(|i| rename(&mut i.name));
+                    t.foreign_keys.iter_mut().for_each(|fk| rename(&mut fk.constraint_name));
+                    t.checks.iter_mut().for_each(|c| rename(&mut c.constraint_name));
+                }
             }
         }
         // The triggers travel with their table; their functions do not, which
@@ -2016,6 +2042,132 @@ fn apply_renames(
             col.name = new_col.clone();
         }
     }
+}
+
+/// `name` with a renamed table's old name at its front swapped for the new
+/// one: every constraint and index Pylon names after a table starts with the
+/// table's name and then `_` or `.` (`Product_pkey`, `Product__sku_idx`,
+/// `Product.tags_pkey`, `Product_tags_target_fkey`).
+fn renamed_prefix(name: &str, old: &str, new: &str) -> Option<String> {
+    let rest = name.strip_prefix(old)?;
+    (rest.starts_with('_') || rest.starts_with('.')).then(|| format!("{new}{rest}"))
+}
+
+/// Renames every constraint and index on `table` named after the table's old
+/// name, as `renamed_prefix` does. Left alone, they keep the old name for
+/// good, and every diff after compares them against names that never match.
+/// Read from the catalog rather than listed: a primary key is not in the
+/// recorded state at all, and a name Postgres cut at 63 bytes is only there.
+fn rename_prefixed_names_sql(module: &str, table: &str, old: &str, new: &str) -> String {
+    let rel = qn(module, table).replace('\'', "''");
+    let schema = pg_schema(module);
+    let old_lit = old.replace('\'', "''");
+    let new_lit = new.replace('\'', "''");
+    let matches = |col: &str| {
+        format!(
+            "left({col}, {len}) = '{old_lit}' AND substr({col}, {next}, 1) IN ('_', '.')",
+            len = old.chars().count(),
+            next = old.chars().count() + 1
+        )
+    };
+    format!(
+        "DO $$ DECLARE r record; BEGIN \
+         FOR r IN SELECT conname AS name FROM pg_constraint \
+         WHERE conrelid = '{rel}'::regclass AND {con} LOOP \
+         EXECUTE format('ALTER TABLE {rel_q} RENAME CONSTRAINT %I TO %I', r.name, \
+         '{new_lit}' || substr(r.name, {next})); END LOOP; \
+         FOR r IN SELECT i.relname AS name FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \
+         WHERE x.indrelid = '{rel}'::regclass AND {idx} \
+         AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = x.indexrelid) LOOP \
+         EXECUTE format('ALTER INDEX {schema_q}.%I RENAME TO %I', r.name, \
+         '{new_lit}' || substr(r.name, {next})); END LOOP; END $$;",
+        con = matches("conname"),
+        idx = matches("i.relname"),
+        rel_q = qn(module, table).replace('\'', "''"),
+        schema_q = schema.replace('\'', "''"),
+        next = old.chars().count() + 1,
+    )
+}
+
+/// `RENAME CONSTRAINT` for every check a renamed table carries over whose
+/// expression is unchanged, so it is not dropped and added again under the
+/// new table's name — see `export::check_names_under`. `state` is the one
+/// `apply_renames` left, and is updated to match. Grouped by the renamed
+/// type's `(module, table)`.
+fn renamed_check_ops(
+    target: &SchemaDescriptor,
+    state: &mut DbState,
+    type_renames: &[(String, String, String, String)],
+) -> Vec<((String, String), Vec<DiffOp>)> {
+    let mut out = Vec::new();
+    for (_, old_table, new_mod, new_table) in type_renames {
+        if old_table == new_table {
+            continue;
+        }
+        let Some(td) = target
+            .types
+            .iter()
+            .find(|t| &t.module == new_mod && &t.table == new_table)
+        else {
+            continue;
+        };
+        let Some(table) = state
+            .tables
+            .iter_mut()
+            .find(|t| &t.schema == new_mod && &t.name == new_table)
+        else {
+            continue;
+        };
+        let mut ops = Vec::new();
+        for (old_name, new_name) in crate::export::check_names_under(td, old_table) {
+            // As `apply_renames` left it: prefix already swapped.
+            let Some(carried) = renamed_prefix(&old_name, old_table, new_table) else {
+                continue;
+            };
+            if table
+                .checks
+                .iter()
+                .any(|c| same_identifier(&c.constraint_name, &new_name))
+            {
+                continue;
+            }
+            let Some(check) = table
+                .checks
+                .iter_mut()
+                .find(|c| same_identifier(&c.constraint_name, &carried))
+            else {
+                continue;
+            };
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER TABLE {} RENAME CONSTRAINT {} TO {};",
+                    qn(new_mod, new_table),
+                    qi(pg_identifier(&check.constraint_name)),
+                    qi(&new_name)
+                ),
+            );
+            check.constraint_name = new_name;
+        }
+        if !ops.is_empty() {
+            out.push(((new_mod.clone(), new_table.clone()), ops));
+        }
+    }
+    out
+}
+
+/// `current` as it is once the confirmed renames have run. Rename detection
+/// looks at this, not `current`, after each confirmed rename: in `current` the
+/// old table is still missing from the schema and the new type still missing
+/// from the database, so both kept being offered for every other pairing.
+pub fn db_state_with_renames(
+    current: &DbState,
+    type_renames: &[(String, String, String, String)],
+    col_renames: &[(String, String, String, String)],
+) -> DbState {
+    let mut state = current.clone();
+    apply_renames(&mut state, type_renames, col_renames);
+    state
 }
 
 /// Every `(type, property)` one of `t`'s trigger handlers stores a qualified
@@ -2132,16 +2284,18 @@ fn renamed_type_name_ops(target: &SchemaDescriptor, type_renames: &[(String, Str
     ops
 }
 
-/// An enum or custom scalar gone from one module and declared under the same
-/// name in another. Moved with `SET SCHEMA` rather than asked about: dropping
-/// the old type would take every column of that type down with it, and
-/// nothing about a type with the same name in its new module reads otherwise.
+/// An enum or custom scalar gone from one place and declared in another —
+/// under the same name in another module, or, for an enum, under a new name
+/// with exactly the same labels. Moved and renamed in place rather than asked
+/// about: dropping the old type would take every column of that type down
+/// with it.
 #[derive(Debug, Clone)]
 struct ScalarMove {
     is_enum: bool,
     old_module: String,
     new_module: String,
-    name: String,
+    old_name: String,
+    new_name: String,
     /// A sequence scalar's `{name}_seq`, which moves along.
     sequence: bool,
 }
@@ -2201,11 +2355,57 @@ fn detect_scalar_moves(target: &SchemaDescriptor, current: &DbState) -> Vec<Scal
         target_domains.iter().copied().filter(|k| !current_domains.contains(k)),
     );
 
+    // What is left over on both sides, paired by labels: an enum renamed,
+    // with or without moving, keeps them. Only a label set that occurs once
+    // among the gone and once among the added enums says which is which.
+    let moved_enum = |module: &str, name: &str, gone: bool| {
+        enum_moves
+            .iter()
+            .any(|(old, new, n)| n == name && (if gone { old } else { new }) == module)
+    };
+    let labels = |members: &[String]| {
+        let mut sorted: Vec<String> = members.to_vec();
+        sorted.sort();
+        sorted
+    };
+    let gone_enums: Vec<(&str, &str, Vec<String>)> = current
+        .enums
+        .iter()
+        .filter(|e| !target_enums.contains(&(e.schema.as_str(), e.name.as_str())))
+        .filter(|e| !moved_enum(&e.schema, &e.name, true))
+        .map(|e| (e.schema.as_str(), e.name.as_str(), labels(&e.members)))
+        .collect();
+    let added_enums: Vec<(&str, &str, Vec<String>)> = target
+        .enums
+        .iter()
+        .filter(|e| !current_enums.contains(&(e.module.as_str(), e.name.as_str())))
+        .filter(|e| !moved_enum(&e.module, &e.name, false))
+        .map(|e| (e.module.as_str(), e.name.as_str(), labels(&e.members)))
+        .collect();
+    let mut enum_renames: Vec<ScalarMove> = Vec::new();
+    for (old_module, old_name, members) in &gone_enums {
+        let same = |list: &[(&str, &str, Vec<String>)]| list.iter().filter(|(_, _, m)| m == members).count();
+        if members.is_empty() || same(&gone_enums) != 1 || same(&added_enums) != 1 {
+            continue;
+        }
+        let (new_module, new_name, _) = added_enums.iter().find(|(_, _, m)| m == members).unwrap();
+        enum_renames.push(ScalarMove {
+            is_enum: true,
+            old_module: old_module.to_string(),
+            new_module: new_module.to_string(),
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
+            sequence: false,
+        });
+    }
+    enum_renames.sort_by(|a, b| (&a.old_module, &a.old_name).cmp(&(&b.old_module, &b.old_name)));
+
     let enums = enum_moves.into_iter().map(|(old_module, new_module, name)| ScalarMove {
         is_enum: true,
         old_module,
         new_module,
-        name,
+        old_name: name.clone(),
+        new_name: name,
         sequence: false,
     });
     let domains = domain_moves.into_iter().map(|(old_module, new_module, name)| {
@@ -2217,30 +2417,43 @@ fn detect_scalar_moves(target: &SchemaDescriptor, current: &DbState) -> Vec<Scal
             is_enum: false,
             old_module,
             new_module,
-            name,
+            old_name: name.clone(),
+            new_name: name,
             sequence,
         }
     });
-    enums.chain(domains).collect()
+    enums.chain(enum_renames).chain(domains).collect()
 }
 
-/// `current` as it is once `moves` have run.
+/// `current` as it is once `moves` have run. A column of a renamed enum is
+/// typed by the new name afterwards too, or the diff would read the rename
+/// as a change of the column's type.
 fn relocate_scalars(current: &DbState, moves: &[ScalarMove]) -> DbState {
     let mut state = current.clone();
     for m in moves {
         if m.is_enum {
             for e in &mut state.enums {
-                if e.schema == m.old_module && e.name == m.name {
+                if e.schema == m.old_module && e.name == m.old_name {
                     e.schema = m.new_module.clone();
+                    e.name = m.new_name.clone();
+                }
+            }
+            if m.old_name != m.new_name {
+                for col in state.tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
+                    if let Some(retyped) =
+                        retyped_column(&col.pg_type, &m.old_module, &m.old_name, &m.new_module, &m.new_name)
+                    {
+                        col.pg_type = retyped;
+                    }
                 }
             }
         } else {
             for d in &mut state.domains {
-                if d.schema == m.old_module && d.name == m.name {
+                if d.schema == m.old_module && d.name == m.old_name {
                     d.schema = m.new_module.clone();
                 }
             }
-            let seq = format!("{}_seq", m.name);
+            let seq = format!("{}_seq", m.old_name);
             for s in &mut state.sequences {
                 if s.schema == m.old_module && s.name == seq {
                     s.schema = m.new_module.clone();
@@ -2249,6 +2462,23 @@ fn relocate_scalars(current: &DbState, moves: &[ScalarMove]) -> DbState {
         }
     }
     state
+}
+
+/// `pg_type` (`perspective."Role"`, `"perspective"."Role"[]`, or unqualified
+/// for one on the search path) respelled for the type's new module and name,
+/// when it names `old_module.old_name` at all.
+fn retyped_column(pg_type: &str, old_module: &str, old_name: &str, new_module: &str, new_name: &str) -> Option<String> {
+    let (base, suffix) = match pg_type.find("[]") {
+        Some(i) => pg_type.split_at(i),
+        None => (pg_type, ""),
+    };
+    let (schema, name) = match base.rsplit_once('.') {
+        Some((schema, name)) => (Some(schema.trim_matches('"')), name.trim_matches('"')),
+        None => (None, base.trim_matches('"')),
+    };
+    let old_schema = if old_module == "default" { "public" } else { old_module };
+    let same_schema = schema.map_or(old_module == "default", |s| s == old_schema);
+    (name == old_name && same_schema).then(|| format!("{}{suffix}", qn(new_module, new_name)))
 }
 
 /// Full diff with confirmed renames and fill expressions applied.
@@ -2279,6 +2509,11 @@ pub fn diff_schema_ops_with_renames_and_fills(
 
     // ── ...and make the baseline match what that DDL will have done ───────────
     apply_renames(&mut modified, type_renames, col_renames);
+    ops.extend(
+        renamed_check_ops(target, &mut modified, type_renames)
+            .into_iter()
+            .flat_map(|(_, ops)| ops),
+    );
 
     // ── Build fill index so emit_column_diff can defer NOT NULL for fills ─────
     let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -2336,6 +2571,7 @@ pub fn diff_schema_steps_with_renames_and_fills(
 ) -> Result<Vec<MigrationStep>, String> {
     let mut modified = current.clone();
     apply_renames(&mut modified, type_renames, col_renames);
+    let check_renames = renamed_check_ops(target, &mut modified, type_renames);
 
     let mut fill_index: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for (module, table, col, _) in fills {
@@ -2382,6 +2618,28 @@ pub fn diff_schema_steps_with_renames_and_fills(
                 op_key: OpKey::Table(module.clone(), table.clone()),
             }),
         }
+    }
+
+    for ((module, table), ops) in check_renames {
+        match steps
+            .iter_mut()
+            .find(|s| matches!(&s.op_key, OpKey::Table(m, t) if *m == module && *t == table))
+        {
+            Some(step) => {
+                step.ddl.splice(0..0, ops);
+            }
+            None => {
+                let desc = verbosename_type(&module, &table);
+                steps.push(MigrationStep {
+                    prompt: format!("did you {} {desc}?", Verb::Alter.as_str()),
+                    verb: Verb::Alter,
+                    object_desc: desc,
+                    ddl: ops,
+                    required_input: vec![],
+                    op_key: OpKey::Table(module, table),
+                })
+            }
+        };
     }
 
     let renamed_names = renamed_type_name_ops(target, type_renames);
@@ -3054,35 +3312,50 @@ fn diff_inner(
         }
     }
 
-    // ── Phase 1.5: enums and custom scalars moved to another module ──────────
+    // ── Phase 1.5: enums and custom scalars moved or renamed ─────────────────
+    // Renamed in the old module first, then moved: the new name is the one
+    // that has to be free where the type ends up.
     for m in &scalar_moves {
         let kind = if m.is_enum { "TYPE" } else { "DOMAIN" };
-        let mut ops = vec![DiffOp {
-            sql: format!(
-                "ALTER {kind} {} SET SCHEMA {};",
-                qn(&m.old_module, &m.name),
-                pg_schema(&m.new_module)
-            ),
-            non_transactional: false,
-        }];
-        if m.sequence {
-            ops.push(DiffOp {
-                sql: format!(
-                    "ALTER SEQUENCE {} SET SCHEMA {};",
-                    qn(&m.old_module, &format!("{}_seq", m.name)),
+        let mut ops: Vec<DiffOp> = Vec::new();
+        if m.old_name != m.new_name {
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER {kind} {} RENAME TO {};",
+                    qn(&m.old_module, &m.old_name),
+                    qi(&m.new_name)
+                ),
+            );
+        }
+        if m.old_module != m.new_module {
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER {kind} {} SET SCHEMA {};",
+                    qn(&m.old_module, &m.new_name),
                     pg_schema(&m.new_module)
                 ),
-                non_transactional: false,
-            });
+            );
+        }
+        if m.sequence {
+            push_tx(
+                &mut ops,
+                format!(
+                    "ALTER SEQUENCE {} SET SCHEMA {};",
+                    qn(&m.old_module, &format!("{}_seq", m.old_name)),
+                    pg_schema(&m.new_module)
+                ),
+            );
         }
         steps.extend(
-            OpKey::Scalar(m.new_module.clone(), m.name.clone()),
+            OpKey::Scalar(m.new_module.clone(), m.new_name.clone()),
             Verb::Rename,
             format!(
                 "{} to '{}::{}'",
-                verbosename_scalar(&m.old_module, &m.name),
+                verbosename_scalar(&m.old_module, &m.old_name),
                 m.new_module,
-                m.name
+                m.new_name
             ),
             ops,
         );
@@ -8079,13 +8352,21 @@ mod tests {
     /// and `Child`, all in `module`, plus a `logging::Audit` the trigger
     /// writes the type's name into.
     fn family_in(module: &str) -> SchemaDescriptor {
+        family(module, "Parent", "Status")
+    }
+
+    /// `family_in`, with the parent type and its enum named `parent` and
+    /// `status`. The parent's `name` carries a check constraint, whose name
+    /// hashes the table it is on.
+    fn family(module: &str, parent_name: &str, status: &str) -> SchemaDescriptor {
         use crate::schema::MultiLinkDescriptor;
         let mut child = simple_type(module, "Child", "Child");
         child.properties.push(prop("rank", "int4", true));
-        let mut parent = simple_type(module, "Parent", "Parent");
+        let mut parent = simple_type(module, parent_name, parent_name);
+        parent.properties[1].check_constraints = vec!["char_length(\"name\") <= 9".into()];
         parent
             .properties
-            .push(prop("status", &format!("\"{module}\".\"Status\""), true));
+            .push(prop("status", &format!("\"{module}\".\"{status}\""), true));
         parent.multilinks = vec![MultiLinkDescriptor {
             name: "children".into(),
             target: format!("{module}::Child"),
@@ -8106,7 +8387,7 @@ mod tests {
         SchemaDescriptor {
             types: vec![child, parent, audit],
             enums: vec![EnumDescriptor {
-                name: "Status".into(),
+                name: status.into(),
                 module: module.into(),
                 members: vec!["Draft".into(), "Live".into()],
             }],
@@ -8114,15 +8395,170 @@ mod tests {
         }
     }
 
+    fn renames_of(target: &SchemaDescriptor, state: &DbState, previous: &SchemaDescriptor) -> Vec<Rename> {
+        detect_unambiguous_renames(target, state, Some(previous))
+            .into_iter()
+            .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
+            .collect()
+    }
+
+    /// `family_in("a")` moved to `b` with `Parent` renamed `Holder` and its
+    /// enum `Status` renamed `Phase`.
+    fn renamed_family() -> (DbState, Vec<Rename>, String) {
+        let before = family_in("a");
+        let state = schema_to_db_state(&before);
+        let target = family("b", "Holder", "Phase");
+        let renames = renames_of(&target, &state, &before);
+        let joined = sql_of(&diff_schema_ops_with_renames_and_fills(&target, &state, &renames, &[], &[]).unwrap());
+        (state, renames, joined)
+    }
+
+    #[test]
+    fn a_type_moved_under_a_new_name_is_renamed_not_dropped() {
+        let (_, renames, joined) = renamed_family();
+        let mut found = renames.clone();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                (
+                    "a".to_string(),
+                    "Child".to_string(),
+                    "b".to_string(),
+                    "Child".to_string()
+                ),
+                (
+                    "a".to_string(),
+                    "Parent".to_string(),
+                    "b".to_string(),
+                    "Holder".to_string()
+                ),
+            ]
+        );
+        for statement in [
+            r#"ALTER TABLE "a"."Parent" SET SCHEMA "b";"#,
+            r#"ALTER TABLE "b"."Parent" RENAME TO "Holder";"#,
+            r#"ALTER TABLE "a"."Parent.children" SET SCHEMA "b";"#,
+            r#"ALTER TABLE "b"."Parent.children" RENAME TO "Holder.children";"#,
+            r#"UPDATE "logging"."Audit" SET "kind" = 'b::Holder' WHERE "kind" = 'a::Parent';"#,
+        ] {
+            assert!(joined.contains(statement), "missing {statement}:\n{joined}");
+        }
+        assert!(!joined.contains("DROP TABLE"), "got:\n{joined}");
+        assert!(!joined.contains("CREATE TABLE"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn an_enum_moved_under_a_new_name_with_the_same_labels_is_renamed() {
+        let (_, _, joined) = renamed_family();
+        let rename = at(&joined, r#"ALTER TYPE "a"."Status" RENAME TO "Phase";"#);
+        let moved = at(&joined, r#"ALTER TYPE "a"."Phase" SET SCHEMA "b";"#);
+        assert!(rename < moved, "renamed where it is, then moved:\n{joined}");
+        assert!(!joined.contains("DROP TYPE"), "got:\n{joined}");
+        assert!(!joined.contains("CREATE TYPE"), "got:\n{joined}");
+        assert!(
+            !joined.contains("ALTER COLUMN \"status\" TYPE"),
+            "the column keeps its type:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn an_enum_rename_is_offered_as_one() {
+        let state = schema_to_db_state(&family_in("a"));
+        let steps = diff_schema_steps(&family("a", "Parent", "Phase"), &state, &HashMap::new()).unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.prompt == "did you rename scalar type 'a::Status' to 'a::Phase'?"),
+            "got: {:?}",
+            steps.iter().map(|s| &s.prompt).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enums_sharing_their_labels_are_not_paired_by_guesswork() {
+        let mut before = family_in("a");
+        before.enums.push(EnumDescriptor {
+            name: "Other".into(),
+            module: "a".into(),
+            members: vec!["Live".into(), "Draft".into()],
+        });
+        let state = schema_to_db_state(&before);
+        let mut target = family("a", "Parent", "Phase");
+        target.enums.push(EnumDescriptor {
+            name: "Else".into(),
+            module: "a".into(),
+            members: vec!["Draft".into(), "Live".into()],
+        });
+        let joined = diff_schema(&target, &state).unwrap().join("\n");
+        assert!(!joined.contains("RENAME TO"), "two enums had those labels:\n{joined}");
+    }
+
+    #[test]
+    fn a_renamed_tables_constraints_and_indexes_take_its_new_name() {
+        let (state, _, joined) = renamed_family();
+        assert!(
+            joined.contains("conrelid = '\"b\".\"Holder\"'::regclass AND left(conname, 6) = 'Parent'"),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("conrelid = '\"b\".\"Holder.children\"'::regclass"),
+            "got:\n{joined}"
+        );
+        // The check keeps its expression, so it is renamed rather than
+        // dropped and added again.
+        let old = state
+            .tables
+            .iter()
+            .find(|t| t.name == "Parent")
+            .and_then(|t| t.checks.first())
+            .map(|c| c.constraint_name.clone())
+            .expect("the parent carries a check");
+        let carried = renamed_prefix(&old, "Parent", "Holder").unwrap();
+        assert!(
+            joined.contains(&format!("RENAME CONSTRAINT \"{carried}\" TO \"Holder_name_")),
+            "got:\n{joined}"
+        );
+        assert!(!joined.contains("ADD CONSTRAINT \"Holder_name_"), "got:\n{joined}");
+        assert!(!joined.contains("DROP CONSTRAINT"), "got:\n{joined}");
+    }
+
+    #[test]
+    fn a_rename_is_only_taken_unasked_when_nothing_rivals_it() {
+        // Two old types that both look exactly like the new one.
+        let mut before = family_in("a");
+        let mut twin = before.types.iter().find(|t| t.name == "Parent").unwrap().clone();
+        twin.name = "Twin".into();
+        twin.table = "Twin".into();
+        before.types.push(twin);
+        let state = schema_to_db_state(&before);
+        let renames = renames_of(&family("b", "Holder", "Status"), &state, &before);
+        assert!(renames.iter().all(|r| r.3 != "Holder"), "got: {renames:?}");
+    }
+
+    #[test]
+    fn a_rename_detected_once_is_not_offered_again() {
+        let before = family_in("a");
+        let state = schema_to_db_state(&before);
+        let target = family("b", "Holder", "Phase");
+        let all = detect_type_renames(&target, &state, &Guidance::default());
+        assert!(all.len() > 2, "every old/new pairing is a candidate at first: {all:?}");
+        let confirmed = renames_of(&target, &state, &before);
+        let after = db_state_with_renames(&state, &confirmed, &[]);
+        let left = detect_type_renames(&target, &after, &Guidance::default());
+        assert!(left.is_empty(), "nothing is left to pair: {left:?}");
+    }
+
     type Rename = (String, String, String, String);
 
     fn moved_family() -> (DbState, SchemaDescriptor, Vec<Rename>, String) {
         let state = schema_to_db_state(&family_in("a"));
         let target = family_in("b");
-        let moves: Vec<(String, String, String, String)> = detect_module_moves(&target, &state, Some(&family_in("a")))
-            .into_iter()
-            .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
-            .collect();
+        let moves: Vec<(String, String, String, String)> =
+            detect_unambiguous_renames(&target, &state, Some(&family_in("a")))
+                .into_iter()
+                .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
+                .collect();
         let joined = sql_of(&diff_schema_ops_with_renames_and_fills(&target, &state, &moves, &[], &[]).unwrap());
         (state, target, moves, joined)
     }
@@ -8209,7 +8645,7 @@ mod tests {
         let state = schema_to_db_state(&with_rewrite("a"));
         let target = with_rewrite("b");
         let moves: Vec<(String, String, String, String)> =
-            detect_module_moves(&target, &state, Some(&with_rewrite("a")))
+            detect_unambiguous_renames(&target, &state, Some(&with_rewrite("a")))
                 .into_iter()
                 .map(|c| (c.old_module, c.old_table, c.new_module, c.new_table))
                 .collect();
@@ -8250,7 +8686,7 @@ mod tests {
             .types
             .extend(family_in("c").types.into_iter().filter(|t| t.name == "Child"));
         let state = schema_to_db_state(&before);
-        let moves = detect_module_moves(&family_in("b"), &state, Some(&before));
+        let moves = detect_unambiguous_renames(&family_in("b"), &state, Some(&before));
         assert!(
             moves.iter().all(|m| m.old_table != "Child"),
             "two Child tables could have gone either way: {moves:?}"
@@ -8260,9 +8696,9 @@ mod tests {
     #[test]
     fn a_same_named_table_pylon_never_declared_is_not_taken_over() {
         let state = schema_to_db_state(&family_in("a"));
-        assert!(detect_module_moves(&family_in("b"), &state, None).is_empty());
+        assert!(detect_unambiguous_renames(&family_in("b"), &state, None).is_empty());
         let unrelated = family_in("c");
-        assert!(detect_module_moves(&family_in("b"), &state, Some(&unrelated)).is_empty());
+        assert!(detect_unambiguous_renames(&family_in("b"), &state, Some(&unrelated)).is_empty());
     }
 
     #[test]

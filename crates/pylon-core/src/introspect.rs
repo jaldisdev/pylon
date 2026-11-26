@@ -897,11 +897,19 @@ const DUMP_FUNCTIONS_SQL: &str = r#"
 /// would have to know every rule of Postgres's deparser; instead the target's
 /// version is created as a temporary object, and Postgres deparses both.
 /// Everything runs in one transaction that is rolled back.
-pub async fn introspect_db_state_against(pool: &PgPool, target: &crate::schema::SchemaDescriptor) -> Result<DbState> {
+///
+/// `type_renames` are the `(old_module, old_table, new_module, new_table)`
+/// renames the diff is going to carry out: a table the target names after
+/// one of them is looked for under its current name.
+pub async fn introspect_db_state_against(
+    pool: &PgPool,
+    target: &crate::schema::SchemaDescriptor,
+    type_renames: &[(String, String, String, String)],
+) -> Result<DbState> {
     let mut state = introspect_db_state(pool).await?;
     let conn = pool.connection().await?;
     conn.batch_execute("BEGIN").await?;
-    let result = reconcile(&conn, target, &mut state).await;
+    let result = reconcile(&conn, target, type_renames, &mut state).await;
     conn.batch_execute("ROLLBACK").await?;
     result?;
     Ok(state)
@@ -937,20 +945,40 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Where the table the target calls `(module, table)` is now, if one of
+/// `type_renames` is what puts it there — junction tables included.
+fn before_renames<'a>(
+    module: &'a str,
+    table: &'a str,
+    type_renames: &'a [(String, String, String, String)],
+) -> (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>) {
+    use std::borrow::Cow;
+    for (old_mod, old_table, new_mod, new_table) in type_renames {
+        if new_mod != module {
+            continue;
+        }
+        if table == new_table {
+            return (Cow::Borrowed(old_mod), Cow::Borrowed(old_table));
+        }
+        if let Some(suffix) = table.strip_prefix(new_table.as_str()).and_then(|r| r.strip_prefix('.')) {
+            return (Cow::Borrowed(old_mod), Cow::Owned(format!("{old_table}.{suffix}")));
+        }
+    }
+    (Cow::Borrowed(module), Cow::Borrowed(table))
+}
+
 async fn reconcile(
     conn: &pylon_pgcon::PgConnection,
     target: &crate::schema::SchemaDescriptor,
+    type_renames: &[(String, String, String, String)],
     state: &mut DbState,
 ) -> Result<()> {
     let expected = crate::diff::schema_to_db_state(target);
 
     // Column defaults.
     for want_table in &expected.tables {
-        let Some(have_table) = state
-            .tables
-            .iter_mut()
-            .find(|t| t.schema == want_table.schema && t.name == want_table.name)
-        else {
+        let (schema, name) = before_renames(&want_table.schema, &want_table.name, type_renames);
+        let Some(have_table) = state.tables.iter_mut().find(|t| t.schema == schema && t.name == name) else {
             continue;
         };
         for want_col in &want_table.columns {

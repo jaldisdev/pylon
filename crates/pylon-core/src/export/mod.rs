@@ -1536,6 +1536,31 @@ pub fn scalar_check_clauses(schema: &SchemaDescriptor, module: &str, name: &str)
     }
 }
 
+/// For each check `check_constraints` gives `td`, the name it would have had
+/// on a table called `table` instead, paired with its real one. The name
+/// hashes the table it is on, so a check carried over by a table rename has
+/// the first name; finding that one in the database proves its expression is
+/// unchanged, and it can be renamed rather than dropped and added again.
+pub fn check_names_under(td: &TypeDescriptor, table: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    if td.abstract_ || td.junction {
+        return result;
+    }
+    for p in &td.properties {
+        for expr in &p.check_constraints {
+            let name = |t: &str| format!("{}_{}_{}_check", t, p.name, &fnv(&[t, &p.name, expr.as_str()])[..8]);
+            result.push((name(table), name(&td.table)));
+        }
+    }
+    for c in &td.constraints {
+        if let TypeConstraint::Expression { expr } = c {
+            let name = |t: &str| format!("{}_{}_check", t, &fnv(&[t, expr.as_str()])[..8]);
+            result.push((name(table), name(&td.table)));
+        }
+    }
+    result
+}
+
 pub fn check_constraints(schema: &SchemaDescriptor) -> Result<Vec<(String, String, String, String)>, PyQLError> {
     let mut result = Vec::new();
     for t in &schema.types {

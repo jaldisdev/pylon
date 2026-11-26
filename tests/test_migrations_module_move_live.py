@@ -53,10 +53,11 @@ class Project:
     def migrations(self) -> Path:
         return self.root / 'migrations'
 
-    def write_family(self, module: str) -> None:
-        """`Parent` (an enum, a multi-link, a rewrite, an audit trigger, an
-        interface link) and `Child`, plus a set-returning function, all in
-        `module`. The file stays the same, so `lazy` references keep working
+    def write_family(self, module: str, parent: str = 'Parent', status: str = 'ParentStatus') -> None:
+        """`Parent` (an enum, a check, a multi-link, a rewrite, an audit
+        trigger, an interface link) and `Child`, plus a set-returning function,
+        all in `module`, with the parent type and its enum named `parent` and
+        `status`. The file stays the same, so `lazy` references keep working
         whichever module it declares."""
         # Rewritten within the same second at the same size, a stale `.pyc`
         # would still pass for current.
@@ -69,7 +70,7 @@ import pylon
 __pylon_module__ = {module!r}
 
 @pylon.enum('Draft', 'Live', 'Archived')
-class ParentStatus(pylon.Enum):
+class {status}(pylon.Enum):
     pass
 
 @pylon.type
@@ -78,9 +79,9 @@ class Child:
     rank: pylon.Property[pylon.Int32, pylon.Default(0)]
 
 @pylon.type
-class Parent:
-    title: pylon.Str
-    status: pylon.Property[ParentStatus, pylon.Default(ParentStatus.Draft)]
+class {parent}:
+    title: pylon.Property[pylon.Str, pylon.MaxLen(64)]
+    status: pylon.Property[{status}, pylon.Default({status}.Draft)]
     deleted_at: pylon.DateTime | None
     deleted: pylon.Property[pylon.Bool, pylon.Rewrite(pylon.On.Insert | pylon.On.Update, "EXISTS (.deleted_at)")] | None
     created_by: pylon.Link[
@@ -197,16 +198,21 @@ def seed(live_pool, module: str, people: str) -> None:
     asyncio.run(run())
 
 
-def checksums(live_pool, module: str) -> dict[str, tuple]:
+def checksums(live_pool, module: str, names: dict[str, str] | None = None) -> dict[str, tuple]:
+    """Row count and content checksum per table, keyed by its original name;
+    `names` maps one to what it is called now."""
+    names = names or {}
+
     async def run() -> dict[str, tuple]:
         out = {}
-        for table in ('Parent', 'Child', 'Parent.children'):
+        for key in ('Parent', 'Child', 'Parent.children'):
+            table = names.get(key, key)
             rows = await live_pool.query_named(
                 "SELECT count(*) AS n, md5(string_agg(t::text, ',' ORDER BY t::text)) AS sum "
                 f'FROM "{module}"."{table}" t',
                 [],
             )
-            out[table] = (rows[0]['n'], rows[0]['sum'])
+            out[key] = (rows[0]['n'], rows[0]['sum'])
         return out
 
     return asyncio.run(run())
@@ -235,7 +241,7 @@ def live_steps(live_pool, project: Project) -> list[str]:
     ]
 
 
-def leftovers(live_pool, old_module: str) -> dict[str, list]:
+def leftovers_in(live_pool, old_module: str) -> dict[str, list]:
     async def run() -> dict[str, list]:
         stale = await live_pool.query_named(
             'SELECT p.proname FROM pg_proc p WHERE p.prosrc LIKE $1',
@@ -280,7 +286,7 @@ def test_a_type_moved_to_another_module_keeps_its_rows(live_pool, project):
     assert result.exit_code == 0, result.output
 
     assert checksums(live_pool, project.module_b) == before
-    assert leftovers(live_pool, project.module_a) == {'stale': [], 'orphans': [], 'functions': []}
+    assert leftovers_in(live_pool, project.module_a) == {'stale': [], 'orphans': [], 'functions': []}
 
     async def audit_types() -> set[str]:
         rows = await live_pool.query_named(f'SELECT DISTINCT type FROM "{project.audit}"."Audit"', [])
@@ -354,10 +360,20 @@ def test_non_interactive_create_refuses_to_drop_a_table_holding_rows(live_pool, 
     assert project.invoke('apply').exit_code == 0
     seed(live_pool, project.module_a, project.people)
 
+    # Replaced by a type that shares nothing with it but `id`: nothing to
+    # read as a rename.
     family = project.root / f'{project.family}.py'
-    family.write_text(
-        family.read_text().replace('class Child:', 'class Kid:').replace('"Child"', '"Kid"').replace('::Child', '::Kid')
+    replaced = (
+        family.read_text()
+        .replace('class Child:', 'class Kid:')
+        .replace('"Child"', '"Kid"')
+        .replace('::Child', '::Kid')
+        .replace('    label: pylon.Str', '    caption: pylon.Str')
+        .replace('    rank: pylon.Property', '    level: pylon.Property')
+        .replace('.rank >=', '.level >=')
     )
+    shutil.rmtree(project.root / '__pycache__', ignore_errors=True)
+    family.write_text(replaced)
     result = project.invoke('create', '--non-interactive', '--dry-run')
     assert result.exit_code == 1, result.output
     assert f'still hold rows: {project.module_a}::Child' in result.output, result.output
@@ -365,3 +381,48 @@ def test_non_interactive_create_refuses_to_drop_a_table_holding_rows(live_pool, 
     result = project.invoke('create', '--non-interactive', '--dry-run', '--allow-unsafe')
     assert result.exit_code == 0, result.output
     assert f'DROP TABLE IF EXISTS "{project.module_a}"."Child" CASCADE;' in result.output, result.output
+
+
+def test_a_type_moved_and_renamed_keeps_its_rows(live_pool, project):
+    """Moved to another module and renamed in the same migration, along with
+    the enum one of its columns has — which used to read as one type dropped
+    and another created, for the table and the enum alike."""
+    result = project.create_first()
+    assert result.exit_code == 0, result.output
+    assert project.invoke('apply').exit_code == 0
+    seed(live_pool, project.module_a, project.people)
+    before = checksums(live_pool, project.module_a)
+
+    a, b = project.module_a, project.module_b
+    project.write_family(b, parent='Holder', status='HolderPhase')
+    result = project.invoke('create', '--non-interactive')
+    assert result.exit_code == 0, result.output
+    assert f"Renaming object type '{a}::Parent' to '{b}::Holder'" in result.output, result.output
+    body = sorted(project.migrations.glob('*.sql'))[-1].read_text()
+    assert 'DROP TABLE' not in body and 'DROP TYPE' not in body, body
+    assert f'ALTER TYPE "{a}"."ParentStatus" RENAME TO "HolderPhase";' in body, body
+    assert 'ADD CONSTRAINT' not in body, body
+    result = project.invoke('apply')
+    assert result.exit_code == 0, result.output
+
+    after = checksums(live_pool, b, {'Parent': 'Holder', 'Parent.children': 'Holder.children'})
+    assert after == before
+
+    async def leftovers() -> list:
+        named_after_parent = await live_pool.query_named(
+            """SELECT conname AS name FROM pg_constraint
+               WHERE connamespace = $1::text::regnamespace AND conname LIKE 'Parent%'
+               UNION ALL SELECT relname FROM pg_class
+               WHERE relnamespace = $1::text::regnamespace AND relname LIKE 'Parent%'""",
+            [b],
+        )
+        old_audit_names = await live_pool.query_named(
+            f'SELECT DISTINCT type AS name FROM "{project.audit}"."Audit" WHERE type <> $1',
+            [f'{b}::Holder'],
+        )
+        return named_after_parent + old_audit_names
+
+    assert asyncio.run(leftovers()) == []
+    assert leftovers_in(live_pool, a) == {'stale': [], 'orphans': [], 'functions': []}
+    assert 'No schema changes detected' in project.invoke('create', '--non-interactive').output
+    assert live_steps(live_pool, project) == []

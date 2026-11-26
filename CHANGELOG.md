@@ -32,6 +32,21 @@ from the same version number.
   such `DROP FUNCTION IF EXISTS` hit nothing and left the function behind.
   A diff against the live database now also drops generated trigger
   functions that no trigger runs, which those drops left behind.
+* A type can move to another module and be renamed in the same migration.
+  Rename detection kept every old and new type in play after one had been
+  matched, so after confirming the right pairs it went on offering the rest
+  crosswise — an old `Message` to a new `Order` and the like — and accepting
+  one produced a migration renaming tables into each other. A confirmed
+  rename now takes both sides out of the search. Non-interactively, a
+  rename is taken when the old table and the new type are each other's
+  clear best match, as a same-name move already was. The renamed table's
+  link tables, constraints and indexes follow its new name, and a check
+  constraint with an unchanged expression is renamed rather than dropped and
+  added again.
+* An enum renamed while keeping its labels — in its module or into another
+  one — is renamed in place with `ALTER TYPE … RENAME TO` (and `SET SCHEMA`),
+  where it used to be dropped, with every column of that type, and created
+  anew.
 * `pylon migration create --non-interactive` refuses to drop a table that
   still holds rows, instead of writing the drop unasked. Run it
   interactively to decide each drop, or pass `--allow-unsafe`.

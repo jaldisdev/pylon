@@ -34,17 +34,22 @@ use crate::{DbDump, DbState, SchemaDescriptor};
 /// `pylon_core::introspect::introspect_db_state_against`. Pass it whenever
 /// the state is going to be diffed against that schema.
 #[pyfunction]
-#[pyo3(signature = (pool, schema=None))]
+/// `type_renames`, `(old_module, old_table, new_module, new_table)`, are the
+/// renames the diff will carry out, so a renamed table's defaults are checked
+/// too.
+#[pyo3(signature = (pool, schema=None, type_renames=None))]
 fn introspect_db_state<'py>(
     py: Python<'py>,
     pool: &PgconPool,
     schema: Option<&SchemaDescriptor>,
+    type_renames: Option<Vec<(String, String, String, String)>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let pool = pool.inner.clone();
     let schema = schema.map(|s| s.inner.clone());
+    let type_renames = type_renames.unwrap_or_default();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let state = match schema {
-            Some(schema) => core::introspect::introspect_db_state_against(&pool, &schema).await,
+            Some(schema) => core::introspect::introspect_db_state_against(&pool, &schema, &type_renames).await,
             None => core::introspect::introspect_db_state(&pool).await,
         }
         .map_err(pgcon_err)?;
