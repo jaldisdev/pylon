@@ -887,3 +887,59 @@ async fn a_negative_index_counts_from_the_end() {
         assert!(error.contains(message), "{expr}: expected {message:?}, got: {error}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_parameter_named_like_a_column_reads_the_argument() {
+    // `parent_id` is also the column storing `Node.parent`. In a SQL function
+    // body Postgres resolves a bare name to a column of a table in scope before
+    // a parameter, so `.id = parent_id` compared the row with itself and
+    // matched nothing.
+    let module = unique_module("live_fn_shadow");
+    let mut node = ty("Node", &module, vec![id_prop(), text_prop("label")]);
+    let mut parent = link("parent", &format!("{module}::Node"));
+    parent.nullable = true;
+    node.links.push(parent);
+    let node_by_id = FunctionDescriptor {
+        name: "node_by_id".into(),
+        module: module.clone(),
+        params: vec![param("parent_id", "uuid")],
+        return_pg_type: format!("{module}::Node"),
+        return_is_object: true,
+        return_is_set: true,
+        return_is_polymorphic: false,
+        volatility: "stable".into(),
+        body: format!("select {module}::Node filter .id = parent_id"),
+    };
+    let sd = SchemaDescriptor {
+        types: vec![node],
+        functions: vec![node_by_id],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+
+    exec(&pool, &sd, &format!("insert {module}::Node {{ label := 'root' }}")).await;
+    exec(
+        &pool,
+        &sd,
+        &format!(
+            "insert {module}::Node {{ label := 'child', \
+             parent := (select {module}::Node filter .label = 'root' limit 1) }}"
+        ),
+    )
+    .await;
+
+    for label in ["root", "child"] {
+        let rows = rows_of(
+            &pool,
+            &sd,
+            &format!(
+                "select {module}::node_by_id((select {module}::Node filter .label = '{label}' limit 1).id) {{ label }}"
+            ),
+        )
+        .await;
+        assert_eq!(rows.len(), 1, "{label}: got {rows:?}");
+        assert_eq!(field(&rows[0], 2), &DecodedValue::Str(label.to_string()), "{label}");
+    }
+}

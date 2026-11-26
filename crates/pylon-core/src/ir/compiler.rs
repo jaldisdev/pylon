@@ -993,6 +993,7 @@ pub fn compile_fn_body_with(
     let mut c = Compiler::new(schema);
     c.in_fn_body = true;
     c.fns_needing_globals = Some(fns_needing_globals.clone());
+    c.fn_name = fn_desc.name.clone();
     for p in &fn_desc.params {
         c.fn_params.insert(p.name.clone(), p.pg_type.clone());
     }
@@ -1689,6 +1690,12 @@ struct Compiler<'a> {
     used_globals_arg: bool,
     /// User-defined function parameters in scope (only set during body compilation).
     fn_params: HashMap<String, String>,
+    /// The unqualified name of the function whose body is being compiled, or
+    /// empty outside one. Parameter references (and the globals argument) are
+    /// qualified with it, since in a SQL function body a column of a table in
+    /// scope shadows a parameter of the same name. A trigger's globals value
+    /// is a plpgsql variable rather than a parameter, so it stays bare there.
+    fn_name: String,
     /// `__new__`/`__old__` row-context bindings, only set during trigger-handler
     /// compilation (`compile_trigger_handler`) — maps the anchor name to
     /// *the trigger's own type* and the table alias its properties/links
@@ -1802,8 +1809,19 @@ impl SelectAnchor {
 /// (and, with PostgreSQL overloading, leave a stale one behind).
 pub const GLOBALS_ARG: &str = "__pylon_json_globals__";
 
-/// SQL reading one global out of `GLOBALS_ARG`.
-fn globals_arg_read(qualified: &str, pg_type: &str) -> String {
+/// SQL naming `GLOBALS_ARG` inside the body of `fn_name` — qualified with the
+/// function's name so no column can shadow it, or bare when `fn_name` is empty
+/// (a trigger, where it is a plpgsql variable, not a parameter).
+fn globals_arg_ref(fn_name: &str) -> String {
+    if fn_name.is_empty() {
+        GLOBALS_ARG.to_string()
+    } else {
+        format!("\"{}\".\"{GLOBALS_ARG}\"", fn_name.replace('"', "\"\""))
+    }
+}
+
+/// SQL reading one global out of `GLOBALS_ARG`, named as `arg`.
+fn globals_arg_read(arg: &str, qualified: &str, pg_type: &str) -> String {
     let key = qualified.replace('\'', "''");
     if let Some(element) = pg_type.strip_suffix("[]") {
         // `->>` would hand back the JSON array's text, not an array, so the
@@ -1812,13 +1830,13 @@ fn globals_arg_read(qualified: &str, pg_type: &str) -> String {
         // extract elements from a scalar". The `coalesce` keeps an empty array
         // an empty array rather than letting `array_agg` turn it into NULL.
         format!(
-            "(case when jsonb_typeof({GLOBALS_ARG} -> '{key}') = 'array' \
+            "(case when jsonb_typeof({arg} -> '{key}') = 'array' \
              then coalesce((select array_agg(value::{element}) \
-             from jsonb_array_elements_text({GLOBALS_ARG} -> '{key}') as value), '{{}}'::{pg_type}) \
+             from jsonb_array_elements_text({arg} -> '{key}') as value), '{{}}'::{pg_type}) \
              else null end)"
         )
     } else {
-        format!("(({GLOBALS_ARG} ->> '{key}')::{pg_type})")
+        format!("(({arg} ->> '{key}')::{pg_type})")
     }
 }
 
@@ -1849,6 +1867,7 @@ impl<'a> Compiler<'a> {
             active_declared_pointers: vec![],
             expanding_computeds: vec![],
             fn_params: HashMap::new(),
+            fn_name: String::new(),
             special_anchors: HashMap::new(),
             exact_rows: Vec::new(),
             unwritten_rows: Vec::new(),
@@ -3012,7 +3031,7 @@ impl<'a> Compiler<'a> {
             // `str` `find` for an `array<str>` global (`strpos(text[], text)
             // does not exist`).
             Ok(IrExpr::TypeCast(Box::new(super::IrTypeCast {
-                expr: IrExpr::RawSql(globals_arg_read(&qualified, &pg_type)),
+                expr: IrExpr::RawSql(globals_arg_read(&globals_arg_ref(&self.fn_name), &qualified, &pg_type)),
                 pg_type,
                 tuple_shape: None,
             })))
@@ -15179,6 +15198,7 @@ impl<'a> Compiler<'a> {
         }
         if allow_fn_param && let Some(pg_type) = self.fn_params.get(name) {
             return Some(IrExpr::FnParam {
+                function: self.fn_name.clone(),
                 name: name.to_string(),
                 pg_type: pg_type.clone(),
             });
@@ -18382,7 +18402,7 @@ impl<'a> Compiler<'a> {
         }
         if self.in_fn_body {
             self.used_globals_arg = true;
-            return Ok(Some(IrExpr::RawSql(GLOBALS_ARG.to_string())));
+            return Ok(Some(IrExpr::RawSql(globals_arg_ref(&self.fn_name))));
         }
         let session_globals: Vec<String> = self
             .schema

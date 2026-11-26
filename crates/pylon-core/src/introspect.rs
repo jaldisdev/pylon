@@ -1058,12 +1058,14 @@ async fn reconcile(
         else {
             continue;
         };
-        let create = format!("CREATE FUNCTION pg_temp.\"_pylon_canon\"{rest}");
+        // Created under its own name: the body qualifies its parameters with
+        // the function's name, which would name nothing in a renamed copy.
+        let create = format!("CREATE FUNCTION pg_temp.{}{rest}", quote_ident(&name));
         // Everything `CREATE FUNCTION` can set, compared field by field.
         let read = format!(
             "SELECT EXISTS (\
                 SELECT 1 FROM pg_proc w, pg_proc h JOIN pg_namespace n ON n.oid = h.pronamespace \
-                WHERE w.pronamespace = pg_my_temp_schema() AND w.proname = '_pylon_canon' \
+                WHERE w.pronamespace = pg_my_temp_schema() AND w.proname = {} \
                   AND n.nspname = {} AND h.proname = {} \
                   AND w.prosrc = h.prosrc AND w.prolang = h.prolang \
                   AND pg_get_function_arguments(w.oid) = pg_get_function_arguments(h.oid) \
@@ -1074,6 +1076,7 @@ async fn reconcile(
                   AND w.procost = h.procost AND w.prorows = h.prorows \
                   AND w.proconfig IS NOT DISTINCT FROM h.proconfig\
             ) AS result",
+            sql_literal(&name),
             sql_literal(pg_schema_name(&module)),
             sql_literal(&name)
         );

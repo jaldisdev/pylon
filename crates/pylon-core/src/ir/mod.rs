@@ -1148,8 +1148,12 @@ pub enum IrExpr {
     /// Used when `detached TypeName.prop` appears in a schema-bound expression context.
     PathSubquery(Box<IrPathSelect>),
     /// A named parameter reference inside a user-defined function body.
-    /// Emitted as a double-quoted SQL identifier: `"param_name"`.
+    /// Emitted qualified by the function's name, `"fn_name"."param_name"`:
+    /// Postgres resolves a bare name to a column of a table in scope before
+    /// the parameter, so a parameter named like a column (`parent_id`) would
+    /// silently read the column instead.
     FnParam {
+        function: String,
         name: String,
         pg_type: String,
     },

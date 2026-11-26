@@ -5907,7 +5907,7 @@ pub fn emit_expr(expr: &IrExpr) -> String {
             format!("({}->{})", emit_expr(expr), index)
         }
 
-        IrExpr::FnParam { name, .. } => qi(name),
+        IrExpr::FnParam { function, name, .. } => format!("{}.{}", qi(function), qi(name)),
 
         IrExpr::FnSubquery(fs) => {
             let scalar = match fs.shape.as_slice() {

@@ -65,6 +65,17 @@ from the same version number.
   Postgres itself. A generated check-constraint name longer than 63 bytes,
   which Postgres stores cut short, no longer reads as missing either.
 
+### Functions
+
+* A function parameter named like a column of a table its body reads now
+  reads the argument. Postgres resolves a bare name in a SQL function to the
+  column first, so `parent_id` in `filter .id = parent_id` over a type with a
+  `parent` link compared each row with itself and the function returned
+  nothing. Parameters, and the session-globals argument, are now qualified
+  with the function's name. Every function that takes an argument compiles
+  to different SQL as a result, so the next `migration create` replaces each
+  of them once.
+
 ## 0.11.0 — 2026-11-23
 
 ### Migrations

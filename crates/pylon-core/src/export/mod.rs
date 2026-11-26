@@ -4072,7 +4072,7 @@ mod tests {
             reader_ddl
         );
         assert!(
-            reader_ddl.contains("__pylon_json_globals__ ->> 'default::snapshot_at'"),
+            reader_ddl.contains("\"cutoff\".\"__pylon_json_globals__\" ->> 'default::snapshot_at'"),
             "the body should read the global out of it, got:\n{}",
             reader_ddl
         );
@@ -4137,7 +4137,7 @@ mod tests {
             ddl
         );
         assert!(
-            ddl.contains("cutoff\"((__pylon_json_globals__))") || ddl.contains("__pylon_json_globals__)"),
+            ddl.contains("(\"is_past\".\"__pylon_json_globals__\")"),
             "it should forward the argument, got:\n{}",
             ddl
         );
