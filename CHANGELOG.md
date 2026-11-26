@@ -75,6 +75,17 @@ from the same version number.
   with the function's name. Every function that takes an argument compiles
   to different SQL as a result, so the next `migration create` replaces each
   of them once.
+* A function returning a scalar can have any body a query can. Only a single
+  expression used to work; a path off a sub-select (`(select Node filter …
+  limit 1).label`), a set of values, a `for` or a `with` body each came out
+  with the two columns a query returns, and Postgres refused the function.
+* A function can read a table, or call another function, that is created
+  after it. Scalar functions come ahead of the tables, since a column
+  default may call one, so one reading a table failed to install on a fresh
+  database or in the migration that added the table ("relation does not
+  exist"). Postgres now checks a function body when it is first called
+  rather than when it is created; Pylon has already compiled it against the
+  schema by then.
 
 ## 0.11.0 — 2026-11-23
 

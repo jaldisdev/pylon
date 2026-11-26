@@ -2817,7 +2817,7 @@ fn emit_interface_exclusive_triggers(schema: &SchemaDescriptor, out: &mut String
 fn emit_scalar_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
     for fd in schema.functions.iter().filter(|fd| !fd.return_is_object) {
         let ddl = emit_one_function(fd, schema)?;
-        out.push_str(&ddl);
+        out.push_str(&with_body_check_deferred(&ddl));
         out.push('\n');
     }
     Ok(())
@@ -2826,10 +2826,24 @@ fn emit_scalar_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<
 fn emit_object_functions(schema: &SchemaDescriptor, out: &mut String) -> Result<(), PyQLError> {
     for fd in schema.functions.iter().filter(|fd| fd.return_is_object) {
         let ddl = emit_one_function(fd, schema)?;
-        out.push_str(&ddl);
+        out.push_str(&with_body_check_deferred(&ddl));
         out.push('\n');
     }
     Ok(())
+}
+
+/// `ddl` preceded by turning off Postgres's create-time body check for the
+/// rest of the transaction.
+///
+/// Scalar functions are created ahead of the tables, because a column
+/// DEFAULT may call one — so one whose body reads a table fails the check
+/// ("relation does not exist"), and so does any function calling another
+/// declared after it. The body is resolved when the function is first
+/// called instead, and Pylon has compiled every body against the schema
+/// already. Kept out of `emit_one_function`'s DDL itself, which is what
+/// recorded function hashes and the live diff's comparison are taken from.
+pub fn with_body_check_deferred(ddl: &str) -> String {
+    format!("SET LOCAL check_function_bodies = off;\n{ddl}")
 }
 
 fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Result<String, PyQLError> {
@@ -2847,7 +2861,7 @@ fn emit_one_function(fd: &FunctionDescriptor, schema: &SchemaDescriptor) -> Resu
     })?;
 
     // Emit the raw SQL body.
-    let mut body_sql = emit_fn_body(&ir_output);
+    let mut body_sql = emit_fn_body(&ir_output, fd.return_is_object);
     // A table can carry columns its type does not declare — a search
     // index's generated `__search__`, a vector index's embedding — which a
     // body ending in `SELECT *` hands back too, and Postgres then rejects as

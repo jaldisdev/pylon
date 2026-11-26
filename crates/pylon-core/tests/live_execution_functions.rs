@@ -943,3 +943,97 @@ async fn a_parameter_named_like_a_column_reads_the_argument() {
         assert_eq!(field(&rows[0], 2), &DecodedValue::Str(label.to_string()), "{label}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn scalar_bodies_of_every_shape_return_their_value() {
+    // Only a single free expression used to come out as one column; every
+    // other scalar body kept the query's `ROW(v) AS result, v` and Postgres
+    // rejected it. These functions also read a table while being created
+    // ahead of the tables, which the create-time body check used to refuse.
+    let module = unique_module("live_fn_scalar_shapes");
+    let m = &module;
+    let node = ty("Node", m, vec![id_prop(), text_prop("label"), int_prop("rank")]);
+    let scalar = |name: &str, ret: &str, set: bool, body: String| FunctionDescriptor {
+        name: name.into(),
+        module: m.clone(),
+        params: vec![param("r", "int8")],
+        return_pg_type: ret.into(),
+        return_is_object: false,
+        return_is_set: set,
+        return_is_polymorphic: false,
+        volatility: "stable".into(),
+        body,
+    };
+    let sd = SchemaDescriptor {
+        types: vec![node],
+        functions: vec![
+            scalar(
+                "label_at",
+                "text",
+                false,
+                format!("select (select {m}::Node filter .rank = r limit 1).label"),
+            ),
+            scalar(
+                "labels_from",
+                "text",
+                true,
+                format!("select (select {m}::Node filter .rank >= r).label"),
+            ),
+            scalar(
+                "bound_label",
+                "text",
+                false,
+                format!("with n := (select {m}::Node filter .rank = r limit 1) select n.label"),
+            ),
+            scalar("doubled", "int8", true, "for x in {1, 2} union (x * r)".into()),
+            scalar("pair", "int8", true, "select {r, r + 1}".into()),
+        ],
+        ..Default::default()
+    };
+    let pool = test_pool().await;
+    bootstrap(&pool, &sd).await;
+    for (label, rank) in [("a", 1), ("b", 2), ("c", 3)] {
+        exec(
+            &pool,
+            &sd,
+            &format!("insert {m}::Node {{ label := '{label}', rank := {rank} }}"),
+        )
+        .await;
+    }
+
+    async fn values(pool: &PgPool, sd: &SchemaDescriptor, pyql: &str) -> Vec<DecodedValue> {
+        let mut out: Vec<DecodedValue> = rows_of(pool, sd, pyql)
+            .await
+            .iter()
+            .map(|r| field(r, 0).clone())
+            .collect();
+        out.sort_by_key(|v| format!("{v:?}"));
+        out
+    }
+    let s = |v: &str| DecodedValue::Str(v.to_string());
+    assert_eq!(
+        values(&pool, &sd, &format!("select {m}::label_at(2)")).await,
+        vec![s("b")]
+    );
+    assert_eq!(
+        values(&pool, &sd, &format!("select {m}::label_at(9)")).await,
+        vec![DecodedValue::Null]
+    );
+    assert_eq!(
+        values(&pool, &sd, &format!("select {m}::labels_from(2)")).await,
+        vec![s("b"), s("c")]
+    );
+    assert_eq!(
+        values(&pool, &sd, &format!("select {m}::bound_label(3)")).await,
+        vec![s("c")]
+    );
+    assert_eq!(
+        values(&pool, &sd, &format!("select {m}::doubled(3)")).await,
+        vec![DecodedValue::I64(3), DecodedValue::I64(6)]
+    );
+    assert_eq!(
+        values(&pool, &sd, &format!("select {m}::pair(4)")).await,
+        vec![DecodedValue::I64(4), DecodedValue::I64(5)]
+    );
+}

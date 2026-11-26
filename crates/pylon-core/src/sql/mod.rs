@@ -6400,11 +6400,13 @@ fn emit_function_select(sel: &IrFunctionSelect) -> SqlOutput {
 /// For a bare scalar free select emits just the expression — e.g. `"a" + "b"`.
 /// For everything else (object functions, non-scalar free selects) emits a
 /// full `SELECT … FROM …` via `emit_dml_as_cte_source`.
-pub fn emit_fn_body(ir: &crate::ir::IrOutput) -> String {
-    with_subtype_fanouts(&ir.subtype_fanouts, || emit_output_fn_body(ir))
+/// `returns_object` is the function's declared return: a scalar function
+/// must end in a single column, which the CTE-source shape does not give it.
+pub fn emit_fn_body(ir: &crate::ir::IrOutput, returns_object: bool) -> String {
+    with_subtype_fanouts(&ir.subtype_fanouts, || emit_output_fn_body(ir, returns_object))
 }
 
-fn emit_output_fn_body(ir: &crate::ir::IrOutput) -> String {
+fn emit_output_fn_body(ir: &crate::ir::IrOutput, returns_object: bool) -> String {
     let body = match &ir.stmt {
         IrStmt::Select(sel) if matches!(sel.rows.as_slice(), [IrRowSource::Free(IrFreeExpr::Scalar(_))]) => {
             let IrRowSource::Free(IrFreeExpr::Scalar(e)) = &sel.rows[0] else {
@@ -6412,6 +6414,15 @@ fn emit_output_fn_body(ir: &crate::ir::IrOutput) -> String {
             };
             format!("SELECT {}", emit_expr(e))
         }
+        IrStmt::Insert(_) | IrStmt::Update(_) | IrStmt::Delete(_) => emit_dml_as_cte_source(&ir.stmt),
+        // Every other scalar statement is emitted as a CTE source, which
+        // exposes `result` (the ROW() top-level decoding reads) beside the
+        // bare `v`; only `v` is the function's value. The CTE prefix stays
+        // outside this subquery, where a data-modifying one has to be.
+        other if !returns_object => format!(
+            "SELECT \"v\" FROM (\n{}\n    ) AS \"_value\"",
+            emit_dml_as_cte_source(other)
+        ),
         other => emit_dml_as_cte_source(other),
     };
     if ir.ctes.is_empty() {
@@ -9230,10 +9241,36 @@ mod tests {
             body: "for n in {1, 2} union (select Person filter .age = n)".into(),
         };
         let ir = ir::compile_fn_body(&descriptor, &schema).expect("function body must compile");
-        let body = emit_fn_body(&ir);
+        let body = emit_fn_body(&ir, true);
         assert!(body.contains("VALUES"), "{body}");
         assert!(body.contains("CROSS JOIN LATERAL"), "{body}");
         assert!(body.contains("\"_body\".*"), "{body}");
+    }
+
+    #[test]
+    fn test_a_scalar_body_reading_a_sub_select_returns_one_column() {
+        // The path off a sub-select compiles to a select over a hoisted CTE,
+        // which the emitter wrote in the query shape — `ROW(v) AS result, v` —
+        // and Postgres rejected as two columns for a scalar return.
+        let schema = make_schema();
+        let descriptor = FunctionDescriptor {
+            name: "name_at".into(),
+            module: "default".into(),
+            params: vec![FunctionParamDescriptor {
+                name: "n".into(),
+                pg_type: "int8".into(),
+            }],
+            return_pg_type: "text".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: "select (select Person filter .age = n limit 1).name".into(),
+        };
+        let ir = ir::compile_fn_body(&descriptor, &schema).expect("function body must compile");
+        let body = emit_fn_body(&ir, false);
+        assert!(body.contains("SELECT \"v\" FROM ("), "{body}");
+        assert!(body.starts_with("WITH"), "the CTE prefix stays outside: {body}");
     }
 
     #[test]

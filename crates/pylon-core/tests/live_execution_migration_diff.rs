@@ -1016,3 +1016,77 @@ async fn a_required_link_fills_from_an_exclusive_multilinks_backlink() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres via PYLON_PGCON_TEST_DSN"]
+async fn a_scalar_function_reading_a_new_table_migrates_with_it() {
+    // Scalar functions are created ahead of the tables, since a column
+    // default may call one; Postgres's create-time body check then rejected
+    // one that reads a table the same migration creates.
+    let module = unique_module("live_migdiff_fn_table");
+    let schema = SchemaDescriptor {
+        types: vec![TypeDescriptor {
+            name: "Widget".into(),
+            module: module.clone(),
+            table: "Widget".into(),
+            abstract_: false,
+            materialized: true,
+            description: None,
+            parents: vec![],
+            interfaces: vec![],
+            bases: vec![],
+            properties: vec![id_prop(), text_prop("code")],
+            links: vec![],
+            multilinks: vec![],
+            computed: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            partition: None,
+            vector_indexes: vec![],
+            search_indexes: vec![],
+            triggers: vec![],
+            junction: false,
+            signals: vec![],
+        }],
+        functions: vec![pylon_core::schema::FunctionDescriptor {
+            name: "widget_count".into(),
+            module: module.clone(),
+            params: vec![],
+            return_pg_type: "int8".into(),
+            return_is_object: false,
+            return_is_set: false,
+            return_is_polymorphic: false,
+            volatility: "stable".into(),
+            body: format!("select count({module}::Widget)"),
+        }],
+        ..Default::default()
+    };
+
+    let pool = test_pool().await;
+    pool.batch_execute(&pylon_core::stdlib::export_stdlib()).await.unwrap();
+    let empty = schema_to_db_state(&SchemaDescriptor::default());
+    let steps = diff_schema_steps(&schema, &empty, &HashMap::new()).unwrap();
+    // One transaction, the way `migration apply` runs a transactional step.
+    let mut sql = String::from("BEGIN;\n");
+    for step in &steps {
+        for op in step.resolved_ddl(&HashMap::new()) {
+            sql.push_str(&op.sql);
+            sql.push('\n');
+        }
+    }
+    sql.push_str("COMMIT;\n");
+    pool.batch_execute(&sql).await.unwrap();
+
+    let insert = query::compile(&format!("insert {module}::Widget {{ code := 'a' }}"), &schema).unwrap();
+    pool.execute_typed(&insert.sql, &[]).await.unwrap();
+    let count = query::compile(&format!("select {module}::widget_count()"), &schema).unwrap();
+    let rows = pool
+        .query_typed(&count.sql, &[], &ExtensionOids::default())
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![DecodedValue::Composite(vec![DecodedValue::I64(1)])]);
+
+    pool.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{module}\" CASCADE;"))
+        .await
+        .unwrap();
+}

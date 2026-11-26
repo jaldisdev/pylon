@@ -3752,7 +3752,7 @@ fn diff_inner(
                 verb,
                 verbosename_function(&module, &name),
                 DiffOp {
-                    sql: ddl,
+                    sql: crate::export::with_body_check_deferred(&ddl),
                     non_transactional: false,
                 },
             );
@@ -4238,7 +4238,7 @@ fn diff_inner(
                 verb,
                 verbosename_function(&module, &name),
                 DiffOp {
-                    sql: ddl,
+                    sql: crate::export::with_body_check_deferred(&ddl),
                     non_transactional: false,
                 },
             );
