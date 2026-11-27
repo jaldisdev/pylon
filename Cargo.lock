@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-config"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thiserror",
  "toml",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-db-cache"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "heed",
  "hex",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-db-client"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-db-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hex",
  "lru",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-db-derive"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-db-pgcon"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "deadpool-postgres",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-db-value"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "rkyv",
  "uuid",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-lsp"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lsp-server",
  "lsp-types",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-providers"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-py"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "deadpool-postgres",
  "pylon-db-cache",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-server"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "pylon-workers"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hex",
  "prometheus",

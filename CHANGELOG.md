@@ -4,7 +4,7 @@ Notable changes per release. Versions are shared across the whole workspace:
 the `pylon-db` Python distribution and every `pylon-db-*` crate are published
 from the same version number.
 
-## 0.12.0
+## 0.12.0 — 2026-11-27
 
 ### Migrations
 
@@ -86,6 +86,36 @@ from the same version number.
   exist"). Postgres now checks a function body when it is first called
   rather than when it is created; Pylon has already compiled it against the
   schema by then.
+
+### Query compilation
+
+* A deeply nested expression no longer overflows the stack. Compiling one
+  recurses a level at a time, at roughly 145 KiB of stack per level in a
+  debug build, so an expression assembled by machine — a long chain of `or`s,
+  a filter built up in a loop — could exhaust the 2 MiB a worker thread gets.
+  On macOS it did not even abort: the overflow spun in the stack probe
+  forever, taking the process with it. Statement and expression compilation
+  now continue on a fresh heap-allocated segment when the remaining stack
+  runs low, so nesting is bounded by memory rather than the caller's stack.
+
+### Parameters
+
+* A `<json>` parameter can be any JSON document, not just an object. At the
+  root, a list went through the binary *array* encoder and a number as a raw
+  int8 — Postgres read the first byte of each as `jsonb` version 0 — and a
+  boolean left nothing after the version byte at all, so binding `[]`,
+  `[{"id": 1}]`, `1` or `true` failed at execution time instead of arriving
+  as the document it was. A string parameter is unchanged: it is JSON text
+  the caller has already serialized.
+
+### Rust client
+
+* A query no longer copies the whole schema to run. Each call cloned the
+  `SchemaDescriptor` out from behind its lock, and the copy started with its
+  derived caches empty, so every query redid the analysis behind them —
+  which compiles the body of every schema function. The schema is now shared
+  behind an `Arc` and each query takes a handle on it; `Client::schema()`
+  still hands back an owned copy, and `reload_schema` still replaces it.
 
 ## 0.11.0 — 2026-11-23
 
